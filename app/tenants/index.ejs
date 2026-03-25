@@ -29,6 +29,7 @@
       }
       let meta = { id: nextId, name: name };
       kv.put("__tenants/" + nextId, JSON.stringify(meta));
+      kv.put("tenants/" + nextId + "/__code/index.ejs", '<h1>Hello, world!</h1>\n<p>Your new tenant is ready.</p>');
       response.status(303);
       response.header("location", "/tenants");
       return "";
