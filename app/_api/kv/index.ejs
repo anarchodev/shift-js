@@ -1,0 +1,61 @@
+<%
+  if (request.method === "GET") {
+    let qs = request.path.split("?")[1] || "";
+    let params = {};
+    for (let p of qs.split("&")) {
+      let [k, v] = p.split("=");
+      if (k && v) params[k] = decodeURIComponent(v);
+    }
+
+    // GET with ?key= reads a single value
+    if (params.key) {
+      let val = kv.get(params.key);
+      if (val === undefined || val === null) {
+        response.status(404);
+        return { error: "not found" };
+      }
+      return { key: params.key, value: val };
+    }
+
+    // Otherwise list by prefix
+    let prefix = params.prefix || "";
+    let entries = [];
+    let end = prefix + "\x7f";
+    let raw = kv.range(prefix, end, 10000);
+    if (raw) {
+      for (let entry of raw) {
+        entries.push({ key: entry.key, size: entry.value.length });
+      }
+    }
+    return { entries };
+  }
+
+  let body = JSON.parse(request.body);
+
+  if (request.method === "POST") {
+    let key = (body.key || "").trim();
+    if (!key) {
+      response.status(400);
+      return { error: "key is required" };
+    }
+    if (body.value === undefined || body.value === null) {
+      response.status(400);
+      return { error: "value is required" };
+    }
+    kv.put(key, body.value);
+    return { ok: true };
+  }
+
+  if (request.method === "DELETE") {
+    let key = (body.key || "").trim();
+    if (!key) {
+      response.status(400);
+      return { error: "key is required" };
+    }
+    kv.delete(key);
+    return { ok: true };
+  }
+
+  response.status(405);
+  return { error: "method not allowed" };
+%>

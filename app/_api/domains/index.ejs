@@ -1,0 +1,42 @@
+<%
+  if (request.method === "GET") {
+    let domains = [];
+    let raw = kv.range("domains/", "domains/\x7f", 1000);
+    if (raw) {
+      for (let entry of raw) {
+        domains.push({ host: entry.key.slice(8), tenant_id: entry.value });
+      }
+    }
+    return { domains };
+  }
+
+  if (request.method === "POST") {
+    let body = JSON.parse(request.body);
+    let host = (body.host || "").trim();
+    let tenant_id = (body.tenant_id || "").toString().trim();
+    if (!host) {
+      response.status(400);
+      return { error: "host is required" };
+    }
+    if (!tenant_id) {
+      response.status(400);
+      return { error: "tenant_id is required" };
+    }
+    kv.put("domains/" + host, tenant_id);
+    return { ok: true };
+  }
+
+  if (request.method === "DELETE") {
+    let body = JSON.parse(request.body);
+    let host = (body.host || "").trim();
+    if (!host) {
+      response.status(400);
+      return { error: "host is required" };
+    }
+    kv.delete("domains/" + host);
+    return { ok: true };
+  }
+
+  response.status(405);
+  return { error: "method not allowed" };
+%>
