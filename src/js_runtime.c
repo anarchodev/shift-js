@@ -1,5 +1,6 @@
 #include "js_runtime.h"
 #include "kvstore.h"
+#include "preprocessor.h"
 #include "router.h"
 
 #include <quickjs.h>
@@ -113,13 +114,8 @@ static kvstore_t *js_get_kv(JSContext *ctx) {
 
 /* Prepend prefix to key into caller-provided buf.
  * Returns key as-is when prefix is NULL/empty. */
-static const char *sjs_prefixed_key(const char *prefix, const char *key,
-                                     char *buf, size_t bufsize) {
-    if (!prefix || prefix[0] == '\0') return key;
-    int n = snprintf(buf, bufsize, "%s%s", prefix, key);
-    if (n < 0 || (size_t)n >= bufsize) return NULL;
-    return buf;
-}
+/* Use the shared kv_prefixed_key from kvstore.h */
+#define sjs_prefixed_key kv_prefixed_key
 
 static const char *js_get_prefix(JSContext *ctx) {
     sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
@@ -389,23 +385,56 @@ static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
     kvstore_t *kv = sjs ? sjs->kv : NULL;
     if (!kv) return NULL;
 
-    char raw_key[256];
-    snprintf(raw_key, sizeof(raw_key), "__code/%s", module_name);
-
-    char key_buf[512];
-    const char *key = sjs_prefixed_key(sjs->current_prefix, raw_key,
-                                        key_buf, sizeof(key_buf));
-    if (!key) return NULL;
-
     void  *source = NULL;
     size_t source_len = 0;
-    int rc = kv_get(kv, key, &source, &source_len);
+    const char *resolved_name = module_name;
+    char *resolved_alloc = NULL;
 
-    if (rc != 0) return NULL;
+    /* Check if the module name has a known extension */
+    const char *ext = sjs_path_extension(module_name);
 
-    JSValue func = JS_Eval(ctx, source, source_len, module_name,
+    if (ext) {
+        /* Explicit extension — fetch directly */
+        char raw_key[256];
+        snprintf(raw_key, sizeof(raw_key), "__code/%s", module_name);
+
+        char key_buf[512];
+        const char *key = sjs_prefixed_key(sjs->current_prefix, raw_key,
+                                            key_buf, sizeof(key_buf));
+        if (!key) return NULL;
+
+        if (kv_get(kv, key, &source, &source_len) != 0) return NULL;
+    } else {
+        /* No extension — probe with each registered extension */
+        resolved_alloc = sjs_resolve_with_extensions(
+            sjs->preprocessors, kv, module_name,
+            sjs->current_prefix, &source, &source_len);
+        if (!resolved_alloc) return NULL;
+        resolved_name = resolved_alloc;
+        ext = sjs_path_extension(resolved_name);
+    }
+
+    /* Apply preprocessor if extension has one registered */
+    char  *compile_source = source;
+    size_t compile_len    = source_len;
+
+    sjs_preprocess_fn transform = ext
+        ? sjs_preprocessor_find(sjs->preprocessors, ext)
+        : NULL;
+
+    if (transform) {
+        size_t js_len;
+        char *js = transform(source, source_len, &js_len);
+        free(source);
+        if (!js) { free(resolved_alloc); return NULL; }
+        compile_source = js;
+        compile_len    = js_len;
+    }
+
+    JSValue func = JS_Eval(ctx, compile_source, compile_len, resolved_name,
                            JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    free(source);
+    free(compile_source);
+    free(resolved_alloc);
 
     if (JS_IsException(func)) return NULL;
 
@@ -433,6 +462,7 @@ static int snapshot_create(sjs_runtime_t *sjs, sjs_snapshot_t *snap) {
     if (!ctx) { arena_release(sjs, arena); return -1; }
 
     JS_AddIntrinsicBaseObjects(ctx);
+    JS_AddIntrinsicRegExp(ctx);
     JS_AddIntrinsicJSON(ctx);
     JS_AddIntrinsicPromise(ctx);
 
@@ -581,9 +611,11 @@ static int snapshot_restore(const sjs_snapshot_t *snap, sjs_arena_t *arena,
  * Runtime lifecycle
  * ====================================================================== */
 
-int sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv) {
+int sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
+                     const sjs_preprocessor_registry_t *preprocessors) {
     memset(sjs, 0, sizeof(*sjs));
     sjs->kv = kv;
+    sjs->preprocessors = preprocessors;
 
     /* Long-lived compiler runtime (standard malloc). */
     sjs->compile_rt = JS_NewRuntime();
@@ -676,8 +708,9 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         return body;
     }
 
-    char *module_path = sjs_resolve_module(req->path);
-    if (!module_path) {
+    /* base_path is extensionless (e.g. "index", "api/users/index") */
+    char *base_path = sjs_resolve_module(req->path);
+    if (!base_path) {
         req->resp_status = 500;
         char *body = strdup("Internal Server Error");
         *out_len = (uint32_t)strlen(body);
@@ -685,42 +718,74 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
     }
 
     /* ---- Phase 1: Ensure bytecode exists in KV cache ---- */
-    char raw_cache[256], raw_code[256];
-    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", module_path);
-    snprintf(raw_code,  sizeof(raw_code),  "__code/%s",     module_path);
+    char raw_cache[256];
+    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base_path);
 
-    char cache_key[512], code_key[512];
+    char cache_key[512];
     const char *ck = sjs_prefixed_key(req->kv_prefix, raw_cache,
                                        cache_key, sizeof(cache_key));
-    const char *sk = sjs_prefixed_key(req->kv_prefix, raw_code,
-                                       code_key, sizeof(code_key));
-    if (!ck || !sk) {
-        free(module_path);
+    if (!ck) {
+        free(base_path);
         req->resp_status = 500;
         char *body = strdup("Key Too Long");
         *out_len = (uint32_t)strlen(body);
         return body;
     }
 
+    /* module_path: resolved name with extension (e.g. "index.ejs").
+     * Allocated by sjs_resolve_with_extensions on cache miss. */
+    char *module_path = NULL;
+
     void  *bytecode = NULL;
     size_t bc_len = 0;
 
     if (kv_get(sjs->kv, ck, &bytecode, &bc_len) != 0) {
+        /* Cache miss — resolve source with extension probing */
         void  *source = NULL;
         size_t source_len = 0;
-        if (kv_get(sjs->kv, sk, &source, &source_len) != 0) {
-            free(module_path);
+        module_path = sjs_resolve_with_extensions(
+            sjs->preprocessors, sjs->kv, base_path,
+            req->kv_prefix, &source, &source_len);
+
+        if (!module_path) {
+            free(base_path);
             req->resp_status = 404;
             char *body = strdup("Not Found");
             *out_len = (uint32_t)strlen(body);
             return body;
         }
 
+        /* Apply preprocessor if the resolved extension has one */
+        const char *ext = sjs_path_extension(module_path);
+        sjs_preprocess_fn transform = ext
+            ? sjs_preprocessor_find(sjs->preprocessors, ext)
+            : NULL;
+
+        char  *compile_source = source;
+        size_t compile_len    = source_len;
+
+        if (transform) {
+            size_t js_len;
+            char *js = transform(source, source_len, &js_len);
+            free(source);
+            if (!js) {
+                free(base_path);
+                free(module_path);
+                req->resp_status = 500;
+                char *body = strdup("Preprocessor Error");
+                *out_len = (uint32_t)strlen(body);
+                return body;
+            }
+            compile_source = js;
+            compile_len    = js_len;
+        }
+
         sjs->current_prefix = req->kv_prefix;
         JSContext *cc = sjs->compile_ctx;
-        JSValue module_val = JS_Eval(cc, source, source_len, module_path,
+        JSValue module_val = JS_Eval(cc, compile_source, compile_len,
+                                     module_path,
                                      JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-        free(source);
+        free(compile_source);
         sjs->current_prefix = NULL;
 
         if (JS_IsException(module_val)) {
@@ -730,6 +795,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
                     module_path, err ? err : "(unknown)");
             JS_FreeCString(cc, err);
             JS_FreeValue(cc, exc);
+            free(base_path);
             free(module_path);
             req->resp_status = 500;
             char *body = strdup("Module Compilation Error");
@@ -743,6 +809,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         JS_FreeValue(cc, module_val);
 
         if (!bc) {
+            free(base_path);
             free(module_path);
             req->resp_status = 500;
             char *body = strdup("Bytecode Serialization Error");
@@ -754,6 +821,10 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         bytecode = bc;
         bc_len = out_bc_len;
     }
+
+    /* On cache hit module_path was not set — use base_path for diagnostics */
+    if (!module_path) module_path = strdup(base_path);
+    free(base_path);
 
     /* ---- Phases 2-4 with transaction retry on conflict ---- */
     #define MAX_TXN_RETRIES 3

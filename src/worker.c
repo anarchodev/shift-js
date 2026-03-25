@@ -276,7 +276,7 @@ void *sjs_worker_fn(void *arg) {
 
     /* ---- QuickJS runtime (per-worker) ---- */
     sjs_runtime_t sjs = {0};
-    if (sjs_runtime_init(&sjs, kv) != 0) {
+    if (sjs_runtime_init(&sjs, kv, wcfg->preprocessors) != 0) {
         fprintf(stderr, "Worker %d: sjs_runtime_init failed\n", wcfg->worker_id);
 #ifdef SH2_HAS_TLS
         if (tls) sh2_tls_config_destroy(tls);

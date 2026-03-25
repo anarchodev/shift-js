@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 
 #include "worker.h"
+#include "preprocessor.h"
+#include "ejs.h"
 
 #include <pthread.h>
 #include <signal.h>
@@ -52,6 +54,11 @@ int main(int argc, char **argv) {
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
+    /* Preprocessor registry — populated before workers start, read-only after. */
+    sjs_preprocessor_registry_t preprocessors;
+    sjs_preprocessor_init(&preprocessors);
+    sjs_preprocessor_register(&preprocessors, ".ejs", sjs_ejs_transform);
+
     printf("shift-js: %d workers, port %d, db %s%s\n",
            nworkers, port, db_path, tls ? ", TLS" : "");
 
@@ -66,6 +73,7 @@ int main(int argc, char **argv) {
             .port        = port,
             .running     = &g_running,
             .tls         = tls,
+            .preprocessors = &preprocessors,
         };
         pthread_create(&threads[i], NULL, sjs_worker_fn, &configs[i]);
     }

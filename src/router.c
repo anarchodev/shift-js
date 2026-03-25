@@ -15,13 +15,13 @@ char *sjs_resolve_module(const char *url_path) {
     size_t len = strlen(p);
     while (len > 0 && p[len - 1] == '/') len--;
 
-    /* Build: <path>/index.mjs or just index.mjs for root */
-    const char *suffix = "/index.mjs";
+    /* Build: <path>/index or just index for root (extensionless) */
+    const char *suffix = "/index";
     size_t suffix_len = strlen(suffix);
 
     char *result;
     if (len == 0) {
-        result = strdup("index.mjs");
+        result = strdup("index");
     } else {
         result = malloc(len + suffix_len + 1);
         if (!result) return NULL;

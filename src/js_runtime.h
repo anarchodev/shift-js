@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kvstore.h"
+#include "preprocessor.h"
 #include <shift_h2.h>
 #include <quickjs.h>
 #include <stddef.h>
@@ -49,6 +50,9 @@ typedef struct {
 
     /* Set during compilation for module loader prefix. */
     const char *current_prefix;
+
+    /* Preprocessor registry (shared, read-only). */
+    const sjs_preprocessor_registry_t *preprocessors;
 } sjs_runtime_t;
 
 /* Per-request context passed through to JS globals. */
@@ -73,7 +77,8 @@ typedef struct {
 } sjs_request_ctx_t;
 
 /* Create/destroy the per-worker runtime. */
-int  sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv);
+int  sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
+                      const sjs_preprocessor_registry_t *preprocessors);
 void sjs_runtime_free(sjs_runtime_t *sjs);
 
 /* Execute a module's handler for the given HTTP verb.

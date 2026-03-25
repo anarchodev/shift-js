@@ -35,6 +35,12 @@ int kv_rollback(kvstore_t *store);
 
 #define KV_CONFLICT (-3)
 
+/* Build a tenant-prefixed key.  If prefix is NULL or empty, returns key
+ * unchanged.  Otherwise writes "<prefix><key>" into buf and returns buf.
+ * Returns NULL if the result would exceed bufsize. */
+const char *kv_prefixed_key(const char *prefix, const char *key,
+                            char *buf, size_t bufsize);
+
 /* Range scan: keys where start <= key < end, up to count results.
  * Caller must free the result with kv_range_free(). */
 int kv_range(kvstore_t *store, const char *start, const char *end,

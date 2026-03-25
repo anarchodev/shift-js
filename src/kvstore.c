@@ -1,6 +1,7 @@
 #include "kvstore.h"
 
 #include <sqlite3.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -149,6 +150,14 @@ int kv_delete(kvstore_t *store, const char *key) {
     int rc = sqlite3_step(st);
     sqlite3_reset(st);
     return (rc == SQLITE_DONE) ? 0 : -2;
+}
+
+const char *kv_prefixed_key(const char *prefix, const char *key,
+                            char *buf, size_t bufsize) {
+    if (!prefix || prefix[0] == '\0') return key;
+    int n = snprintf(buf, bufsize, "%s%s", prefix, key);
+    if (n < 0 || (size_t)n >= bufsize) return NULL;
+    return buf;
 }
 
 int kv_range(kvstore_t *store, const char *start, const char *end,

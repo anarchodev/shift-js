@@ -63,6 +63,8 @@ add_executable(shift-js
     src/kvstore.c
     src/js_runtime.c
     src/router.c
+    src/preprocessor.c
+    src/ejs.c
 )
 target_include_directories(shift-js PRIVATE src)
 target_link_libraries(shift-js PRIVATE
