@@ -1,0 +1,35 @@
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct kvstore kvstore_t;
+
+typedef struct {
+    char   *key;
+    void   *value;
+    size_t  value_len;
+} kv_entry_t;
+
+typedef struct {
+    kv_entry_t *entries;
+    size_t      count;
+} kv_range_result_t;
+
+/* Open or create a KV store backed by the given SQLite file.
+ * Each thread should call kv_open() to get its own connection. */
+int kv_open(const char *path, kvstore_t **out);
+void kv_close(kvstore_t *store);
+
+/* Core operations.  Values are binary blobs.
+ * kv_get: caller must free(*out_value) when done.
+ * Returns 0 on success, -1 on not-found, -2 on error. */
+int kv_get(kvstore_t *store, const char *key, void **out_value, size_t *out_len);
+int kv_put(kvstore_t *store, const char *key, const void *value, size_t len);
+int kv_delete(kvstore_t *store, const char *key);
+
+/* Range scan: keys where start <= key < end, up to count results.
+ * Caller must free the result with kv_range_free(). */
+int kv_range(kvstore_t *store, const char *start, const char *end,
+             size_t count, kv_range_result_t *out);
+void kv_range_free(kv_range_result_t *result);
