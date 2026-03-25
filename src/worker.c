@@ -98,20 +98,21 @@ void *sjs_worker_fn(void *arg) {
         return NULL;
     }
 
-    /* ---- Create user collections (all 8 sh2 components) ---- */
+    /* ---- Create user collections (all sh2 components) ---- */
     shift_component_id_t all_comps[] = {
         comp.stream_id, comp.session, comp.req_headers, comp.req_body,
         comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
+        comp.domain_tag,
     };
-    shift_collection_info_t ci = {
-        .comp_ids   = all_comps,
-        .comp_count = sizeof(all_comps) / sizeof(all_comps[0]),
-    };
+    size_t ncomps = sizeof(all_comps) / sizeof(all_comps[0]);
 
     shift_collection_id_t request_out, response_in, response_result_out;
-    if (shift_collection_register(sh, &ci, &request_out) != shift_ok ||
-        shift_collection_register(sh, &ci, &response_in) != shift_ok ||
-        shift_collection_register(sh, &ci, &response_result_out) != shift_ok) {
+    shift_collection_info_t ci_req  = { .name = "request_out",        .comp_ids = all_comps, .comp_count = ncomps };
+    shift_collection_info_t ci_resp = { .name = "response_in",        .comp_ids = all_comps, .comp_count = ncomps };
+    shift_collection_info_t ci_res  = { .name = "response_result_out", .comp_ids = all_comps, .comp_count = ncomps };
+    if (shift_collection_register(sh, &ci_req,  &request_out) != shift_ok ||
+        shift_collection_register(sh, &ci_resp, &response_in) != shift_ok ||
+        shift_collection_register(sh, &ci_res,  &response_result_out) != shift_ok) {
         fprintf(stderr, "Worker %d: collection register failed\n", wcfg->worker_id);
         shift_context_destroy(sh);
         sjs_runtime_free(&sjs);
