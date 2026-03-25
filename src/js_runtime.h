@@ -3,10 +3,31 @@
 #include "kvstore.h"
 #include <shift_h2.h>
 #include <quickjs.h>
+#include <stddef.h>
 
-/* Per-worker JS runtime — one per thread, long-lived. */
+/* Fixed-size arena for per-request JS runtimes.
+ * Allocated once up front, never reallocated (no pointer invalidation).
+ * Managed in a free list per worker. */
+#define SJS_ARENA_SIZE (256 * 1024)  /* 256 KB per arena */
+#define SJS_ARENA_POOL  16           /* pre-allocated arenas per worker */
+
+typedef struct sjs_arena {
+    struct sjs_arena *next;  /* free list link */
+    size_t  used;
+    char    data[];          /* flexible array — SJS_ARENA_SIZE bytes */
+} sjs_arena_t;
+
+/* Per-worker JS state — one per thread, long-lived. */
 typedef struct {
-    JSRuntime *rt;
+    /* Long-lived compiler runtime (standard allocator). */
+    JSRuntime *compile_rt;
+    JSContext *compile_ctx;
+
+    /* Free list of pre-allocated fixed-size arenas. */
+    sjs_arena_t *arena_free;
+    /* Backing allocation for the pool (one contiguous block). */
+    void *arena_pool;
+
     kvstore_t *kv;
 } sjs_runtime_t;
 
