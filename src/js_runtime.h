@@ -46,6 +46,9 @@ typedef struct {
     void *arena_pool;
 
     kvstore_t *kv;
+
+    /* Set during compilation for module loader prefix. */
+    const char *current_prefix;
 } sjs_runtime_t;
 
 /* Per-request context passed through to JS globals. */
@@ -57,6 +60,9 @@ typedef struct {
     uint32_t                header_count;
     const void             *body;
     uint32_t                body_len;
+
+    /* Tenant KV prefix (e.g. "tenants/acme/"). NULL for system domain. */
+    const char *kv_prefix;
 
     /* Response state (written by JS, read by C to build sh2 response) */
     uint16_t  resp_status;

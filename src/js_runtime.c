@@ -111,6 +111,21 @@ static kvstore_t *js_get_kv(JSContext *ctx) {
     return sjs ? sjs->kv : NULL;
 }
 
+/* Prepend prefix to key into caller-provided buf.
+ * Returns key as-is when prefix is NULL/empty. */
+static const char *sjs_prefixed_key(const char *prefix, const char *key,
+                                     char *buf, size_t bufsize) {
+    if (!prefix || prefix[0] == '\0') return key;
+    int n = snprintf(buf, bufsize, "%s%s", prefix, key);
+    if (n < 0 || (size_t)n >= bufsize) return NULL;
+    return buf;
+}
+
+static const char *js_get_prefix(JSContext *ctx) {
+    sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
+    return req ? req->kv_prefix : NULL;
+}
+
 static JSValue js_kv_get(JSContext *ctx, JSValue this_val,
                          int argc, JSValue *argv) {
     kvstore_t *kv = js_get_kv(ctx);
@@ -119,9 +134,14 @@ static JSValue js_kv_get(JSContext *ctx, JSValue this_val,
     const char *key = JS_ToCString(ctx, argv[0]);
     if (!key) return JS_EXCEPTION;
 
+    char pfx_buf[512];
+    const char *actual_key = sjs_prefixed_key(js_get_prefix(ctx), key,
+                                               pfx_buf, sizeof(pfx_buf));
+    if (!actual_key) { JS_FreeCString(ctx, key); return JS_EXCEPTION; }
+
     void  *value = NULL;
     size_t vlen  = 0;
-    int rc = kv_get(kv, key, &value, &vlen);
+    int rc = kv_get(kv, actual_key, &value, &vlen);
     JS_FreeCString(ctx, key);
 
     if (rc == -1) return JS_NULL;
@@ -140,11 +160,16 @@ static JSValue js_kv_put(JSContext *ctx, JSValue this_val,
     const char *key = JS_ToCString(ctx, argv[0]);
     if (!key) return JS_EXCEPTION;
 
+    char pfx_buf[512];
+    const char *actual_key = sjs_prefixed_key(js_get_prefix(ctx), key,
+                                               pfx_buf, sizeof(pfx_buf));
+    if (!actual_key) { JS_FreeCString(ctx, key); return JS_EXCEPTION; }
+
     size_t vlen;
     const char *val = JS_ToCStringLen(ctx, &vlen, argv[1]);
     if (!val) { JS_FreeCString(ctx, key); return JS_EXCEPTION; }
 
-    int rc = kv_put(kv, key, val, vlen);
+    int rc = kv_put(kv, actual_key, val, vlen);
     JS_FreeCString(ctx, key);
     JS_FreeCString(ctx, val);
 
@@ -159,7 +184,12 @@ static JSValue js_kv_delete(JSContext *ctx, JSValue this_val,
     const char *key = JS_ToCString(ctx, argv[0]);
     if (!key) return JS_EXCEPTION;
 
-    int rc = kv_delete(kv, key);
+    char pfx_buf[512];
+    const char *actual_key = sjs_prefixed_key(js_get_prefix(ctx), key,
+                                               pfx_buf, sizeof(pfx_buf));
+    if (!actual_key) { JS_FreeCString(ctx, key); return JS_EXCEPTION; }
+
+    int rc = kv_delete(kv, actual_key);
     JS_FreeCString(ctx, key);
 
     return rc == 0 ? JS_TRUE : JS_EXCEPTION;
@@ -176,21 +206,36 @@ static JSValue js_kv_range(JSContext *ctx, JSValue this_val,
     const char *end = JS_ToCString(ctx, argv[1]);
     if (!end) { JS_FreeCString(ctx, start); return JS_EXCEPTION; }
 
+    const char *prefix = js_get_prefix(ctx);
+    char pfx_start[512], pfx_end[512];
+    const char *actual_start = sjs_prefixed_key(prefix, start,
+                                                 pfx_start, sizeof(pfx_start));
+    const char *actual_end = sjs_prefixed_key(prefix, end,
+                                               pfx_end, sizeof(pfx_end));
+    if (!actual_start || !actual_end) {
+        JS_FreeCString(ctx, start);
+        JS_FreeCString(ctx, end);
+        return JS_EXCEPTION;
+    }
+
     int64_t count = 100;
     if (argc > 2) JS_ToInt64(ctx, &count, argv[2]);
 
     kv_range_result_t result;
-    int rc = kv_range(kv, start, end, (size_t)count, &result);
+    int rc = kv_range(kv, actual_start, actual_end, (size_t)count, &result);
     JS_FreeCString(ctx, start);
     JS_FreeCString(ctx, end);
 
     if (rc < 0) return JS_EXCEPTION;
 
+    size_t prefix_len = (prefix && prefix[0]) ? strlen(prefix) : 0;
+
     JSValue arr = JS_NewArray(ctx);
     for (size_t i = 0; i < result.count; i++) {
         JSValue entry = JS_NewObject(ctx);
+        const char *visible_key = result.entries[i].key + prefix_len;
         JS_SetPropertyStr(ctx, entry, "key",
-                          JS_NewString(ctx, result.entries[i].key));
+                          JS_NewString(ctx, visible_key));
         JS_SetPropertyStr(ctx, entry, "value",
                           JS_NewStringLen(ctx, result.entries[i].value,
                                           result.entries[i].value_len));
@@ -344,16 +389,17 @@ static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
     kvstore_t *kv = sjs ? sjs->kv : NULL;
     if (!kv) return NULL;
 
-    size_t name_len = strlen(module_name);
-    size_t key_len = 7 + name_len;
-    char *key = malloc(key_len + 1);
+    char raw_key[256];
+    snprintf(raw_key, sizeof(raw_key), "__code/%s", module_name);
+
+    char key_buf[512];
+    const char *key = sjs_prefixed_key(sjs->current_prefix, raw_key,
+                                        key_buf, sizeof(key_buf));
     if (!key) return NULL;
-    snprintf(key, key_len + 1, "__code/%s", module_name);
 
     void  *source = NULL;
     size_t source_len = 0;
     int rc = kv_get(kv, key, &source, &source_len);
-    free(key);
 
     if (rc != 0) return NULL;
 
@@ -639,19 +685,30 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
     }
 
     /* ---- Phase 1: Ensure bytecode exists in KV cache ---- */
-    char cache_key[512];
-    snprintf(cache_key, sizeof(cache_key), "__compiled/%s", module_path);
+    char raw_cache[256], raw_code[256];
+    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", module_path);
+    snprintf(raw_code,  sizeof(raw_code),  "__code/%s",     module_path);
+
+    char cache_key[512], code_key[512];
+    const char *ck = sjs_prefixed_key(req->kv_prefix, raw_cache,
+                                       cache_key, sizeof(cache_key));
+    const char *sk = sjs_prefixed_key(req->kv_prefix, raw_code,
+                                       code_key, sizeof(code_key));
+    if (!ck || !sk) {
+        free(module_path);
+        req->resp_status = 500;
+        char *body = strdup("Key Too Long");
+        *out_len = (uint32_t)strlen(body);
+        return body;
+    }
 
     void  *bytecode = NULL;
     size_t bc_len = 0;
 
-    if (kv_get(sjs->kv, cache_key, &bytecode, &bc_len) != 0) {
-        char kv_key[512];
-        snprintf(kv_key, sizeof(kv_key), "__code/%s", module_path);
-
+    if (kv_get(sjs->kv, ck, &bytecode, &bc_len) != 0) {
         void  *source = NULL;
         size_t source_len = 0;
-        if (kv_get(sjs->kv, kv_key, &source, &source_len) != 0) {
+        if (kv_get(sjs->kv, sk, &source, &source_len) != 0) {
             free(module_path);
             req->resp_status = 404;
             char *body = strdup("Not Found");
@@ -659,10 +716,12 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             return body;
         }
 
+        sjs->current_prefix = req->kv_prefix;
         JSContext *cc = sjs->compile_ctx;
         JSValue module_val = JS_Eval(cc, source, source_len, module_path,
                                      JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
         free(source);
+        sjs->current_prefix = NULL;
 
         if (JS_IsException(module_val)) {
             JSValue exc = JS_GetException(cc);
@@ -691,7 +750,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             return body;
         }
 
-        kv_put(sjs->kv, cache_key, bc, out_bc_len);
+        kv_put(sjs->kv, ck, bc, out_bc_len);
         bytecode = bc;
         bc_len = out_bc_len;
     }
@@ -718,7 +777,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             /* Re-fetch bytecode — previous copy was freed */
             free(bytecode);
             bytecode = NULL;
-            if (kv_get(sjs->kv, cache_key, &bytecode, &bc_len) != 0) {
+            if (kv_get(sjs->kv, ck, &bytecode, &bc_len) != 0) {
                 free(module_path);
                 req->resp_status = 500;
                 char *body = strdup("Internal Server Error");

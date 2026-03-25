@@ -9,7 +9,7 @@
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s -d <db> <command> [args...]\n\n"
+        "Usage: %s -d <db> [-t <tenant_id>] <command> [args...]\n\n"
         "Commands:\n"
         "  get <key>                   Print value for key\n"
         "  put <key> <value>           Set key to value (string)\n"
@@ -18,6 +18,12 @@ static void usage(const char *prog) {
         "  range <start> <end> [count] List keys in range\n"
         "  upload <dir> [prefix]       Upload directory tree as __code/<prefix>/...\n"
         "  list [prefix]               List all keys with optional prefix\n"
+        "  domain-map <host> <id>      Map hostname to tenant ID\n"
+        "  domain-unmap <host>         Remove hostname mapping\n"
+        "  cert-put <name> <cert> <key> Store cert/key PEM files\n"
+        "\n"
+        "Options:\n"
+        "  -t <tenant_id>  Scope all key operations under tenants/<id>/\n"
         , prog);
 }
 
@@ -39,7 +45,16 @@ static char *read_file(const char *path, size_t *out_len) {
     return buf;
 }
 
-static int upload_dir(kvstore_t *kv, const char *dir_path, const char *prefix) {
+/* Prepend tenant prefix to a key. Returns key as-is if prefix is NULL. */
+static const char *prefixed_key(const char *prefix, const char *key,
+                                char *buf, size_t bufsize) {
+    if (!prefix) return key;
+    snprintf(buf, bufsize, "%s%s", prefix, key);
+    return buf;
+}
+
+static int upload_dir(kvstore_t *kv, const char *dir_path,
+                      const char *code_prefix, const char *tenant_prefix) {
     DIR *d = opendir(dir_path);
     if (!d) {
         fprintf(stderr, "Cannot open directory: %s: %s\n",
@@ -62,24 +77,30 @@ static int upload_dir(kvstore_t *kv, const char *dir_path, const char *prefix) {
         if (S_ISDIR(st.st_mode)) {
             /* Recurse into subdirectory */
             char subprefix[4096];
-            if (prefix[0])
-                snprintf(subprefix, sizeof(subprefix), "%s/%s", prefix, ent->d_name);
+            if (code_prefix[0])
+                snprintf(subprefix, sizeof(subprefix), "%s/%s",
+                         code_prefix, ent->d_name);
             else
                 snprintf(subprefix, sizeof(subprefix), "%s", ent->d_name);
 
-            int sub = upload_dir(kv, filepath, subprefix);
+            int sub = upload_dir(kv, filepath, subprefix, tenant_prefix);
             if (sub > 0) count += sub;
             continue;
         }
 
         if (!S_ISREG(st.st_mode)) continue;
 
-        /* Build KV key: __code/<prefix>/<filename> */
-        char key[4096];
-        if (prefix[0])
-            snprintf(key, sizeof(key), "__code/%s/%s", prefix, ent->d_name);
+        /* Build KV key: [tenant_prefix]__code/[code_prefix/]<filename> */
+        char raw_key[4096];
+        if (code_prefix[0])
+            snprintf(raw_key, sizeof(raw_key), "__code/%s/%s",
+                     code_prefix, ent->d_name);
         else
-            snprintf(key, sizeof(key), "__code/%s", ent->d_name);
+            snprintf(raw_key, sizeof(raw_key), "__code/%s", ent->d_name);
+
+        char key[4096];
+        const char *actual_key = prefixed_key(tenant_prefix, raw_key,
+                                              key, sizeof(key));
 
         size_t flen;
         char *contents = read_file(filepath, &flen);
@@ -88,11 +109,11 @@ static int upload_dir(kvstore_t *kv, const char *dir_path, const char *prefix) {
             continue;
         }
 
-        if (kv_put(kv, key, contents, flen) == 0) {
-            printf("  %s → %s (%zu bytes)\n", filepath, key, flen);
+        if (kv_put(kv, actual_key, contents, flen) == 0) {
+            printf("  %s → %s (%zu bytes)\n", filepath, actual_key, flen);
             count++;
         } else {
-            fprintf(stderr, "  FAILED: %s\n", key);
+            fprintf(stderr, "  FAILED: %s\n", actual_key);
         }
 
         free(contents);
@@ -104,12 +125,28 @@ static int upload_dir(kvstore_t *kv, const char *dir_path, const char *prefix) {
 
 int main(int argc, char **argv) {
     const char *db_path = NULL;
+    const char *tenant_prefix_str = NULL;
+    char tenant_buf[128];
     int arg_start = 1;
 
-    /* Parse -d <db> */
-    if (argc >= 3 && !strcmp(argv[1], "-d")) {
-        db_path = argv[2];
-        arg_start = 3;
+    /* Parse flags: -d <db> [-t <tenant_id>] */
+    while (arg_start + 1 < argc) {
+        if (!strcmp(argv[arg_start], "-d")) {
+            db_path = argv[arg_start + 1];
+            arg_start += 2;
+        } else if (!strcmp(argv[arg_start], "-t")) {
+            long tid = atol(argv[arg_start + 1]);
+            if (tid <= 0) {
+                fprintf(stderr, "Tenant ID must be a positive integer\n");
+                return 1;
+            }
+            snprintf(tenant_buf, sizeof(tenant_buf),
+                     "tenants/%ld/", tid);
+            tenant_prefix_str = tenant_buf;
+            arg_start += 2;
+        } else {
+            break;
+        }
     }
 
     if (!db_path || arg_start >= argc) {
@@ -130,11 +167,16 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "get")) {
         if (arg_start + 1 >= argc) { usage(argv[0]); rc = 1; goto done; }
 
+        char kbuf[4096];
+        const char *key = prefixed_key(tenant_prefix_str,
+                                       argv[arg_start + 1],
+                                       kbuf, sizeof(kbuf));
+
         void  *value = NULL;
         size_t vlen  = 0;
-        int r = kv_get(kv, argv[arg_start + 1], &value, &vlen);
+        int r = kv_get(kv, key, &value, &vlen);
         if (r == -1) {
-            fprintf(stderr, "Not found: %s\n", argv[arg_start + 1]);
+            fprintf(stderr, "Not found: %s\n", key);
             rc = 1;
         } else if (r < 0) {
             fprintf(stderr, "Error reading key\n");
@@ -148,7 +190,11 @@ int main(int argc, char **argv) {
 
     } else if (!strcmp(cmd, "put")) {
         if (arg_start + 2 >= argc) { usage(argv[0]); rc = 1; goto done; }
-        const char *key = argv[arg_start + 1];
+
+        char kbuf[4096];
+        const char *key = prefixed_key(tenant_prefix_str,
+                                       argv[arg_start + 1],
+                                       kbuf, sizeof(kbuf));
         const char *val = argv[arg_start + 2];
         if (kv_put(kv, key, val, strlen(val)) != 0) {
             fprintf(stderr, "Failed to put key\n");
@@ -157,7 +203,11 @@ int main(int argc, char **argv) {
 
     } else if (!strcmp(cmd, "putfile")) {
         if (arg_start + 2 >= argc) { usage(argv[0]); rc = 1; goto done; }
-        const char *key = argv[arg_start + 1];
+
+        char kbuf[4096];
+        const char *key = prefixed_key(tenant_prefix_str,
+                                       argv[arg_start + 1],
+                                       kbuf, sizeof(kbuf));
         const char *path = argv[arg_start + 2];
 
         size_t flen;
@@ -175,15 +225,26 @@ int main(int argc, char **argv) {
 
     } else if (!strcmp(cmd, "delete")) {
         if (arg_start + 1 >= argc) { usage(argv[0]); rc = 1; goto done; }
-        if (kv_delete(kv, argv[arg_start + 1]) != 0) {
+
+        char kbuf[4096];
+        const char *key = prefixed_key(tenant_prefix_str,
+                                       argv[arg_start + 1],
+                                       kbuf, sizeof(kbuf));
+        if (kv_delete(kv, key) != 0) {
             fprintf(stderr, "Failed to delete key\n");
             rc = 1;
         }
 
     } else if (!strcmp(cmd, "range")) {
         if (arg_start + 2 >= argc) { usage(argv[0]); rc = 1; goto done; }
-        const char *start = argv[arg_start + 1];
-        const char *end   = argv[arg_start + 2];
+
+        char sbuf[4096], ebuf[4096];
+        const char *start = prefixed_key(tenant_prefix_str,
+                                         argv[arg_start + 1],
+                                         sbuf, sizeof(sbuf));
+        const char *end = prefixed_key(tenant_prefix_str,
+                                       argv[arg_start + 2],
+                                       ebuf, sizeof(ebuf));
         size_t count = 100;
         if (arg_start + 3 < argc) count = (size_t)atol(argv[arg_start + 3]);
 
@@ -192,8 +253,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Range query failed\n");
             rc = 1;
         } else {
+            size_t pfx_len = tenant_prefix_str ? strlen(tenant_prefix_str) : 0;
             for (size_t i = 0; i < result.count; i++) {
-                printf("%s\t%zu bytes\n", result.entries[i].key,
+                const char *display_key = result.entries[i].key + pfx_len;
+                printf("%s\t%zu bytes\n", display_key,
                        result.entries[i].value_len);
             }
             kv_range_free(&result);
@@ -204,32 +267,98 @@ int main(int argc, char **argv) {
         const char *dir = argv[arg_start + 1];
         const char *prefix = (arg_start + 2 < argc) ? argv[arg_start + 2] : "";
 
-        int n = upload_dir(kv, dir, prefix);
+        int n = upload_dir(kv, dir, prefix, tenant_prefix_str);
         printf("Uploaded %d files\n", n);
 
     } else if (!strcmp(cmd, "list")) {
         const char *prefix = (arg_start + 1 < argc) ? argv[arg_start + 1] : "";
 
-        /* Use range scan: prefix to prefix + max char */
-        size_t plen = strlen(prefix);
-        char *end = malloc(plen + 2);
+        char sbuf[4096];
+        const char *start = prefixed_key(tenant_prefix_str, prefix,
+                                         sbuf, sizeof(sbuf));
+
+        size_t slen = strlen(start);
+        char *end = malloc(slen + 2);
         if (!end) { rc = 1; goto done; }
-        memcpy(end, prefix, plen);
-        end[plen] = '\x7f';  /* DEL — sorts after all printable chars */
-        end[plen + 1] = '\0';
+        memcpy(end, start, slen);
+        end[slen] = '\x7f';
+        end[slen + 1] = '\0';
 
         kv_range_result_t result;
-        if (kv_range(kv, prefix, end, 10000, &result) != 0) {
+        if (kv_range(kv, start, end, 10000, &result) != 0) {
             fprintf(stderr, "List failed\n");
             rc = 1;
         } else {
+            size_t pfx_len = tenant_prefix_str ? strlen(tenant_prefix_str) : 0;
             for (size_t i = 0; i < result.count; i++) {
-                printf("%s\t%zu bytes\n", result.entries[i].key,
+                const char *display_key = result.entries[i].key + pfx_len;
+                printf("%s\t%zu bytes\n", display_key,
                        result.entries[i].value_len);
             }
             kv_range_free(&result);
         }
         free(end);
+
+    } else if (!strcmp(cmd, "domain-map")) {
+        if (arg_start + 2 >= argc) { usage(argv[0]); rc = 1; goto done; }
+        const char *hostname  = argv[arg_start + 1];
+        const char *tenant_id = argv[arg_start + 2];
+
+        char key[512];
+        snprintf(key, sizeof(key), "domains/%s", hostname);
+
+        if (kv_put(kv, key, tenant_id, strlen(tenant_id)) != 0) {
+            fprintf(stderr, "Failed to map domain\n");
+            rc = 1;
+        } else {
+            printf("Mapped %s → tenant %s\n", hostname, tenant_id);
+        }
+
+    } else if (!strcmp(cmd, "domain-unmap")) {
+        if (arg_start + 1 >= argc) { usage(argv[0]); rc = 1; goto done; }
+        const char *hostname = argv[arg_start + 1];
+
+        char key[512];
+        snprintf(key, sizeof(key), "domains/%s", hostname);
+
+        if (kv_delete(kv, key) != 0) {
+            fprintf(stderr, "Failed to unmap domain\n");
+            rc = 1;
+        } else {
+            printf("Unmapped %s\n", hostname);
+        }
+
+    } else if (!strcmp(cmd, "cert-put")) {
+        if (arg_start + 3 >= argc) { usage(argv[0]); rc = 1; goto done; }
+        const char *name      = argv[arg_start + 1];
+        const char *cert_path = argv[arg_start + 2];
+        const char *key_path  = argv[arg_start + 3];
+
+        size_t cert_len, key_len;
+        char *cert_data = read_file(cert_path, &cert_len);
+        char *key_data  = read_file(key_path, &key_len);
+
+        if (!cert_data || !key_data) {
+            fprintf(stderr, "Cannot read cert/key files\n");
+            free(cert_data);
+            free(key_data);
+            rc = 1;
+        } else {
+            char ck[512], kk[512];
+            snprintf(ck, sizeof(ck), "__certs/%s/cert.pem", name);
+            snprintf(kk, sizeof(kk), "__certs/%s/key.pem", name);
+
+            if (kv_put(kv, ck, cert_data, cert_len) != 0 ||
+                kv_put(kv, kk, key_data, key_len) != 0) {
+                fprintf(stderr, "Failed to store cert/key\n");
+                rc = 1;
+            } else {
+                printf("Stored cert '%s' (%zu + %zu bytes)\n",
+                       name, cert_len, key_len);
+            }
+            free(cert_data);
+            free(key_data);
+        }
 
     } else {
         fprintf(stderr, "Unknown command: %s\n", cmd);

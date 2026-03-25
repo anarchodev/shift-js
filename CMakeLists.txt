@@ -31,6 +31,7 @@ FetchContent_Declare(sqlite3
 )
 
 # -- shift and shift-h2 have their own CMakeLists ---
+set(ENABLE_TLS ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(shift shift_h2)
 
 # -- quickjs-ng: use its own CMakeLists (provides 'qjs' target) --------

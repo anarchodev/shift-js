@@ -51,6 +51,202 @@ static char *header_to_str(const char *val, uint32_t len) {
     return s;
 }
 
+/* Build tenant KV prefix from tenant ID. Returns NULL for ID 0 (system). */
+static const char *tenant_prefix(uint64_t tenant_id,
+                                 char *buf, size_t bufsize) {
+    if (tenant_id == 0) return NULL;
+    snprintf(buf, bufsize, "tenants/%lu/", (unsigned long)tenant_id);
+    return buf;
+}
+
+/* ======================================================================
+ * Domain cache — per-worker, hybrid in-memory cache of KV
+ * ====================================================================== */
+
+#ifdef SH2_HAS_TLS
+
+#define MAX_DOMAIN_CACHE 256
+#define MAX_HOSTNAME_LEN 256
+
+typedef struct {
+    char          hostname[MAX_HOSTNAME_LEN];
+    uint64_t      tenant_id;
+    sh2_cert_id_t cert_id;
+} domain_entry_t;
+
+typedef struct {
+    domain_entry_t    entries[MAX_DOMAIN_CACHE];
+    size_t            count;
+    kvstore_t        *kv;
+    sh2_tls_config_t *tls;
+    sh2_cert_id_t     default_cert;
+} domain_cache_t;
+
+/* Look up a domain in cache by hostname. Returns entry or NULL. */
+static domain_entry_t *domain_cache_find(domain_cache_t *dc,
+                                          const char *hostname,
+                                          uint32_t hostname_len) {
+    for (size_t i = 0; i < dc->count; i++) {
+        if (strlen(dc->entries[i].hostname) == hostname_len &&
+            memcmp(dc->entries[i].hostname, hostname, hostname_len) == 0)
+            return &dc->entries[i];
+    }
+    return NULL;
+}
+
+/* Resolve a hostname via KV lookup and cache the result. */
+static domain_entry_t *domain_cache_resolve(domain_cache_t *dc,
+                                             const char *hostname,
+                                             uint32_t hostname_len) {
+    /* Check cache first */
+    domain_entry_t *cached = domain_cache_find(dc, hostname, hostname_len);
+    if (cached) return cached;
+
+    /* Cache miss — look up domains/<hostname> in KV */
+    char domain_key[256 + 8];
+    char host_str[MAX_HOSTNAME_LEN];
+    uint32_t copy_len = hostname_len < MAX_HOSTNAME_LEN - 1
+                        ? hostname_len : MAX_HOSTNAME_LEN - 1;
+    memcpy(host_str, hostname, copy_len);
+    host_str[copy_len] = '\0';
+    snprintf(domain_key, sizeof(domain_key), "domains/%s", host_str);
+
+    void  *value = NULL;
+    size_t vlen  = 0;
+    if (kv_get(dc->kv, domain_key, &value, &vlen) != 0)
+        return NULL;  /* unknown domain */
+
+    /* Parse tenant ID */
+    char *endptr;
+    uint64_t tenant_id = strtoull(value, &endptr, 10);
+    free(value);
+
+    /* Try loading tenant-specific cert from KV */
+    sh2_cert_id_t cert_id = dc->default_cert;
+    if (tenant_id != 0) {
+        char cert_key[128], key_key[128];
+        snprintf(cert_key, sizeof(cert_key),
+                 "tenants/%lu/__certs/cert.pem", (unsigned long)tenant_id);
+        snprintf(key_key, sizeof(key_key),
+                 "tenants/%lu/__certs/key.pem", (unsigned long)tenant_id);
+
+        void *cert_raw = NULL, *key_raw = NULL;
+        size_t cert_len = 0, key_len = 0;
+
+        if (kv_get(dc->kv, cert_key, &cert_raw, &cert_len) == 0 &&
+            kv_get(dc->kv, key_key, &key_raw, &key_len) == 0) {
+            /* NUL-terminate for OpenSSL PEM parsing */
+            char *cp = malloc(cert_len + 1);
+            char *kp = malloc(key_len + 1);
+            if (cp && kp) {
+                memcpy(cp, cert_raw, cert_len); cp[cert_len] = '\0';
+                memcpy(kp, key_raw,  key_len);  kp[key_len]  = '\0';
+                sh2_cert_id_t tid;
+                if (sh2_tls_config_add_cert(dc->tls, cp, kp,
+                                             &tid) == sh2_ok)
+                    cert_id = tid;
+            }
+            free(cp);
+            free(kp);
+        }
+        free(cert_raw);
+        free(key_raw);
+    }
+
+    /* Add to cache */
+    if (dc->count < MAX_DOMAIN_CACHE) {
+        domain_entry_t *e = &dc->entries[dc->count++];
+        memcpy(e->hostname, host_str, copy_len + 1);
+        e->tenant_id = tenant_id;
+        e->cert_id   = cert_id;
+        return e;
+    }
+
+    return NULL;  /* cache full */
+}
+
+/* SNI callback — called by sh2 during TLS handshake */
+static sh2_sni_result_t sni_callback(const char *hostname,
+                                      uint32_t hostname_len,
+                                      void *user_data) {
+    domain_cache_t *dc = user_data;
+    domain_entry_t *entry = domain_cache_resolve(dc, hostname, hostname_len);
+
+    if (entry) {
+        return (sh2_sni_result_t){
+            .cert_id    = entry->cert_id,
+            .domain_tag = entry->tenant_id,
+        };
+    }
+
+    /* Unknown domain — use default cert, system tenant */
+    return (sh2_sni_result_t){
+        .cert_id    = dc->default_cert,
+        .domain_tag = 0,
+    };
+}
+
+/* Load default cert from KV and set up TLS config.
+ * Returns NULL if TLS not requested or setup fails. */
+static sh2_tls_config_t *setup_tls(kvstore_t *kv, domain_cache_t *dc,
+                                    int worker_id) {
+    sh2_tls_config_t *tls = NULL;
+    if (sh2_tls_config_create(&tls) != sh2_ok) {
+        fprintf(stderr, "Worker %d: sh2_tls_config_create failed\n", worker_id);
+        return NULL;
+    }
+
+    /* Load default cert from KV (must NUL-terminate for OpenSSL PEM parsing) */
+    void *cert_raw = NULL, *key_raw = NULL;
+    size_t cert_len = 0, key_len = 0;
+
+    if (kv_get(kv, "__certs/default/cert.pem", &cert_raw, &cert_len) != 0 ||
+        kv_get(kv, "__certs/default/key.pem", &key_raw, &key_len) != 0) {
+        fprintf(stderr, "Worker %d: default cert not found in KV "
+                "(expected __certs/default/cert.pem and __certs/default/key.pem)\n",
+                worker_id);
+        free(cert_raw);
+        free(key_raw);
+        sh2_tls_config_destroy(tls);
+        return NULL;
+    }
+
+    char *cert_pem = malloc(cert_len + 1);
+    char *key_pem  = malloc(key_len + 1);
+    if (!cert_pem || !key_pem) {
+        free(cert_raw); free(key_raw);
+        free(cert_pem); free(key_pem);
+        sh2_tls_config_destroy(tls);
+        return NULL;
+    }
+    memcpy(cert_pem, cert_raw, cert_len); cert_pem[cert_len] = '\0';
+    memcpy(key_pem,  key_raw,  key_len);  key_pem[key_len]   = '\0';
+    free(cert_raw);
+    free(key_raw);
+
+    sh2_cert_id_t default_cert;
+    if (sh2_tls_config_add_cert(tls, cert_pem, key_pem,
+                                 &default_cert) != sh2_ok) {
+        fprintf(stderr, "Worker %d: failed to register default cert\n",
+                worker_id);
+        free(cert_pem);
+        free(key_pem);
+        sh2_tls_config_destroy(tls);
+        return NULL;
+    }
+    free(cert_pem);
+    free(key_pem);
+
+    dc->tls          = tls;
+    dc->default_cert = default_cert;
+
+    sh2_tls_config_set_sni_callback(tls, sni_callback, dc);
+
+    return tls;
+}
+
+#endif /* SH2_HAS_TLS */
+
 void *sjs_worker_fn(void *arg) {
     sjs_worker_config_t *wcfg = arg;
 
@@ -65,10 +261,26 @@ void *sjs_worker_fn(void *arg) {
         return NULL;
     }
 
+    /* ---- TLS setup (per-worker) ---- */
+    sh2_tls_config_t *tls = NULL;
+#ifdef SH2_HAS_TLS
+    domain_cache_t dcache = { .kv = kv };
+    if (wcfg->tls) {
+        tls = setup_tls(kv, &dcache, wcfg->worker_id);
+        if (!tls) {
+            kv_close(kv);
+            return NULL;
+        }
+    }
+#endif
+
     /* ---- QuickJS runtime (per-worker) ---- */
     sjs_runtime_t sjs = {0};
     if (sjs_runtime_init(&sjs, kv) != 0) {
         fprintf(stderr, "Worker %d: sjs_runtime_init failed\n", wcfg->worker_id);
+#ifdef SH2_HAS_TLS
+        if (tls) sh2_tls_config_destroy(tls);
+#endif
         kv_close(kv);
         return NULL;
     }
@@ -84,6 +296,9 @@ void *sjs_worker_fn(void *arg) {
     if (shift_context_create(&sh_cfg, &sh) != shift_ok) {
         fprintf(stderr, "Worker %d: shift_context_create failed\n", wcfg->worker_id);
         sjs_runtime_free(&sjs);
+#ifdef SH2_HAS_TLS
+        if (tls) sh2_tls_config_destroy(tls);
+#endif
         kv_close(kv);
         return NULL;
     }
@@ -94,6 +309,9 @@ void *sjs_worker_fn(void *arg) {
         fprintf(stderr, "Worker %d: sh2_register_components failed\n", wcfg->worker_id);
         shift_context_destroy(sh);
         sjs_runtime_free(&sjs);
+#ifdef SH2_HAS_TLS
+        if (tls) sh2_tls_config_destroy(tls);
+#endif
         kv_close(kv);
         return NULL;
     }
@@ -116,6 +334,9 @@ void *sjs_worker_fn(void *arg) {
         fprintf(stderr, "Worker %d: collection register failed\n", wcfg->worker_id);
         shift_context_destroy(sh);
         sjs_runtime_free(&sjs);
+#ifdef SH2_HAS_TLS
+        if (tls) sh2_tls_config_destroy(tls);
+#endif
         kv_close(kv);
         return NULL;
     }
@@ -132,12 +353,18 @@ void *sjs_worker_fn(void *arg) {
         .request_out         = request_out,
         .response_in         = response_in,
         .response_result_out = response_result_out,
+#ifdef SH2_HAS_TLS
+        .tls                 = tls,
+#endif
     };
     if (sh2_context_create(&h2cfg, &h2) != sh2_ok) {
         fprintf(stderr, "Worker %d: sh2_context_create failed: errno=%d (%s)\n",
                 wcfg->worker_id, errno, strerror(errno));
         shift_context_destroy(sh);
         sjs_runtime_free(&sjs);
+#ifdef SH2_HAS_TLS
+        if (tls) sh2_tls_config_destroy(tls);
+#endif
         kv_close(kv);
         return NULL;
     }
@@ -148,12 +375,15 @@ void *sjs_worker_fn(void *arg) {
         sh2_context_destroy(h2);
         shift_context_destroy(sh);
         sjs_runtime_free(&sjs);
+#ifdef SH2_HAS_TLS
+        if (tls) sh2_tls_config_destroy(tls);
+#endif
         kv_close(kv);
         return NULL;
     }
 
-    printf("shift-js worker %d: listening on port %d\n",
-           wcfg->worker_id, wcfg->port);
+    printf("shift-js worker %d: listening on port %d (%s)\n",
+           wcfg->worker_id, wcfg->port, tls ? "h2 TLS" : "h2c");
 
     /* ---- Event loop ---- */
     while (*wcfg->running) {
@@ -201,6 +431,16 @@ void *sjs_worker_fn(void *arg) {
                     continue;
                 }
 
+                /* Resolve tenant from domain_tag */
+                sh2_domain_tag_t *dtag = NULL;
+                shift_entity_get_component(sh, e, comp.domain_tag, (void **)&dtag);
+                uint64_t tenant_id = dtag ? dtag->tag : 0;
+
+                char prefix_buf[64];
+                const char *prefix = tenant_prefix(tenant_id,
+                                                    prefix_buf,
+                                                    sizeof(prefix_buf));
+
                 char *method_str = header_to_str(method_val, method_len);
                 char *path_str   = header_to_str(path_val, path_len);
 
@@ -212,6 +452,7 @@ void *sjs_worker_fn(void *arg) {
                     .header_count = rqh->count,
                     .body         = rqb->data,
                     .body_len     = rqb->len,
+                    .kv_prefix    = prefix,
                 };
 
                 uint32_t body_len = 0;
@@ -300,6 +541,9 @@ void *sjs_worker_fn(void *arg) {
 
     shift_context_destroy(sh);
     sjs_runtime_free(&sjs);
+#ifdef SH2_HAS_TLS
+    if (tls) sh2_tls_config_destroy(tls);
+#endif
     kv_close(kv);
 
     printf("shift-js worker %d: shutdown complete\n", wcfg->worker_id);

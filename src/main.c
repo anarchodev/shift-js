@@ -22,6 +22,7 @@ static void usage(const char *prog) {
             "  -d <path>    SQLite database path (default: shift-js.db)\n"
             "  -p <port>    Listen port (default: 9000)\n"
             "  -w <count>   Worker thread count (default: number of CPUs)\n"
+            "  -t           Enable TLS (certs loaded from KV)\n"
             "  -h           Show this help\n",
             prog);
 }
@@ -30,13 +31,15 @@ int main(int argc, char **argv) {
     const char *db_path = "shift-js.db";
     uint16_t    port    = 9000;
     int         nworkers = 0;
+    bool        tls      = false;
 
     int opt;
-    while ((opt = getopt(argc, argv, "d:p:w:h")) != -1) {
+    while ((opt = getopt(argc, argv, "d:p:w:th")) != -1) {
         switch (opt) {
         case 'd': db_path  = optarg; break;
         case 'p': port     = (uint16_t)atoi(optarg); break;
         case 'w': nworkers = atoi(optarg); break;
+        case 't': tls      = true; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
@@ -49,7 +52,8 @@ int main(int argc, char **argv) {
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
-    printf("shift-js: %d workers, port %d, db %s\n", nworkers, port, db_path);
+    printf("shift-js: %d workers, port %d, db %s%s\n",
+           nworkers, port, db_path, tls ? ", TLS" : "");
 
     sjs_worker_config_t *configs = calloc((size_t)nworkers, sizeof(*configs));
     pthread_t           *threads = calloc((size_t)nworkers, sizeof(*threads));
@@ -61,6 +65,7 @@ int main(int argc, char **argv) {
             .db_path     = db_path,
             .port        = port,
             .running     = &g_running,
+            .tls         = tls,
         };
         pthread_create(&threads[i], NULL, sjs_worker_fn, &configs[i]);
     }
