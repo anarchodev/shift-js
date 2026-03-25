@@ -722,6 +722,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
     JS_SetContextOpaque(ctx, req);
 
     /* ---- Phase 3: Load bytecode, evaluate module, call handler ---- */
+    kv_begin(sjs->kv);
     JSValue module_val = JS_ReadObject(ctx, bytecode, bc_len,
                                        JS_READ_OBJ_BYTECODE);
     free(bytecode);
@@ -763,6 +764,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
     JSValue handler = JS_GetPropertyStr(ctx, ns, func_name);
 
     if (!JS_IsFunction(ctx, handler)) {
+        kv_rollback(sjs->kv);
         arena_release(sjs, arena);
         free(module_path);
         req->resp_status = 405;
@@ -834,6 +836,9 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         }
     }
 
+    /* Commit the transaction — all KV mutations from this handler are atomic. */
+    kv_commit(sjs->kv);
+
     /* No JS teardown — just release the arena back to the free list. */
     arena_release(sjs, arena);
     free(module_path);
@@ -845,6 +850,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
     return body;
 
 arena_fail:
+    kv_rollback(sjs->kv);
     arena_release(sjs, arena);
     free(bytecode);
     free(module_path);

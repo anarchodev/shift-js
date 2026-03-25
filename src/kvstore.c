@@ -10,6 +10,9 @@ struct kvstore {
     sqlite3_stmt *stmt_put;
     sqlite3_stmt *stmt_del;
     sqlite3_stmt *stmt_range;
+    sqlite3_stmt *stmt_begin;
+    sqlite3_stmt *stmt_commit;
+    sqlite3_stmt *stmt_rollback;
 };
 
 static const char SQL_CREATE[] =
@@ -21,7 +24,10 @@ static const char SQL_CREATE[] =
 static const char SQL_GET[]   = "SELECT value FROM kv WHERE key = ?;";
 static const char SQL_PUT[]   = "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?);";
 static const char SQL_DEL[]   = "DELETE FROM kv WHERE key = ?;";
-static const char SQL_RANGE[] = "SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key LIMIT ?;";
+static const char SQL_RANGE[]    = "SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key LIMIT ?;";
+static const char SQL_BEGIN[]    = "BEGIN;";
+static const char SQL_COMMIT[]   = "COMMIT;";
+static const char SQL_ROLLBACK[] = "ROLLBACK;";
 
 int kv_open(const char *path, kvstore_t **out) {
     kvstore_t *s = calloc(1, sizeof(*s));
@@ -47,6 +53,12 @@ int kv_open(const char *path, kvstore_t **out) {
         goto fail;
     if (sqlite3_prepare_v2(s->db, SQL_RANGE, -1, &s->stmt_range, NULL) != SQLITE_OK)
         goto fail;
+    if (sqlite3_prepare_v2(s->db, SQL_BEGIN, -1, &s->stmt_begin, NULL) != SQLITE_OK)
+        goto fail;
+    if (sqlite3_prepare_v2(s->db, SQL_COMMIT, -1, &s->stmt_commit, NULL) != SQLITE_OK)
+        goto fail;
+    if (sqlite3_prepare_v2(s->db, SQL_ROLLBACK, -1, &s->stmt_rollback, NULL) != SQLITE_OK)
+        goto fail;
 
     *out = s;
     return 0;
@@ -63,8 +75,35 @@ void kv_close(kvstore_t *store) {
     sqlite3_finalize(store->stmt_put);
     sqlite3_finalize(store->stmt_del);
     sqlite3_finalize(store->stmt_range);
+    sqlite3_finalize(store->stmt_begin);
+    sqlite3_finalize(store->stmt_commit);
+    sqlite3_finalize(store->stmt_rollback);
     sqlite3_close(store->db);
     free(store);
+}
+
+int kv_begin(kvstore_t *store) {
+    sqlite3_stmt *st = store->stmt_begin;
+    sqlite3_reset(st);
+    int rc = sqlite3_step(st);
+    sqlite3_reset(st);
+    return (rc == SQLITE_DONE) ? 0 : -2;
+}
+
+int kv_commit(kvstore_t *store) {
+    sqlite3_stmt *st = store->stmt_commit;
+    sqlite3_reset(st);
+    int rc = sqlite3_step(st);
+    sqlite3_reset(st);
+    return (rc == SQLITE_DONE) ? 0 : -2;
+}
+
+int kv_rollback(kvstore_t *store) {
+    sqlite3_stmt *st = store->stmt_rollback;
+    sqlite3_reset(st);
+    int rc = sqlite3_step(st);
+    sqlite3_reset(st);
+    return (rc == SQLITE_DONE) ? 0 : -2;
 }
 
 int kv_get(kvstore_t *store, const char *key, void **out_value, size_t *out_len) {
