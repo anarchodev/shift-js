@@ -31,7 +31,7 @@
       kv.put("__tenants/" + nextId, JSON.stringify(meta));
       kv.put("tenants/" + nextId + "/__code/index.ejs", '<h1>Hello, world!</h1>\n<p>Your new tenant is ready.</p>');
       response.status(303);
-      response.header("location", "/tenants");
+      response.header("location", "/_admin/tenants");
       return "";
     }
   }
@@ -75,8 +75,9 @@
 <body>
   <h1>Tenants</h1>
   <nav>
-    <a href="/">&larr; Dashboard</a>
-    <a href="/domains">Domains</a>
+    <a href="/_admin">&larr; Dashboard</a>
+    <a href="/_admin/domains">Domains</a>
+    <a href="/_admin/editor">Editor</a>
   </nav>
 
   <table>
@@ -117,7 +118,7 @@
     async function createTenant(e) {
       e.preventDefault();
       let name = document.getElementById("tenant-name").value;
-      await fetch("/tenants", {
+      await fetch("/_admin/tenants", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ name })
@@ -128,7 +129,7 @@
 
     async function deleteTenant(id) {
       if (!confirm("Delete tenant " + id + "?")) return;
-      await fetch("/tenants", {
+      await fetch("/_admin/tenants", {
         method: "DELETE",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ id })

@@ -1,61 +1,68 @@
-<%
-  let tenants = [];
-  let raw = kv.range("__tenants/", "__tenants/\x7f", 100);
-  if (raw) {
-    for (let entry of raw) {
-      let meta = JSON.parse(entry.value);
-      tenants.push(meta);
-    }
-  }
-
-  let domains = [];
-  let rawDomains = kv.range("domains/", "domains/\x7f", 100);
-  if (rawDomains) {
-    for (let entry of rawDomains) {
-      domains.push({ host: entry.key.slice(8), tenant_id: entry.value });
-    }
-  }
-%>
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>shift-js admin</title>
+  <title>shift-js</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: system-ui, sans-serif; background: #f5f5f5; color: #333; padding: 2rem; max-width: 960px; margin: 0 auto; }
-    h1 { margin-bottom: 0.5rem; }
-    .subtitle { color: #666; margin-bottom: 2rem; }
-    .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2rem; }
-    .card { background: #fff; border-radius: 8px; padding: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-    .card h2 { font-size: 1.1rem; margin-bottom: 0.25rem; }
-    .card .count { font-size: 2rem; font-weight: 700; color: #2563eb; }
-    .card a { display: inline-block; margin-top: 0.75rem; color: #2563eb; text-decoration: none; }
-    .card a:hover { text-decoration: underline; }
-    nav { margin-bottom: 2rem; }
-    nav a { color: #2563eb; text-decoration: none; margin-right: 1.5rem; font-weight: 500; }
-    nav a:hover { text-decoration: underline; }
+    body { font-family: system-ui, sans-serif; background: #f5f5f5; color: #333; }
+    .hero { max-width: 720px; margin: 0 auto; padding: 4rem 2rem; }
+    h1 { font-size: 2.5rem; margin-bottom: 0.5rem; }
+    h1 span { color: #2563eb; }
+    .tagline { font-size: 1.2rem; color: #666; margin-bottom: 2.5rem; }
+    .features { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2.5rem; }
+    .feature { background: #fff; border-radius: 8px; padding: 1.25rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .feature h3 { font-size: 0.95rem; margin-bottom: 0.35rem; }
+    .feature p { font-size: 0.9rem; color: #555; line-height: 1.5; }
+    .example { background: #1e293b; color: #e2e8f0; border-radius: 8px; padding: 1.25rem; font-family: "SF Mono", "Fira Code", monospace; font-size: 0.85rem; line-height: 1.6; overflow-x: auto; margin-bottom: 2rem; }
+    .example .comment { color: #64748b; }
+    .example .kw { color: #7dd3fc; }
+    .example .str { color: #86efac; }
+    .example .fn { color: #c4b5fd; }
+    .links { display: flex; gap: 1rem; }
+    .links a { display: inline-block; padding: 0.6rem 1.25rem; border-radius: 6px; text-decoration: none; font-weight: 500; font-size: 0.95rem; }
+    .links .primary { background: #2563eb; color: #fff; }
+    .links .primary:hover { background: #1d4ed8; }
+    .links .secondary { background: #fff; color: #333; border: 1px solid #ddd; }
+    .links .secondary:hover { background: #f9fafb; }
   </style>
 </head>
 <body>
-  <h1>shift-js admin</h1>
-  <p class="subtitle">Tenant management dashboard</p>
+  <div class="hero">
+    <h1><span>shift-js</span></h1>
+    <p class="tagline">A high-performance HTTP/2 server that runs JavaScript handlers, powered by QuickJS and io_uring.</p>
 
-  <nav>
-    <a href="/tenants">Tenants</a>
-    <a href="/domains">Domains</a>
-  </nav>
-
-  <div class="cards">
-    <div class="card">
-      <h2>Tenants</h2>
-      <div class="count"><%= tenants.length %></div>
-      <a href="/tenants">Manage tenants &rarr;</a>
+    <div class="features">
+      <div class="feature">
+        <h3>Per-request isolation</h3>
+        <p>Each request runs in a fresh JS context restored from a frozen snapshot via memcpy &mdash; no GC, no cross-request state leakage.</p>
+      </div>
+      <div class="feature">
+        <h3>Zero-copy arena allocator</h3>
+        <p>JS allocations use a 256KB bump allocator. The entire arena is reclaimed at once when the request completes.</p>
+      </div>
+      <div class="feature">
+        <h3>Built-in KV store</h3>
+        <p>SQLite-backed key-value storage accessible from JS handlers. Modules, bytecode cache, and app data all live in the same store.</p>
+      </div>
+      <div class="feature">
+        <h3>Multitenancy</h3>
+        <p>Tenant isolation via KV prefix scoping and TLS SNI routing. Per-tenant modules, data, and TLS certificates.</p>
+      </div>
     </div>
-    <div class="card">
-      <h2>Domain mappings</h2>
-      <div class="count"><%= domains.length %></div>
-      <a href="/domains">Manage domains &rarr;</a>
+
+    <div class="example">
+      <span class="comment">// Deploy a handler with sjsctl</span><br>
+      <span class="comment">// $ ./sjsctl -d app.db put "__code/index.mjs" '...'</span><br><br>
+      <span class="kw">export function</span> <span class="fn">get</span>() {<br>
+      &nbsp;&nbsp;<span class="kw">let</span> visits = kv.<span class="fn">get</span>(<span class="str">"visits"</span>) || <span class="str">"0"</span>;<br>
+      &nbsp;&nbsp;kv.<span class="fn">put</span>(<span class="str">"visits"</span>, String(Number(visits) + <span class="str">1</span>));<br>
+      &nbsp;&nbsp;<span class="kw">return</span> { visits: Number(visits) + <span class="str">1</span> };<br>
+      }
+    </div>
+
+    <div class="links">
+      <a href="/_admin" class="secondary">Admin dashboard</a>
     </div>
   </div>
 </body>

@@ -131,6 +131,35 @@ static const char *prefixed_key(const char *prefix, const char *key,
     return buf;
 }
 
+/* If key is a __code/ entry, delete the corresponding __compiled/ bytecode
+ * cache entry so the server recompiles on next request. */
+static void invalidate_cache(kvstore_t *kv, const char *key,
+                             const char *tenant_prefix) {
+    /* Work on the unprefixed key — strip tenant prefix if present */
+    const char *raw = key;
+    if (tenant_prefix && strncmp(raw, tenant_prefix, strlen(tenant_prefix)) == 0)
+        raw += strlen(tenant_prefix);
+
+    if (strncmp(raw, "__code/", 7) != 0) return;
+    const char *rel = raw + 7; /* e.g. "index.ejs" or "_admin/tenants/index.ejs" */
+
+    /* Strip file extension to get the extensionless base path */
+    char base[4096];
+    snprintf(base, sizeof(base), "%s", rel);
+    char *dot = strrchr(base, '.');
+    char *slash = strrchr(base, '/');
+    if (dot && (!slash || dot > slash)) *dot = '\0';
+
+    /* Build the prefixed __compiled/ key and delete it */
+    char raw_cache[4096];
+    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base);
+
+    char cache_key[4096];
+    const char *ck = prefixed_key(tenant_prefix, raw_cache,
+                                  cache_key, sizeof(cache_key));
+    kv_delete(kv, ck);
+}
+
 static int upload_dir(kvstore_t *kv, const char *dir_path,
                       const char *code_prefix, const char *tenant_prefix) {
     DIR *d = opendir(dir_path);
@@ -188,6 +217,7 @@ static int upload_dir(kvstore_t *kv, const char *dir_path,
         }
 
         if (kv_put(kv, actual_key, contents, flen) == 0) {
+            invalidate_cache(kv, actual_key, tenant_prefix);
             printf("  %s → %s (%zu bytes)\n", filepath, actual_key, flen);
             count++;
         } else {
@@ -277,6 +307,8 @@ int main(int argc, char **argv) {
         if (kv_put(kv, key, val, strlen(val)) != 0) {
             fprintf(stderr, "Failed to put key\n");
             rc = 1;
+        } else {
+            invalidate_cache(kv, key, tenant_prefix_str);
         }
 
     } else if (!strcmp(cmd, "putfile")) {
@@ -297,6 +329,8 @@ int main(int argc, char **argv) {
             if (kv_put(kv, key, contents, flen) != 0) {
                 fprintf(stderr, "Failed to put key\n");
                 rc = 1;
+            } else {
+                invalidate_cache(kv, key, tenant_prefix_str);
             }
             free(contents);
         }

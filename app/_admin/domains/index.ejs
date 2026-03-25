@@ -36,7 +36,7 @@
     if (host && tenant_id) {
       kv.put("domains/" + host, tenant_id);
       response.status(303);
-      response.header("location", "/domains");
+      response.header("location", "/_admin/domains");
       return "";
     }
   }
@@ -82,8 +82,9 @@
 <body>
   <h1>Domain mappings</h1>
   <nav>
-    <a href="/">&larr; Dashboard</a>
-    <a href="/tenants">Tenants</a>
+    <a href="/_admin">&larr; Dashboard</a>
+    <a href="/_admin/tenants">Tenants</a>
+    <a href="/_admin/editor">Editor</a>
   </nav>
 
   <table>
@@ -133,7 +134,7 @@
       e.preventDefault();
       let host = document.getElementById("hostname").value;
       let tenant_id = document.getElementById("tenant-id").value;
-      await fetch("/domains", {
+      await fetch("/_admin/domains", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ host, tenant_id })
@@ -144,7 +145,7 @@
 
     async function unmapDomain(host) {
       if (!confirm("Remove mapping for " + host + "?")) return;
-      await fetch("/domains", {
+      await fetch("/_admin/domains", {
         method: "DELETE",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ host })
