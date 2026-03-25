@@ -28,10 +28,12 @@ int kv_get(kvstore_t *store, const char *key, void **out_value, size_t *out_len)
 int kv_put(kvstore_t *store, const char *key, const void *value, size_t len);
 int kv_delete(kvstore_t *store, const char *key);
 
-/* Transactions.  Returns 0 on success, -2 on error. */
+/* Transactions.  Returns 0 on success, -2 on error, -3 on conflict (BUSY). */
 int kv_begin(kvstore_t *store);
 int kv_commit(kvstore_t *store);
 int kv_rollback(kvstore_t *store);
+
+#define KV_CONFLICT (-3)
 
 /* Range scan: keys where start <= key < end, up to count results.
  * Caller must free the result with kv_range_free(). */

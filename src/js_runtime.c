@@ -696,168 +696,220 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         bc_len = out_bc_len;
     }
 
-    /* ---- Phase 2: Restore snapshot into a fresh arena ---- */
-    sjs_arena_t *arena = arena_acquire(sjs);
-    if (!arena) {
-        free(bytecode);
-        free(module_path);
-        req->resp_status = 503;
-        char *body = strdup("Arena Pool Exhausted");
-        *out_len = (uint32_t)strlen(body);
-        return body;
-    }
+    /* ---- Phases 2-4 with transaction retry on conflict ---- */
+    #define MAX_TXN_RETRIES 3
 
-    JSRuntime *rt = NULL;
-    JSContext *ctx = NULL;
-    if (snapshot_restore(&sjs->snapshot, arena, sjs, &rt, &ctx) != 0) {
-        arena_release(sjs, arena);
-        free(bytecode);
-        free(module_path);
-        req->resp_status = 500;
-        char *body = strdup("Internal Server Error");
-        *out_len = (uint32_t)strlen(body);
-        return body;
-    }
+    for (int attempt = 0; attempt <= MAX_TXN_RETRIES; attempt++) {
 
-    JS_SetContextOpaque(ctx, req);
+        /* Reset response state on retry */
+        if (attempt > 0) {
+            for (uint32_t i = 0; i < req->resp_header_count; i++) {
+                free(req->resp_header_names[i]);
+                free(req->resp_header_values[i]);
+            }
+            free(req->resp_header_names);
+            free(req->resp_header_values);
+            req->resp_status = 200;
+            req->resp_header_names = NULL;
+            req->resp_header_values = NULL;
+            req->resp_header_count = 0;
+            req->resp_header_cap = 0;
 
-    /* ---- Phase 3: Load bytecode, evaluate module, call handler ---- */
-    kv_begin(sjs->kv);
-    JSValue module_val = JS_ReadObject(ctx, bytecode, bc_len,
-                                       JS_READ_OBJ_BYTECODE);
-    free(bytecode);
-    bytecode = NULL;
-
-    if (JS_IsException(module_val)) {
-        const char *err = JS_ToCString(ctx, JS_GetException(ctx));
-        fprintf(stderr, "shift-js: bytecode load error in %s: %s\n",
-                module_path, err ? err : "(unknown)");
-        goto arena_fail;
-    }
-
-    JSModuleDef *mod_def = JS_VALUE_GET_PTR(module_val);
-
-    JSValue result = JS_EvalFunction(ctx, module_val);
-    if (JS_IsException(result)) {
-        const char *err = JS_ToCString(ctx, JS_GetException(ctx));
-        fprintf(stderr, "shift-js: module eval error in %s: %s\n",
-                module_path, err ? err : "(unknown)");
-        goto arena_fail;
-    }
-
-    /* Pump microtask queue — module eval returns a promise */
-    {
-        JSContext *pctx;
-        while (JS_IsJobPending(rt))
-            JS_ExecutePendingJob(rt, &pctx);
-    }
-
-    if (JS_PromiseState(ctx, result) == JS_PROMISE_REJECTED) {
-        JSValue reason = JS_PromiseResult(ctx, result);
-        const char *err = JS_ToCString(ctx, reason);
-        fprintf(stderr, "shift-js: module rejected in %s: %s\n",
-                module_path, err ? err : "(unknown)");
-        goto arena_fail;
-    }
-
-    JSValue ns = JS_GetModuleNamespace(ctx, mod_def);
-    JSValue handler = JS_GetPropertyStr(ctx, ns, func_name);
-
-    if (!JS_IsFunction(ctx, handler)) {
-        kv_rollback(sjs->kv);
-        arena_release(sjs, arena);
-        free(module_path);
-        req->resp_status = 405;
-        char *body = strdup("Method Not Allowed");
-        *out_len = (uint32_t)strlen(body);
-        return body;
-    }
-
-    JSValue ret = JS_Call(ctx, handler, JS_UNDEFINED, 0, NULL);
-
-    /* Pump microtasks after handler call */
-    {
-        JSContext *pctx;
-        while (JS_IsJobPending(rt))
-            JS_ExecutePendingJob(rt, &pctx);
-    }
-
-    if (JS_IsException(ret)) {
-        const char *err = JS_ToCString(ctx, JS_GetException(ctx));
-        fprintf(stderr, "shift-js: handler error in %s.%s: %s\n",
-                module_path, func_name, err ? err : "(unknown)");
-        goto arena_fail;
-    }
-
-    /* ---- Phase 4: Extract response body to libc heap ---- */
-    char *body = NULL;
-
-    if (JS_IsString(ret)) {
-        size_t len;
-        const char *str = JS_ToCStringLen(ctx, &len, ret);
-        body = malloc(len);
-        if (body) {
-            memcpy(body, str, len);
-            *out_len = (uint32_t)len;
+            /* Re-fetch bytecode — previous copy was freed */
+            free(bytecode);
+            bytecode = NULL;
+            if (kv_get(sjs->kv, cache_key, &bytecode, &bc_len) != 0) {
+                free(module_path);
+                req->resp_status = 500;
+                char *body = strdup("Internal Server Error");
+                *out_len = (uint32_t)strlen(body);
+                return body;
+            }
         }
-    } else if (!JS_IsUndefined(ret) && !JS_IsNull(ret)) {
-        JSValue global = JS_GetGlobalObject(ctx);
-        JSValue json = JS_GetPropertyStr(ctx, global, "JSON");
-        JSValue stringify = JS_GetPropertyStr(ctx, json, "stringify");
 
-        JSValue json_str = JS_Call(ctx, stringify, json, 1, &ret);
-        if (JS_IsString(json_str)) {
+        /* Phase 2: Restore snapshot into a fresh arena */
+        sjs_arena_t *arena = arena_acquire(sjs);
+        if (!arena) {
+            free(bytecode);
+            free(module_path);
+            req->resp_status = 503;
+            char *body = strdup("Arena Pool Exhausted");
+            *out_len = (uint32_t)strlen(body);
+            return body;
+        }
+
+        JSRuntime *rt = NULL;
+        JSContext *ctx = NULL;
+        if (snapshot_restore(&sjs->snapshot, arena, sjs, &rt, &ctx) != 0) {
+            arena_release(sjs, arena);
+            free(bytecode);
+            free(module_path);
+            req->resp_status = 500;
+            char *body = strdup("Internal Server Error");
+            *out_len = (uint32_t)strlen(body);
+            return body;
+        }
+
+        JS_SetContextOpaque(ctx, req);
+
+        /* Phase 3: Begin transaction, load bytecode, evaluate, call handler */
+        if (kv_begin(sjs->kv) == KV_CONFLICT) {
+            arena_release(sjs, arena);
+            continue;
+        }
+
+        JSValue module_val = JS_ReadObject(ctx, bytecode, bc_len,
+                                           JS_READ_OBJ_BYTECODE);
+        free(bytecode);
+        bytecode = NULL;
+
+        if (JS_IsException(module_val)) {
+            const char *err = JS_ToCString(ctx, JS_GetException(ctx));
+            fprintf(stderr, "shift-js: bytecode load error in %s: %s\n",
+                    module_path, err ? err : "(unknown)");
+            kv_rollback(sjs->kv);
+            arena_release(sjs, arena);
+            free(module_path);
+            req->resp_status = 500;
+            char *body = strdup("Bytecode Load Error");
+            *out_len = (uint32_t)strlen(body);
+            return body;
+        }
+
+        JSModuleDef *mod_def = JS_VALUE_GET_PTR(module_val);
+
+        JSValue result = JS_EvalFunction(ctx, module_val);
+        if (JS_IsException(result)) {
+            const char *err = JS_ToCString(ctx, JS_GetException(ctx));
+            fprintf(stderr, "shift-js: module eval error in %s: %s\n",
+                    module_path, err ? err : "(unknown)");
+            goto txn_fail;
+        }
+
+        /* Pump microtask queue — module eval returns a promise */
+        {
+            JSContext *pctx;
+            while (JS_IsJobPending(rt))
+                JS_ExecutePendingJob(rt, &pctx);
+        }
+
+        if (JS_PromiseState(ctx, result) == JS_PROMISE_REJECTED) {
+            JSValue reason = JS_PromiseResult(ctx, result);
+            const char *err = JS_ToCString(ctx, reason);
+            fprintf(stderr, "shift-js: module rejected in %s: %s\n",
+                    module_path, err ? err : "(unknown)");
+            goto txn_fail;
+        }
+
+        JSValue ns = JS_GetModuleNamespace(ctx, mod_def);
+        JSValue handler = JS_GetPropertyStr(ctx, ns, func_name);
+
+        if (!JS_IsFunction(ctx, handler)) {
+            kv_rollback(sjs->kv);
+            arena_release(sjs, arena);
+            free(module_path);
+            req->resp_status = 405;
+            char *body = strdup("Method Not Allowed");
+            *out_len = (uint32_t)strlen(body);
+            return body;
+        }
+
+        JSValue ret = JS_Call(ctx, handler, JS_UNDEFINED, 0, NULL);
+
+        /* Pump microtasks after handler call */
+        {
+            JSContext *pctx;
+            while (JS_IsJobPending(rt))
+                JS_ExecutePendingJob(rt, &pctx);
+        }
+
+        if (JS_IsException(ret)) {
+            const char *err = JS_ToCString(ctx, JS_GetException(ctx));
+            fprintf(stderr, "shift-js: handler error in %s.%s: %s\n",
+                    module_path, func_name, err ? err : "(unknown)");
+            goto txn_fail;
+        }
+
+        /* Phase 4: Extract response body to libc heap */
+        char *body = NULL;
+
+        if (JS_IsString(ret)) {
             size_t len;
-            const char *str = JS_ToCStringLen(ctx, &len, json_str);
+            const char *str = JS_ToCStringLen(ctx, &len, ret);
             body = malloc(len);
             if (body) {
                 memcpy(body, str, len);
                 *out_len = (uint32_t)len;
             }
+        } else if (!JS_IsUndefined(ret) && !JS_IsNull(ret)) {
+            JSValue global = JS_GetGlobalObject(ctx);
+            JSValue json = JS_GetPropertyStr(ctx, global, "JSON");
+            JSValue stringify = JS_GetPropertyStr(ctx, json, "stringify");
 
-            bool has_ct = false;
-            for (uint32_t i = 0; i < req->resp_header_count; i++) {
-                if (!strcasecmp(req->resp_header_names[i], "content-type")) {
-                    has_ct = true;
-                    break;
+            JSValue json_str = JS_Call(ctx, stringify, json, 1, &ret);
+            if (JS_IsString(json_str)) {
+                size_t len;
+                const char *str = JS_ToCStringLen(ctx, &len, json_str);
+                body = malloc(len);
+                if (body) {
+                    memcpy(body, str, len);
+                    *out_len = (uint32_t)len;
+                }
+
+                bool has_ct = false;
+                for (uint32_t i = 0; i < req->resp_header_count; i++) {
+                    if (!strcasecmp(req->resp_header_names[i], "content-type")) {
+                        has_ct = true;
+                        break;
+                    }
+                }
+                if (!has_ct) {
+                    if (req->resp_header_count == req->resp_header_cap) {
+                        uint32_t nc = req->resp_header_cap ? req->resp_header_cap * 2 : 8;
+                        req->resp_header_names = realloc(req->resp_header_names, nc * sizeof(char *));
+                        req->resp_header_values = realloc(req->resp_header_values, nc * sizeof(char *));
+                        req->resp_header_cap = nc;
+                    }
+                    req->resp_header_names[req->resp_header_count] = strdup("content-type");
+                    req->resp_header_values[req->resp_header_count] = strdup("application/json");
+                    req->resp_header_count++;
                 }
             }
-            if (!has_ct) {
-                if (req->resp_header_count == req->resp_header_cap) {
-                    uint32_t nc = req->resp_header_cap ? req->resp_header_cap * 2 : 8;
-                    req->resp_header_names = realloc(req->resp_header_names, nc * sizeof(char *));
-                    req->resp_header_values = realloc(req->resp_header_values, nc * sizeof(char *));
-                    req->resp_header_cap = nc;
-                }
-                req->resp_header_names[req->resp_header_count] = strdup("content-type");
-                req->resp_header_values[req->resp_header_count] = strdup("application/json");
-                req->resp_header_count++;
-            }
+        }
+
+        /* Commit — retry on conflict */
+        if (kv_commit(sjs->kv) == KV_CONFLICT) {
+            free(body);
+            arena_release(sjs, arena);
+            continue;
+        }
+
+        arena_release(sjs, arena);
+        free(module_path);
+
+        if (!body) {
+            body = strdup("");
+            *out_len = 0;
+        }
+        return body;
+
+    txn_fail:
+        kv_rollback(sjs->kv);
+        arena_release(sjs, arena);
+        free(module_path);
+        req->resp_status = 500;
+        {
+            char *body = strdup("Internal Server Error");
+            *out_len = (uint32_t)strlen(body);
+            return body;
         }
     }
 
-    /* Commit the transaction — all KV mutations from this handler are atomic. */
-    kv_commit(sjs->kv);
-
-    /* No JS teardown — just release the arena back to the free list. */
-    arena_release(sjs, arena);
-    free(module_path);
-
-    if (!body) {
-        body = strdup("");
-        *out_len = 0;
-    }
-    return body;
-
-arena_fail:
-    kv_rollback(sjs->kv);
-    arena_release(sjs, arena);
+    /* All retries exhausted */
     free(bytecode);
     free(module_path);
-    req->resp_status = 500;
-    {
-        char *body = strdup("Internal Server Error");
-        *out_len = (uint32_t)strlen(body);
-        return body;
-    }
+    req->resp_status = 409;
+    char *body = strdup("Transaction Conflict");
+    *out_len = (uint32_t)strlen(body);
+    return body;
 }

@@ -87,6 +87,7 @@ int kv_begin(kvstore_t *store) {
     sqlite3_reset(st);
     int rc = sqlite3_step(st);
     sqlite3_reset(st);
+    if (rc == SQLITE_BUSY) return KV_CONFLICT;
     return (rc == SQLITE_DONE) ? 0 : -2;
 }
 
@@ -95,6 +96,7 @@ int kv_commit(kvstore_t *store) {
     sqlite3_reset(st);
     int rc = sqlite3_step(st);
     sqlite3_reset(st);
+    if (rc == SQLITE_BUSY) return KV_CONFLICT;
     return (rc == SQLITE_DONE) ? 0 : -2;
 }
 
