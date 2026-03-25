@@ -7,6 +7,82 @@
 #include <sys/stat.h>
 #include <dirent.h>
 
+/* Prepend tenant prefix to a key. Returns key as-is if prefix is NULL. */
+static const char *prefixed_key(const char *prefix, const char *key,
+                                char *buf, size_t bufsize);
+
+static int write_file(const char *path, const void *data, size_t len) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    size_t written = fwrite(data, 1, len, f);
+    fclose(f);
+    return (written == len) ? 0 : -1;
+}
+
+static int mkdirs(const char *path) {
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return -1;
+            *p = '/';
+        }
+    }
+    return 0;
+}
+
+static int export_code(kvstore_t *kv, const char *out_dir,
+                       const char *tenant_prefix) {
+    /* Range scan for all __code/ keys */
+    char sbuf[4096], ebuf[4096];
+    const char *raw_start = "__code/";
+    const char *start = prefixed_key(tenant_prefix, raw_start,
+                                     sbuf, sizeof(sbuf));
+    char raw_end[64];
+    snprintf(raw_end, sizeof(raw_end), "__code/\x7f");
+    const char *end = prefixed_key(tenant_prefix, raw_end,
+                                   ebuf, sizeof(ebuf));
+
+    kv_range_result_t result;
+    if (kv_range(kv, start, end, 100000, &result) != 0) {
+        fprintf(stderr, "Failed to list code entries\n");
+        return -1;
+    }
+
+    size_t pfx_len = tenant_prefix ? strlen(tenant_prefix) : 0;
+    int count = 0;
+
+    for (size_t i = 0; i < result.count; i++) {
+        /* Strip tenant prefix and __code/ to get relative path */
+        const char *full_key = result.entries[i].key + pfx_len;
+        if (strncmp(full_key, "__code/", 7) != 0) continue;
+        const char *rel_path = full_key + 7; /* skip "__code/" */
+
+        char filepath[4096];
+        snprintf(filepath, sizeof(filepath), "%s/%s", out_dir, rel_path);
+
+        /* Create parent directories */
+        if (mkdirs(filepath) != 0) {
+            fprintf(stderr, "Cannot create directories for %s: %s\n",
+                    filepath, strerror(errno));
+            continue;
+        }
+
+        if (write_file(filepath, result.entries[i].value,
+                       result.entries[i].value_len) != 0) {
+            fprintf(stderr, "  FAILED: %s\n", filepath);
+        } else {
+            printf("  %s → %s (%zu bytes)\n", full_key, filepath,
+                   result.entries[i].value_len);
+            count++;
+        }
+    }
+
+    kv_range_free(&result);
+    return count;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s -d <db> [-t <tenant_id>] <command> [args...]\n\n"
@@ -17,6 +93,8 @@ static void usage(const char *prog) {
         "  delete <key>                Delete key\n"
         "  range <start> <end> [count] List keys in range\n"
         "  upload <dir> [prefix]       Upload directory tree as __code/<prefix>/...\n"
+        "  import <dir> [prefix]       Alias for upload\n"
+        "  export <dir>                Export all __code/ entries to directory\n"
         "  list [prefix]               List all keys with optional prefix\n"
         "  domain-map <host> <id>      Map hostname to tenant ID\n"
         "  domain-unmap <host>         Remove hostname mapping\n"
@@ -262,13 +340,31 @@ int main(int argc, char **argv) {
             kv_range_free(&result);
         }
 
-    } else if (!strcmp(cmd, "upload")) {
+    } else if (!strcmp(cmd, "upload") || !strcmp(cmd, "import")) {
         if (arg_start + 1 >= argc) { usage(argv[0]); rc = 1; goto done; }
         const char *dir = argv[arg_start + 1];
         const char *prefix = (arg_start + 2 < argc) ? argv[arg_start + 2] : "";
 
         int n = upload_dir(kv, dir, prefix, tenant_prefix_str);
-        printf("Uploaded %d files\n", n);
+        printf("Imported %d files\n", n);
+
+    } else if (!strcmp(cmd, "export")) {
+        if (arg_start + 1 >= argc) { usage(argv[0]); rc = 1; goto done; }
+        const char *dir = argv[arg_start + 1];
+
+        if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+            fprintf(stderr, "Cannot create output directory: %s: %s\n",
+                    dir, strerror(errno));
+            rc = 1;
+            goto done;
+        }
+
+        int n = export_code(kv, dir, tenant_prefix_str);
+        if (n < 0) {
+            rc = 1;
+        } else {
+            printf("Exported %d files\n", n);
+        }
 
     } else if (!strcmp(cmd, "list")) {
         const char *prefix = (arg_start + 1 < argc) ? argv[arg_start + 1] : "";
