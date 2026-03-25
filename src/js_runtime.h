@@ -17,11 +17,28 @@ typedef struct sjs_arena {
     char    data[];          /* flexible array — SJS_ARENA_SIZE bytes */
 } sjs_arena_t;
 
+/* Frozen snapshot of a JS runtime+context with intrinsics set up.
+ * Created once at worker init. Restored per-request via memcpy + relocation. */
+typedef struct {
+    void     *data;         /* saved arena content */
+    size_t    used;         /* bytes used in arena */
+    uint64_t *bitmap;       /* relocation bitmap: 1 bit per 8-byte slot */
+    size_t    bitmap_words; /* number of uint64_t words in bitmap */
+    char     *old_base;     /* arena data base when snapshot was taken */
+    /* Offsets of JSRuntime* and JSContext* within the arena data,
+     * so we can find them after restore without searching. */
+    size_t    rt_offset;
+    size_t    ctx_offset;
+} sjs_snapshot_t;
+
 /* Per-worker JS state — one per thread, long-lived. */
 typedef struct {
     /* Long-lived compiler runtime (standard allocator). */
     JSRuntime *compile_rt;
     JSContext *compile_ctx;
+
+    /* Frozen snapshot for fast per-request context creation. */
+    sjs_snapshot_t snapshot;
 
     /* Free list of pre-allocated fixed-size arenas. */
     sjs_arena_t *arena_free;

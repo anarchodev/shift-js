@@ -369,6 +369,169 @@ static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
 }
 
 /* ======================================================================
+ * Arena snapshot: freeze a fully-initialized runtime+context into a
+ * relocatable image. Restore per-request via memcpy + pointer fixup.
+ * ====================================================================== */
+
+static int snapshot_create(sjs_runtime_t *sjs, sjs_snapshot_t *snap) {
+    /* Use one arena from the pool to build the template */
+    sjs_arena_t *arena = arena_acquire(sjs);
+    if (!arena) return -1;
+
+    JSRuntime *rt = JS_NewRuntime2(&bump_mf, arena);
+    if (!rt) { arena_release(sjs, arena); return -1; }
+
+    JS_SetRuntimeOpaque(rt, sjs);
+
+    JSContext *ctx = JS_NewContextRaw(rt);
+    if (!ctx) { arena_release(sjs, arena); return -1; }
+
+    JS_AddIntrinsicBaseObjects(ctx);
+    JS_AddIntrinsicJSON(ctx);
+    JS_AddIntrinsicPromise(ctx);
+
+    /* Install globals with NULL request context — just the structure */
+    js_install_kv(ctx);
+    js_install_request(ctx);
+    js_install_response(ctx);
+
+    /* Save the arena content */
+    snap->used = arena->used;
+    snap->data = malloc(snap->used);
+    if (!snap->data) { arena_release(sjs, arena); return -1; }
+    memcpy(snap->data, arena->data, snap->used);
+    snap->old_base = arena->data;
+
+    /* Record offsets of rt and ctx within the arena so we can find them
+     * after restore. They are the first two allocations. */
+    snap->rt_offset  = (char *)rt  - arena->data;
+    snap->ctx_offset = (char *)ctx - arena->data;
+
+    /* Build relocation bitmap: 1 bit per 8-byte-aligned slot.
+     * A bit is set if the 8-byte value at that offset is a pointer
+     * into the arena range [base, base+used). */
+    size_t num_slots = snap->used / sizeof(void *);
+    snap->bitmap_words = (num_slots + 63) / 64;
+    snap->bitmap = calloc(snap->bitmap_words, sizeof(uint64_t));
+    if (!snap->bitmap) { free(snap->data); arena_release(sjs, arena); return -1; }
+
+    char *base = arena->data;
+    char *end  = base + arena->used;
+    size_t reloc_count = 0;
+
+    for (size_t i = 0; i < num_slots; i++) {
+        void *val;
+        memcpy(&val, base + i * sizeof(void *), sizeof(void *));
+        if ((char *)val >= base && (char *)val < end) {
+            snap->bitmap[i / 64] |= (uint64_t)1 << (i % 64);
+            reloc_count++;
+        }
+    }
+
+    fprintf(stderr, "shift-js: snapshot created: %zu bytes, %zu relocations\n",
+            snap->used, reloc_count);
+
+    /* Return the arena to the pool — the snapshot is in snap->data */
+    arena_release(sjs, arena);
+    return 0;
+}
+
+static void snapshot_destroy(sjs_snapshot_t *snap) {
+    free(snap->data);
+    free(snap->bitmap);
+    memset(snap, 0, sizeof(*snap));
+}
+
+/* Restore a snapshot into a fresh arena. Returns the JSRuntime* and
+ * JSContext* at their new addresses. The arena is ready for use —
+ * additional allocations (bytecode load, handler execution) go after
+ * the restored content. */
+static int snapshot_restore(const sjs_snapshot_t *snap, sjs_arena_t *arena,
+                            sjs_runtime_t *sjs,
+                            JSRuntime **out_rt, JSContext **out_ctx) {
+    memcpy(arena->data, snap->data, snap->used);
+    arena->used = snap->used;
+
+    ptrdiff_t delta = arena->data - snap->old_base;
+
+    if (delta != 0) {
+        /* Walk the bitmap and relocate every marked pointer */
+        for (size_t i = 0; i < snap->bitmap_words; i++) {
+            uint64_t word = snap->bitmap[i];
+            while (word) {
+                int bit = __builtin_ctzll(word);
+                size_t offset = ((size_t)i * 64 + (size_t)bit) * sizeof(void *);
+                char **slot = (char **)(arena->data + offset);
+                *slot += delta;
+                word &= word - 1;
+            }
+        }
+    }
+
+    /* The JSRuntime and JSContext are at known offsets */
+    JSRuntime *rt  = (JSRuntime *)(arena->data + snap->rt_offset);
+    JSContext *ctx  = (JSContext *)(arena->data + snap->ctx_offset);
+
+    /* Patch the malloc state opaque to point to the new arena,
+     * and the runtime opaque to point to our sjs_runtime_t */
+    JS_SetRuntimeOpaque(rt, sjs);
+
+    /* The JSMallocState.opaque is an external pointer (points to sjs_arena_t,
+     * not inside the arena data). We need to set it to the new arena.
+     * JS_SetRuntimeOpaque doesn't do this — we need to find JSMallocState.
+     * It's stored inside JSRuntime. The custom allocator's opaque was the
+     * arena pointer. After memcpy it still points to the old arena.
+     * Unfortunately there's no public API for this, but JSMallocState is
+     * at a fixed offset within JSRuntime. We can use a workaround:
+     * the bump_mf functions receive opaque as the arena pointer. After
+     * restore, any new allocation will use the wrong arena. We fix this
+     * by knowing that JSRuntime stores JSMallocState which has .opaque.
+     *
+     * Since JSRuntime is opaque to us, we use a trick: create a tiny
+     * test allocation, and if it lands in our arena, the opaque is correct.
+     * Actually, simpler: the opaque pointer was set to &arena (the
+     * sjs_arena_t*) when we called JS_NewRuntime2. But the sjs_arena_t
+     * struct lives OUTSIDE the arena data (it's the header before data[]).
+     * So it was NOT relocated by the bitmap (it's external). But after
+     * restore, we're using a different sjs_arena_t. We need to patch it.
+     *
+     * The cleanest approach: scan for the old arena pointer in the restored
+     * data and replace it. The old opaque was snap->old_base - offsetof(sjs_arena_t, data).
+     * Actually, the opaque passed to JS_NewRuntime2 was the sjs_arena_t*
+     * itself, which equals (arena_header*). Let's just find and patch it.
+     */
+
+    /* The JSMallocState.opaque field holds the sjs_arena_t pointer.
+     * When we created the snapshot, opaque pointed to the original arena.
+     * We need it to point to the new arena. The original arena pointer was:
+     *   old_arena = container_of(snap->old_base, sjs_arena_t, data)
+     * The new arena pointer is just `arena`.
+     * We scan the JSRuntime region for this value and patch it. */
+    {
+        sjs_arena_t *old_arena = (sjs_arena_t *)(snap->old_base - offsetof(sjs_arena_t, data));
+        /* JSMallocState is near the beginning of JSRuntime.
+         * Scan first 256 bytes — the opaque field is early in the struct. */
+        char *rt_bytes = (char *)rt;
+        size_t scan_len = 256;
+        if (snap->rt_offset + scan_len > arena->used)
+            scan_len = arena->used - snap->rt_offset;
+        for (size_t i = 0; i <= scan_len - sizeof(void *); i += sizeof(void *)) {
+            void *val;
+            memcpy(&val, rt_bytes + i, sizeof(void *));
+            if (val == old_arena) {
+                void *new_val = arena;
+                memcpy(rt_bytes + i, &new_val, sizeof(void *));
+                break;
+            }
+        }
+    }
+
+    *out_rt = rt;
+    *out_ctx = ctx;
+    return 0;
+}
+
+/* ======================================================================
  * Runtime lifecycle
  * ====================================================================== */
 
@@ -408,10 +571,21 @@ int sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv) {
         sjs->arena_free = a;
     }
 
+    /* Create the frozen snapshot of a fully-initialized runtime+context.
+     * This is the template that gets memcpy'd + relocated per request. */
+    if (snapshot_create(sjs, &sjs->snapshot) != 0) {
+        fprintf(stderr, "shift-js: snapshot_create failed\n");
+        free(sjs->arena_pool);
+        JS_FreeContext(sjs->compile_ctx);
+        JS_FreeRuntime(sjs->compile_rt);
+        return -1;
+    }
+
     return 0;
 }
 
 void sjs_runtime_free(sjs_runtime_t *sjs) {
+    snapshot_destroy(&sjs->snapshot);
     if (sjs->compile_ctx) {
         JS_FreeContext(sjs->compile_ctx);
         sjs->compile_ctx = NULL;
@@ -522,7 +696,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         bc_len = out_bc_len;
     }
 
-    /* ---- Phase 2: Acquire arena, create per-request runtime ---- */
+    /* ---- Phase 2: Restore snapshot into a fresh arena ---- */
     sjs_arena_t *arena = arena_acquire(sjs);
     if (!arena) {
         free(bytecode);
@@ -533,8 +707,9 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         return body;
     }
 
-    JSRuntime *rt = JS_NewRuntime2(&bump_mf, arena);
-    if (!rt) {
+    JSRuntime *rt = NULL;
+    JSContext *ctx = NULL;
+    if (snapshot_restore(&sjs->snapshot, arena, sjs, &rt, &ctx) != 0) {
         arena_release(sjs, arena);
         free(bytecode);
         free(module_path);
@@ -544,20 +719,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         return body;
     }
 
-    JS_SetRuntimeOpaque(rt, sjs);
-
-    JSContext *ctx = JS_NewContextRaw(rt);
-    if (!ctx) goto arena_fail;
-
-    JS_AddIntrinsicBaseObjects(ctx);
-    JS_AddIntrinsicJSON(ctx);
-    JS_AddIntrinsicPromise(ctx);
-
     JS_SetContextOpaque(ctx, req);
-
-    js_install_kv(ctx);
-    js_install_request(ctx);
-    js_install_response(ctx);
 
     /* ---- Phase 3: Load bytecode, evaluate module, call handler ---- */
     JSValue module_val = JS_ReadObject(ctx, bytecode, bc_len,
