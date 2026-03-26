@@ -7,13 +7,10 @@
 #include <stddef.h>
 
 /* Fixed-size arena for per-request JS runtimes.
- * Allocated once up front, never reallocated (no pointer invalidation).
- * Managed in a free list per worker. */
-#define SJS_ARENA_SIZE (256 * 1024)  /* 256 KB per arena */
-#define SJS_ARENA_POOL  16           /* pre-allocated arenas per worker */
+ * One arena per worker — reset between requests. */
+#define SJS_ARENA_SIZE (10 * 1024 * 1024)  /* 10 MB per arena */
 
 typedef struct sjs_arena {
-    struct sjs_arena *next;  /* free list link */
     size_t  used;
     char    data[];          /* flexible array — SJS_ARENA_SIZE bytes */
 } sjs_arena_t;
@@ -41,10 +38,8 @@ typedef struct {
     /* Frozen snapshot for fast per-request context creation. */
     sjs_snapshot_t snapshot;
 
-    /* Free list of pre-allocated fixed-size arenas. */
-    sjs_arena_t *arena_free;
-    /* Backing allocation for the pool (one contiguous block). */
-    void *arena_pool;
+    /* Single pre-allocated arena, reset between requests. */
+    sjs_arena_t *arena;
 
     kvstore_t *kv;
 

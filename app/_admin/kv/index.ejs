@@ -9,7 +9,7 @@
       let raw = kv.range(prefix, end, 10000);
       if (raw) {
         for (let entry of raw) {
-          entries.push({ key: entry.key, size: entry.value.length });
+          entries.push({ key: entry.key, size: entry.value_size });
         }
       }
       return { entries };
@@ -162,7 +162,8 @@
         document.getElementById("value-header").style.display = "";
         document.getElementById("key-path").textContent = key;
         document.getElementById("key-path").title = key;
-        document.getElementById("empty-state").style.display = "none";
+        var es = document.getElementById("empty-state");
+        if (es) es.style.display = "none";
         renderValue();
         // Highlight active key
         var items = document.querySelectorAll(".key-item");

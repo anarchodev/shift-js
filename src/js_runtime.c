@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "js_runtime.h"
 #include "kvstore.h"
 #include "preprocessor.h"
@@ -87,20 +88,28 @@ static const JSMallocFunctions bump_mf = {
 
 /* ---- Arena pool management ---- */
 
-static sjs_arena_t *arena_acquire(sjs_runtime_t *sjs) {
-    sjs_arena_t *a = sjs->arena_free;
-    if (a) {
-        sjs->arena_free = a->next;
-        a->next = NULL;
-        a->used = 0;
-        return a;
-    }
-    return NULL;
+static void arena_reset(sjs_runtime_t *sjs) {
+    sjs->arena->used = 0;
 }
 
-static void arena_release(sjs_runtime_t *sjs, sjs_arena_t *a) {
-    a->next = sjs->arena_free;
-    sjs->arena_free = a;
+/* ======================================================================
+ * JS error extraction — falls back to arena stats when OOM prevents
+ * QuickJS from allocating an exception object.
+ * ====================================================================== */
+
+static const char *js_err_string(JSContext *ctx, sjs_arena_t *arena) {
+    JSValue exc = JS_GetException(ctx);
+    if (!JS_IsNull(exc) && !JS_IsUndefined(exc)) {
+        const char *str = JS_ToCString(ctx, exc);
+        if (str) return str;
+    }
+    /* Exception is null — almost certainly arena exhaustion.
+     * Return a static string (no arena allocation needed). */
+    static _Thread_local char oom_buf[128];
+    snprintf(oom_buf, sizeof(oom_buf),
+             "arena exhausted (%zu / %d bytes used)",
+             arena->used, SJS_ARENA_SIZE);
+    return oom_buf;
 }
 
 /* ======================================================================
@@ -125,7 +134,7 @@ static const char *js_get_prefix(JSContext *ctx) {
 static JSValue js_kv_get(JSContext *ctx, JSValue this_val,
                          int argc, JSValue *argv) {
     kvstore_t *kv = js_get_kv(ctx);
-    if (!kv) return JS_EXCEPTION;
+    if (!kv) return JS_ThrowInternalError(ctx, "kv store not available");
 
     const char *key = JS_ToCString(ctx, argv[0]);
     if (!key) return JS_EXCEPTION;
@@ -133,7 +142,10 @@ static JSValue js_kv_get(JSContext *ctx, JSValue this_val,
     char pfx_buf[512];
     const char *actual_key = sjs_prefixed_key(js_get_prefix(ctx), key,
                                                pfx_buf, sizeof(pfx_buf));
-    if (!actual_key) { JS_FreeCString(ctx, key); return JS_EXCEPTION; }
+    if (!actual_key) {
+        JS_FreeCString(ctx, key);
+        return JS_ThrowRangeError(ctx, "kv key too long");
+    }
 
     void  *value = NULL;
     size_t vlen  = 0;
@@ -141,7 +153,7 @@ static JSValue js_kv_get(JSContext *ctx, JSValue this_val,
     JS_FreeCString(ctx, key);
 
     if (rc == -1) return JS_NULL;
-    if (rc < 0)   return JS_EXCEPTION;
+    if (rc < 0)   return JS_ThrowInternalError(ctx, "kv.get failed (rc=%d)", rc);
 
     JSValue result = JS_NewStringLen(ctx, value, vlen);
     free(value);
@@ -151,7 +163,7 @@ static JSValue js_kv_get(JSContext *ctx, JSValue this_val,
 static JSValue js_kv_put(JSContext *ctx, JSValue this_val,
                          int argc, JSValue *argv) {
     kvstore_t *kv = js_get_kv(ctx);
-    if (!kv) return JS_EXCEPTION;
+    if (!kv) return JS_ThrowInternalError(ctx, "kv store not available");
 
     const char *key = JS_ToCString(ctx, argv[0]);
     if (!key) return JS_EXCEPTION;
@@ -159,7 +171,10 @@ static JSValue js_kv_put(JSContext *ctx, JSValue this_val,
     char pfx_buf[512];
     const char *actual_key = sjs_prefixed_key(js_get_prefix(ctx), key,
                                                pfx_buf, sizeof(pfx_buf));
-    if (!actual_key) { JS_FreeCString(ctx, key); return JS_EXCEPTION; }
+    if (!actual_key) {
+        JS_FreeCString(ctx, key);
+        return JS_ThrowRangeError(ctx, "kv key too long");
+    }
 
     size_t vlen;
     const char *val = JS_ToCStringLen(ctx, &vlen, argv[1]);
@@ -169,13 +184,14 @@ static JSValue js_kv_put(JSContext *ctx, JSValue this_val,
     JS_FreeCString(ctx, key);
     JS_FreeCString(ctx, val);
 
-    return rc == 0 ? JS_TRUE : JS_EXCEPTION;
+    if (rc != 0) return JS_ThrowInternalError(ctx, "kv.put failed (rc=%d)", rc);
+    return JS_TRUE;
 }
 
 static JSValue js_kv_delete(JSContext *ctx, JSValue this_val,
                             int argc, JSValue *argv) {
     kvstore_t *kv = js_get_kv(ctx);
-    if (!kv) return JS_EXCEPTION;
+    if (!kv) return JS_ThrowInternalError(ctx, "kv store not available");
 
     const char *key = JS_ToCString(ctx, argv[0]);
     if (!key) return JS_EXCEPTION;
@@ -183,18 +199,22 @@ static JSValue js_kv_delete(JSContext *ctx, JSValue this_val,
     char pfx_buf[512];
     const char *actual_key = sjs_prefixed_key(js_get_prefix(ctx), key,
                                                pfx_buf, sizeof(pfx_buf));
-    if (!actual_key) { JS_FreeCString(ctx, key); return JS_EXCEPTION; }
+    if (!actual_key) {
+        JS_FreeCString(ctx, key);
+        return JS_ThrowRangeError(ctx, "kv key too long");
+    }
 
     int rc = kv_delete(kv, actual_key);
     JS_FreeCString(ctx, key);
 
-    return rc == 0 ? JS_TRUE : JS_EXCEPTION;
+    if (rc != 0) return JS_ThrowInternalError(ctx, "kv.delete failed (rc=%d)", rc);
+    return JS_TRUE;
 }
 
 static JSValue js_kv_range(JSContext *ctx, JSValue this_val,
                            int argc, JSValue *argv) {
     kvstore_t *kv = js_get_kv(ctx);
-    if (!kv) return JS_EXCEPTION;
+    if (!kv) return JS_ThrowInternalError(ctx, "kv store not available");
 
     const char *start = JS_ToCString(ctx, argv[0]);
     if (!start) return JS_EXCEPTION;
@@ -211,7 +231,7 @@ static JSValue js_kv_range(JSContext *ctx, JSValue this_val,
     if (!actual_start || !actual_end) {
         JS_FreeCString(ctx, start);
         JS_FreeCString(ctx, end);
-        return JS_EXCEPTION;
+        return JS_ThrowRangeError(ctx, "kv range key too long");
     }
 
     int64_t count = 100;
@@ -222,19 +242,25 @@ static JSValue js_kv_range(JSContext *ctx, JSValue this_val,
     JS_FreeCString(ctx, start);
     JS_FreeCString(ctx, end);
 
-    if (rc < 0) return JS_EXCEPTION;
+    if (rc < 0) return JS_ThrowInternalError(ctx, "kv.range failed (rc=%d)", rc);
 
     size_t prefix_len = (prefix && prefix[0]) ? strlen(prefix) : 0;
 
     JSValue arr = JS_NewArray(ctx);
     for (size_t i = 0; i < result.count; i++) {
         JSValue entry = JS_NewObject(ctx);
+        if (JS_IsException(entry)) {
+            kv_range_free(&result);
+            return JS_ThrowInternalError(ctx, "kv.range: arena exhausted building results");
+        }
         const char *visible_key = result.entries[i].key + prefix_len;
         JS_SetPropertyStr(ctx, entry, "key",
                           JS_NewString(ctx, visible_key));
         JS_SetPropertyStr(ctx, entry, "value",
                           JS_NewStringLen(ctx, result.entries[i].value,
                                           result.entries[i].value_len));
+        JS_SetPropertyStr(ctx, entry, "value_size",
+                          JS_NewInt64(ctx, (int64_t)result.entries[i].value_len));
         JS_SetPropertyUint32(ctx, arr, (uint32_t)i, entry);
     }
 
@@ -270,7 +296,7 @@ static sjs_request_ctx_t *js_get_req_ctx(JSContext *ctx) {
 static JSValue js_request_get(JSContext *ctx, JSValue this_val,
                               int magic) {
     sjs_request_ctx_t *req = js_get_req_ctx(ctx);
-    if (!req) return JS_EXCEPTION;
+    if (!req) return JS_ThrowInternalError(ctx, "no request context");
 
     switch (magic) {
     case 0: return JS_NewString(ctx, req->method);
@@ -321,7 +347,7 @@ static void js_install_request(JSContext *ctx) {
 static JSValue js_response_status(JSContext *ctx, JSValue this_val,
                                   int argc, JSValue *argv) {
     sjs_request_ctx_t *req = js_get_req_ctx(ctx);
-    if (!req) return JS_EXCEPTION;
+    if (!req) return JS_ThrowInternalError(ctx, "no request context");
 
     int32_t code;
     if (JS_ToInt32(ctx, &code, argv[0])) return JS_EXCEPTION;
@@ -332,7 +358,7 @@ static JSValue js_response_status(JSContext *ctx, JSValue this_val,
 static JSValue js_response_header(JSContext *ctx, JSValue this_val,
                                   int argc, JSValue *argv) {
     sjs_request_ctx_t *req = js_get_req_ctx(ctx);
-    if (!req) return JS_EXCEPTION;
+    if (!req) return JS_ThrowInternalError(ctx, "no request context");
 
     const char *name = JS_ToCString(ctx, argv[0]);
     if (!name) return JS_EXCEPTION;
@@ -346,7 +372,7 @@ static JSValue js_response_header(JSContext *ctx, JSValue this_val,
         if (!nn || !nv) {
             JS_FreeCString(ctx, name);
             JS_FreeCString(ctx, value);
-            return JS_EXCEPTION;
+            return JS_ThrowInternalError(ctx, "response header allocation failed");
         }
         req->resp_header_names = nn;
         req->resp_header_values = nv;
@@ -449,17 +475,17 @@ static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
  * ====================================================================== */
 
 static int snapshot_create(sjs_runtime_t *sjs, sjs_snapshot_t *snap) {
-    /* Use one arena from the pool to build the template */
-    sjs_arena_t *arena = arena_acquire(sjs);
-    if (!arena) return -1;
+    /* Use the worker's arena to build the template */
+    sjs_arena_t *arena = sjs->arena;
+    arena->used = 0;
 
     JSRuntime *rt = JS_NewRuntime2(&bump_mf, arena);
-    if (!rt) { arena_release(sjs, arena); return -1; }
+    if (!rt) return -1;
 
     JS_SetRuntimeOpaque(rt, sjs);
 
     JSContext *ctx = JS_NewContextRaw(rt);
-    if (!ctx) { arena_release(sjs, arena); return -1; }
+    if (!ctx) return -1;
 
     JS_AddIntrinsicBaseObjects(ctx);
     JS_AddIntrinsicRegExp(ctx);
@@ -474,7 +500,7 @@ static int snapshot_create(sjs_runtime_t *sjs, sjs_snapshot_t *snap) {
     /* Save the arena content */
     snap->used = arena->used;
     snap->data = malloc(snap->used);
-    if (!snap->data) { arena_release(sjs, arena); return -1; }
+    if (!snap->data) return -1;
     memcpy(snap->data, arena->data, snap->used);
     snap->old_base = arena->data;
 
@@ -489,7 +515,7 @@ static int snapshot_create(sjs_runtime_t *sjs, sjs_snapshot_t *snap) {
     size_t num_slots = snap->used / sizeof(void *);
     snap->bitmap_words = (num_slots + 63) / 64;
     snap->bitmap = calloc(snap->bitmap_words, sizeof(uint64_t));
-    if (!snap->bitmap) { free(snap->data); arena_release(sjs, arena); return -1; }
+    if (!snap->bitmap) { free(snap->data); return -1; }
 
     char *base = arena->data;
     char *end  = base + arena->used;
@@ -507,8 +533,7 @@ static int snapshot_create(sjs_runtime_t *sjs, sjs_snapshot_t *snap) {
     fprintf(stderr, "shift-js: snapshot created: %zu bytes, %zu relocations\n",
             snap->used, reloc_count);
 
-    /* Return the arena to the pool — the snapshot is in snap->data */
-    arena_release(sjs, arena);
+    /* Arena is reused for requests — snapshot is in snap->data */
     return 0;
 }
 
@@ -630,30 +655,20 @@ int sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
         return -1;
     }
 
-    /* Pre-allocate arena pool.
-     * Each arena is sizeof(sjs_arena_t) + SJS_ARENA_SIZE bytes.
-     * All arenas are in one contiguous allocation for cache friendliness. */
-    size_t per_arena = sizeof(sjs_arena_t) + SJS_ARENA_SIZE;
-    sjs->arena_pool = malloc(per_arena * SJS_ARENA_POOL);
-    if (!sjs->arena_pool) {
+    /* Allocate single arena per worker — reset between requests. */
+    sjs->arena = malloc(sizeof(sjs_arena_t) + SJS_ARENA_SIZE);
+    if (!sjs->arena) {
         JS_FreeContext(sjs->compile_ctx);
         JS_FreeRuntime(sjs->compile_rt);
         return -1;
     }
-
-    sjs->arena_free = NULL;
-    for (int i = 0; i < SJS_ARENA_POOL; i++) {
-        sjs_arena_t *a = (sjs_arena_t *)((char *)sjs->arena_pool + i * per_arena);
-        a->used = 0;
-        a->next = sjs->arena_free;
-        sjs->arena_free = a;
-    }
+    sjs->arena->used = 0;
 
     /* Create the frozen snapshot of a fully-initialized runtime+context.
      * This is the template that gets memcpy'd + relocated per request. */
     if (snapshot_create(sjs, &sjs->snapshot) != 0) {
         fprintf(stderr, "shift-js: snapshot_create failed\n");
-        free(sjs->arena_pool);
+        free(sjs->arena);
         JS_FreeContext(sjs->compile_ctx);
         JS_FreeRuntime(sjs->compile_rt);
         return -1;
@@ -672,9 +687,8 @@ void sjs_runtime_free(sjs_runtime_t *sjs) {
         JS_FreeRuntime(sjs->compile_rt);
         sjs->compile_rt = NULL;
     }
-    free(sjs->arena_pool);
-    sjs->arena_pool = NULL;
-    sjs->arena_free = NULL;
+    free(sjs->arena);
+    sjs->arena = NULL;
 }
 
 /* ======================================================================
@@ -793,12 +807,14 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             const char *err = JS_ToCString(cc, exc);
             fprintf(stderr, "shift-js: compile error in %s: %s\n",
                     module_path, err ? err : "(unknown)");
+            char *body;
+            asprintf(&body, "compile error in %s: %s",
+                     module_path, err ? err : "(unknown)");
             JS_FreeCString(cc, err);
             JS_FreeValue(cc, exc);
             free(base_path);
             free(module_path);
             req->resp_status = 500;
-            char *body = strdup("Module Compilation Error");
             *out_len = (uint32_t)strlen(body);
             return body;
         }
@@ -829,6 +845,8 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
     /* ---- Phases 2-4 with transaction retry on conflict ---- */
     #define MAX_TXN_RETRIES 3
 
+    char *err_msg = NULL;   /* populated before goto txn_fail */
+
     for (int attempt = 0; attempt <= MAX_TXN_RETRIES; attempt++) {
 
         /* Reset response state on retry */
@@ -858,20 +876,11 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         }
 
         /* Phase 2: Restore snapshot into a fresh arena */
-        sjs_arena_t *arena = arena_acquire(sjs);
-        if (!arena) {
-            free(bytecode);
-            free(module_path);
-            req->resp_status = 503;
-            char *body = strdup("Arena Pool Exhausted");
-            *out_len = (uint32_t)strlen(body);
-            return body;
-        }
+        sjs_arena_t *arena = sjs->arena;
 
         JSRuntime *rt = NULL;
         JSContext *ctx = NULL;
         if (snapshot_restore(&sjs->snapshot, arena, sjs, &rt, &ctx) != 0) {
-            arena_release(sjs, arena);
             free(bytecode);
             free(module_path);
             req->resp_status = 500;
@@ -884,7 +893,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 
         /* Phase 3: Begin transaction, load bytecode, evaluate, call handler */
         if (kv_begin(sjs->kv) == KV_CONFLICT) {
-            arena_release(sjs, arena);
+            arena_reset(sjs);
             continue;
         }
 
@@ -894,14 +903,16 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         bytecode = NULL;
 
         if (JS_IsException(module_val)) {
-            const char *err = JS_ToCString(ctx, JS_GetException(ctx));
+            const char *err = js_err_string(ctx, arena);
             fprintf(stderr, "shift-js: bytecode load error in %s: %s\n",
-                    module_path, err ? err : "(unknown)");
+                    module_path, err);
+            char *body;
+            asprintf(&body, "bytecode load error in %s: %s",
+                     module_path, err);
             kv_rollback(sjs->kv);
-            arena_release(sjs, arena);
+            arena_reset(sjs);
             free(module_path);
             req->resp_status = 500;
-            char *body = strdup("Bytecode Load Error");
             *out_len = (uint32_t)strlen(body);
             return body;
         }
@@ -910,9 +921,11 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 
         JSValue result = JS_EvalFunction(ctx, module_val);
         if (JS_IsException(result)) {
-            const char *err = JS_ToCString(ctx, JS_GetException(ctx));
+            const char *err = js_err_string(ctx, arena);
             fprintf(stderr, "shift-js: module eval error in %s: %s\n",
-                    module_path, err ? err : "(unknown)");
+                    module_path, err);
+            asprintf(&err_msg, "module eval error in %s: %s",
+                     module_path, err);
             goto txn_fail;
         }
 
@@ -926,8 +939,11 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         if (JS_PromiseState(ctx, result) == JS_PROMISE_REJECTED) {
             JSValue reason = JS_PromiseResult(ctx, result);
             const char *err = JS_ToCString(ctx, reason);
+            if (!err) err = "(unknown)";
             fprintf(stderr, "shift-js: module rejected in %s: %s\n",
-                    module_path, err ? err : "(unknown)");
+                    module_path, err);
+            asprintf(&err_msg, "module rejected in %s: %s",
+                     module_path, err);
             goto txn_fail;
         }
 
@@ -936,7 +952,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 
         if (!JS_IsFunction(ctx, handler)) {
             kv_rollback(sjs->kv);
-            arena_release(sjs, arena);
+            arena_reset(sjs);
             free(module_path);
             req->resp_status = 405;
             char *body = strdup("Method Not Allowed");
@@ -946,18 +962,21 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 
         JSValue ret = JS_Call(ctx, handler, JS_UNDEFINED, 0, NULL);
 
+        /* Capture exception immediately — microtask pump can clear it */
+        if (JS_IsException(ret)) {
+            const char *err = js_err_string(ctx, arena);
+            fprintf(stderr, "shift-js: handler error in %s.%s: %s\n",
+                    module_path, func_name, err);
+            asprintf(&err_msg, "handler error in %s.%s: %s",
+                     module_path, func_name, err);
+            goto txn_fail;
+        }
+
         /* Pump microtasks after handler call */
         {
             JSContext *pctx;
             while (JS_IsJobPending(rt))
                 JS_ExecutePendingJob(rt, &pctx);
-        }
-
-        if (JS_IsException(ret)) {
-            const char *err = JS_ToCString(ctx, JS_GetException(ctx));
-            fprintf(stderr, "shift-js: handler error in %s.%s: %s\n",
-                    module_path, func_name, err ? err : "(unknown)");
-            goto txn_fail;
         }
 
         /* Phase 4: Extract response body to libc heap */
@@ -977,6 +996,14 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             JSValue stringify = JS_GetPropertyStr(ctx, json, "stringify");
 
             JSValue json_str = JS_Call(ctx, stringify, json, 1, &ret);
+            if (JS_IsException(json_str)) {
+                const char *err = js_err_string(ctx, arena);
+                fprintf(stderr, "shift-js: JSON.stringify error in %s.%s: %s\n",
+                        module_path, func_name, err);
+                asprintf(&err_msg, "JSON.stringify error in %s.%s: %s",
+                         module_path, func_name, err);
+                goto txn_fail;
+            }
             if (JS_IsString(json_str)) {
                 size_t len;
                 const char *str = JS_ToCStringLen(ctx, &len, json_str);
@@ -1010,11 +1037,11 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         /* Commit — retry on conflict */
         if (kv_commit(sjs->kv) == KV_CONFLICT) {
             free(body);
-            arena_release(sjs, arena);
+            arena_reset(sjs);
             continue;
         }
 
-        arena_release(sjs, arena);
+        arena_reset(sjs);
         free(module_path);
 
         if (!body) {
@@ -1025,11 +1052,11 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 
     txn_fail:
         kv_rollback(sjs->kv);
-        arena_release(sjs, arena);
+        arena_reset(sjs);
         free(module_path);
         req->resp_status = 500;
         {
-            char *body = strdup("Internal Server Error");
+            char *body = err_msg ? err_msg : strdup("Internal Server Error");
             *out_len = (uint32_t)strlen(body);
             return body;
         }
