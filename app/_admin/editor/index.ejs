@@ -133,6 +133,8 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/htmlmixed/htmlmixed.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/xml/xml.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/css/css.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/addon/mode/multiplex.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/htmlembedded/htmlembedded.min.js"></script>
   <script>
     var files = <%- JSON.stringify(files) %>;
     var editor = null;
@@ -235,7 +237,8 @@
 
     function getMode(path) {
       if (/\.mjs$/.test(path) || /\.js$/.test(path)) return "javascript";
-      if (/\.ejs$/.test(path) || /\.html$/.test(path)) return "htmlmixed";
+      if (/\.ejs$/.test(path)) return { name: "htmlembedded", scriptingModeSpec: "javascript" };
+      if (/\.html$/.test(path)) return "htmlmixed";
       if (/\.css$/.test(path)) return "css";
       return "htmlmixed";
     }
