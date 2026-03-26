@@ -76,6 +76,7 @@ add_executable(shift-js
     src/router.c
     src/preprocessor.c
     src/ejs.c
+    src/session.c
 )
 target_include_directories(shift-js PRIVATE src)
 target_link_libraries(shift-js PRIVATE

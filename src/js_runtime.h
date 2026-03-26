@@ -5,6 +5,7 @@
 #include <shift_h2.h>
 #include <quickjs.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 /* Fixed-size arena for per-request JS runtimes.
  * One arena per worker — reset between requests. */
@@ -69,6 +70,11 @@ typedef struct {
     char    **resp_header_values;
     uint32_t  resp_header_count;
     uint32_t  resp_header_cap;
+
+    /* Session state */
+    char   *session_id;       /* heap-allocated session ID, or NULL */
+    bool    session_new;      /* true if we generated a new session ID */
+    bool    session_dirty;    /* true if session data was modified by JS */
 } sjs_request_ctx_t;
 
 /* Create/destroy the per-worker runtime. */

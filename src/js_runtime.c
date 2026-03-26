@@ -3,6 +3,7 @@
 #include "kvstore.h"
 #include "preprocessor.h"
 #include "router.h"
+#include "session.h"
 
 #include <quickjs.h>
 #include <stdlib.h>
@@ -402,6 +403,91 @@ static void js_install_response(JSContext *ctx) {
 }
 
 /* ======================================================================
+ * session global
+ * ====================================================================== */
+
+/* session.id — read-only getter returning the session ID */
+static JSValue js_session_id_get(JSContext *ctx, JSValue this_val, int magic) {
+    (void)magic;
+    sjs_request_ctx_t *req = js_get_req_ctx(ctx);
+    if (!req || !req->session_id) return JS_NULL;
+    return JS_NewString(ctx, req->session_id);
+}
+
+/* session.get(key) — read from the __data property */
+static JSValue js_session_get(JSContext *ctx, JSValue this_val,
+                              int argc, JSValue *argv) {
+    const char *key = JS_ToCString(ctx, argv[0]);
+    if (!key) return JS_EXCEPTION;
+
+    JSValue data = JS_GetPropertyStr(ctx, this_val, "__data");
+    JSValue val = JS_GetPropertyStr(ctx, data, key);
+    JS_FreeValue(ctx, data);
+    JS_FreeCString(ctx, key);
+    return val;
+}
+
+/* session.set(key, value) — write to __data and mark dirty */
+static JSValue js_session_set(JSContext *ctx, JSValue this_val,
+                              int argc, JSValue *argv) {
+    sjs_request_ctx_t *req = js_get_req_ctx(ctx);
+    if (!req) return JS_ThrowInternalError(ctx, "no request context");
+
+    const char *key = JS_ToCString(ctx, argv[0]);
+    if (!key) return JS_EXCEPTION;
+
+    JSValue data = JS_GetPropertyStr(ctx, this_val, "__data");
+    JS_SetPropertyStr(ctx, data, key, JS_DupValue(ctx, argv[1]));
+    JS_FreeValue(ctx, data);
+    JS_FreeCString(ctx, key);
+
+    req->session_dirty = true;
+    return JS_UNDEFINED;
+}
+
+/* session.delete(key) — delete from __data and mark dirty */
+static JSValue js_session_delete(JSContext *ctx, JSValue this_val,
+                                 int argc, JSValue *argv) {
+    sjs_request_ctx_t *req = js_get_req_ctx(ctx);
+    if (!req) return JS_ThrowInternalError(ctx, "no request context");
+
+    JSAtom atom = JS_ValueToAtom(ctx, argv[0]);
+    if (atom == JS_ATOM_NULL) return JS_EXCEPTION;
+
+    JSValue data = JS_GetPropertyStr(ctx, this_val, "__data");
+    JS_DeleteProperty(ctx, data, atom, 0);
+    JS_FreeValue(ctx, data);
+    JS_FreeAtom(ctx, atom);
+
+    req->session_dirty = true;
+    return JS_UNDEFINED;
+}
+
+static const JSCFunctionListEntry js_session_props[] = {
+    JS_CGETSET_MAGIC_DEF("id", js_session_id_get, NULL, 0),
+};
+
+static void js_install_session(JSContext *ctx) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue sess = JS_NewObject(ctx);
+
+    JS_SetPropertyFunctionList(ctx, sess, js_session_props,
+                               sizeof(js_session_props) / sizeof(js_session_props[0]));
+    JS_SetPropertyStr(ctx, sess, "get",
+                      JS_NewCFunction(ctx, js_session_get, "get", 1));
+    JS_SetPropertyStr(ctx, sess, "set",
+                      JS_NewCFunction(ctx, js_session_set, "set", 2));
+    JS_SetPropertyStr(ctx, sess, "delete",
+                      JS_NewCFunction(ctx, js_session_delete, "delete", 1));
+
+    /* __data starts as empty object — populated per-request from KV */
+    JS_SetPropertyStr(ctx, sess, "__data", JS_NewObject(ctx));
+
+    JS_SetPropertyStr(ctx, global, "session", sess);
+    JS_FreeValue(ctx, global);
+}
+
+/* ======================================================================
  * Module loader (compile context only)
  * ====================================================================== */
 
@@ -499,6 +585,7 @@ static int snapshot_create(sjs_runtime_t *sjs, sjs_snapshot_t *snap) {
     js_install_kv(ctx);
     js_install_request(ctx);
     js_install_response(ctx);
+    js_install_session(ctx);
 
     /* Save the arena content */
     snap->used = arena->used;
@@ -1025,6 +1112,26 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
     if (!module_path) module_path = strdup(base_path);
     free(base_path);
 
+    /* ---- Session: extract session ID from Cookie header ---- */
+    req->session_id = NULL;
+    req->session_new = false;
+    req->session_dirty = false;
+
+    for (uint32_t i = 0; i < req->header_count; i++) {
+        if (req->headers[i].name_len == 6 &&
+            memcmp(req->headers[i].name, "cookie", 6) == 0) {
+            req->session_id = sjs_session_parse_cookie(
+                req->headers[i].value, req->headers[i].value_len);
+            break;
+        }
+    }
+    if (!req->session_id) {
+        char id_buf[SJS_SESSION_ID_LEN + 1];
+        if (sjs_session_generate_id(id_buf))
+            req->session_id = strdup(id_buf);
+        req->session_new = true;
+    }
+
     /* ---- Phases 2-4 with transaction retry on conflict ---- */
     #define MAX_TXN_RETRIES 3
 
@@ -1050,6 +1157,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             bytecode = NULL;
             if (kv_get(sjs->kv, ck, &bytecode, &bc_len) != 0) {
                 free(module_path); free(url_func); free(query_str);
+                free(req->session_id); req->session_id = NULL;
                 req->resp_status = 500;
                 char *body = strdup("Internal Server Error");
                 *out_len = (uint32_t)strlen(body);
@@ -1064,6 +1172,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         JSContext *ctx = NULL;
         if (snapshot_restore(&sjs->snapshot, arena, sjs, &rt, &ctx) != 0) {
             free(bytecode); free(module_path); free(url_func); free(query_str);
+            free(req->session_id); req->session_id = NULL;
             req->resp_status = 500;
             char *body = strdup("Internal Server Error");
             *out_len = (uint32_t)strlen(body);
@@ -1076,6 +1185,40 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         if (kv_begin(sjs->kv) == KV_CONFLICT) {
             arena_reset(sjs);
             continue;
+        }
+
+        /* Load session data from KV into session.__data */
+        req->session_dirty = false;
+        if (req->session_id && !req->session_new) {
+            char sess_key[80];
+            snprintf(sess_key, sizeof(sess_key), "sessions/%s", req->session_id);
+
+            char pfx_buf[512];
+            const char *actual_key = sjs_prefixed_key(req->kv_prefix, sess_key,
+                                                       pfx_buf, sizeof(pfx_buf));
+            if (actual_key) {
+                void  *sdata = NULL;
+                size_t sdata_len = 0;
+                if (kv_get(sjs->kv, actual_key, &sdata, &sdata_len) == 0 && sdata) {
+                    /* Parse JSON into session.__data */
+                    JSValue global = JS_GetGlobalObject(ctx);
+                    JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
+                    JSValue parse_fn = JS_GetPropertyStr(ctx, json_obj, "parse");
+                    JSValue json_str = JS_NewStringLen(ctx, sdata, sdata_len);
+                    JSValue parsed = JS_Call(ctx, parse_fn, json_obj, 1, &json_str);
+
+                    if (!JS_IsException(parsed)) {
+                        JSValue sess = JS_GetPropertyStr(ctx, global, "session");
+                        JS_SetPropertyStr(ctx, sess, "__data", parsed);
+                        JS_FreeValue(ctx, sess);
+                    } else {
+                        JS_GetException(ctx); /* clear */
+                    }
+
+                    JS_FreeValue(ctx, global);
+                    free(sdata);
+                }
+            }
         }
 
         JSValue module_val = JS_ReadObject(ctx, bytecode, bc_len,
@@ -1093,6 +1236,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             kv_rollback(sjs->kv);
             arena_reset(sjs);
             free(module_path); free(url_func); free(query_str);
+            free(req->session_id); req->session_id = NULL;
             req->resp_status = 500;
             *out_len = (uint32_t)strlen(body);
             return body;
@@ -1161,6 +1305,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
                 char *body;
                 asprintf(&body, "function \"%s\" not found", fn_name);
                 free(module_path); free(url_func); free(query_str);
+                free(req->session_id); req->session_id = NULL;
                 *out_len = (uint32_t)strlen(body);
                 return body;
             }
@@ -1278,6 +1423,44 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             free(cb_buf);
         }
 
+        /* ---- Session: persist if dirty, set cookie if new ---- */
+        if (req->session_id && (req->session_dirty || req->session_new)) {
+            if (req->session_dirty) {
+                /* Serialize session.__data to JSON and write to KV */
+                JSValue global = JS_GetGlobalObject(ctx);
+                JSValue sess = JS_GetPropertyStr(ctx, global, "session");
+                JSValue data = JS_GetPropertyStr(ctx, sess, "__data");
+                JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
+                JSValue stringify = JS_GetPropertyStr(ctx, json_obj, "stringify");
+                JSValue json_val = JS_Call(ctx, stringify, json_obj, 1, &data);
+
+                if (JS_IsString(json_val)) {
+                    size_t jlen;
+                    const char *jstr = JS_ToCStringLen(ctx, &jlen, json_val);
+                    if (jstr) {
+                        char sess_key[80];
+                        snprintf(sess_key, sizeof(sess_key),
+                                 "sessions/%s", req->session_id);
+                        char pfx_buf[512];
+                        const char *actual_key = sjs_prefixed_key(
+                            req->kv_prefix, sess_key, pfx_buf, sizeof(pfx_buf));
+                        if (actual_key)
+                            kv_put(sjs->kv, actual_key, jstr, jlen);
+                    }
+                }
+
+                JS_FreeValue(ctx, global);
+            }
+
+            if (req->session_new) {
+                char *cookie = sjs_session_cookie_header(req->session_id);
+                if (cookie) {
+                    resp_add_header(req, "set-cookie", cookie);
+                    free(cookie);
+                }
+            }
+        }
+
         /* Commit — retry on conflict */
         if (kv_commit(sjs->kv) == KV_CONFLICT) {
             free(body);
@@ -1287,6 +1470,8 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 
         arena_reset(sjs);
         free(module_path); free(url_func); free(query_str);
+        free(req->session_id);
+        req->session_id = NULL;
 
         if (!body) {
             body = strdup("");
@@ -1298,6 +1483,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         kv_rollback(sjs->kv);
         arena_reset(sjs);
         free(module_path); free(url_func); free(query_str);
+        free(req->session_id); req->session_id = NULL;
         req->resp_status = 500;
         {
             char *body = err_msg ? err_msg : strdup("Internal Server Error");
@@ -1309,6 +1495,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
     /* All retries exhausted */
     free(bytecode);
     free(module_path); free(url_func); free(query_str);
+    free(req->session_id); req->session_id = NULL;
     req->resp_status = 409;
     char *body = strdup("Transaction Conflict");
     *out_len = (uint32_t)strlen(body);

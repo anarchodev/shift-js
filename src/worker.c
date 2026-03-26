@@ -528,7 +528,7 @@ void *sjs_worker_fn(void *arg) {
     sh2_context_destroy(h2);
     shift_flush(sh);
 
-    /* Drain remaining entities */
+    /* Drain remaining entities — destructors handle cleanup */
     shift_collection_id_t drain[] = { request_out, response_in, response_result_out };
     for (int c = 0; c < 3; c++) {
         shift_entity_t *ents = NULL;
