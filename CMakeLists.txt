@@ -65,6 +65,9 @@ if(NOT dmon_POPULATED)
     FetchContent_Populate(dmon)
 endif()
 
+# -- OpenSSL: crypto primitives for Web Crypto API ---------------------
+find_package(OpenSSL REQUIRED)
+
 # ----------------------------------------------------------------------
 # shift-js server
 # ----------------------------------------------------------------------
@@ -77,12 +80,14 @@ add_executable(shift-js
     src/preprocessor.c
     src/ejs.c
     src/session.c
+    src/crypto.c
 )
 target_include_directories(shift-js PRIVATE src)
 target_link_libraries(shift-js PRIVATE
     shift_h2
     qjs
     sqlite3
+    OpenSSL::Crypto
     pthread
     m
     dl

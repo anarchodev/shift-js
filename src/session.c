@@ -1,17 +1,13 @@
 #include "session.h"
+#include "crypto.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-char *sjs_session_generate_id(char *buf) {
+char *sjs_session_generate_id(char *buf, sjs_request_ctx_t *req) {
     uint8_t bytes[16];
-    FILE *f = fopen("/dev/urandom", "rb");
-    if (!f) return NULL;
-    if (fread(bytes, 1, sizeof(bytes), f) != sizeof(bytes)) {
-        fclose(f);
+    if (sjs_random_fill(req, bytes, 16) != 0)
         return NULL;
-    }
-    fclose(f);
 
     static const char hex[] = "0123456789abcdef";
     for (int i = 0; i < 16; i++) {

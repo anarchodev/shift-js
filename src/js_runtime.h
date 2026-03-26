@@ -52,7 +52,7 @@ typedef struct {
 } sjs_runtime_t;
 
 /* Per-request context passed through to JS globals. */
-typedef struct {
+typedef struct sjs_request_ctx {
     /* Request info (read from sh2 components) */
     const char             *method;
     const char             *path;
@@ -75,6 +75,13 @@ typedef struct {
     char   *session_id;       /* heap-allocated session ID, or NULL */
     bool    session_new;      /* true if we generated a new session ID */
     bool    session_dirty;    /* true if session data was modified by JS */
+
+    /* Random byte capture/replay for deterministic replay */
+    uint8_t  *random_tape;        /* malloc'd buffer */
+    size_t    random_tape_len;    /* bytes written (capture) or total (replay) */
+    size_t    random_tape_cap;    /* allocated capacity */
+    size_t    random_tape_pos;    /* read position (replay mode) */
+    bool      random_tape_replay; /* true = replay from tape, false = capture */
 } sjs_request_ctx_t;
 
 /* Create/destroy the per-worker runtime. */

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "js_runtime.h"
+#include "crypto.h"
 #include "kvstore.h"
 #include "preprocessor.h"
 #include "router.h"
@@ -586,6 +587,7 @@ static int snapshot_create(sjs_runtime_t *sjs, sjs_snapshot_t *snap) {
     js_install_request(ctx);
     js_install_response(ctx);
     js_install_session(ctx);
+    js_install_crypto(ctx);
 
     /* Save the arena content */
     snap->used = arena->used;
@@ -1127,7 +1129,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
     }
     if (!req->session_id) {
         char id_buf[SJS_SESSION_ID_LEN + 1];
-        if (sjs_session_generate_id(id_buf))
+        if (sjs_session_generate_id(id_buf, req))
             req->session_id = strdup(id_buf);
         req->session_new = true;
     }
@@ -1350,6 +1352,20 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             JSContext *pctx;
             while (JS_IsJobPending(rt))
                 JS_ExecutePendingJob(rt, &pctx);
+        }
+
+        /* Unwrap if handler returned a promise (async function) */
+        if (JS_PromiseState(ctx, ret) == JS_PROMISE_FULFILLED) {
+            JSValue resolved = JS_PromiseResult(ctx, ret);
+            ret = JS_DupValue(ctx, resolved);
+        } else if (JS_PromiseState(ctx, ret) == JS_PROMISE_REJECTED) {
+            JSValue reason = JS_PromiseResult(ctx, ret);
+            const char *err = JS_ToCString(ctx, reason);
+            fprintf(stderr, "shift-js: async handler rejected in %s.%s: %s\n",
+                    module_path, called_func, err ? err : "(unknown)");
+            asprintf(&err_msg, "async handler rejected in %s.%s: %s",
+                     module_path, called_func, err ? err : "(unknown)");
+            goto txn_fail;
         }
 
         /* Phase 4: Extract response body to libc heap */

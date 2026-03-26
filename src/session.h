@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Forward-declare to avoid circular include with js_runtime.h */
+typedef struct sjs_request_ctx sjs_request_ctx_t;
+
 /* Session cookie name */
 #define SJS_SESSION_COOKIE "_sjs_sid"
 
@@ -12,8 +15,9 @@
 
 /* Generate a cryptographically random session ID.
  * buf must be at least SJS_SESSION_ID_LEN + 1 bytes.
+ * Random bytes are routed through req's random tape for deterministic replay.
  * Returns buf on success, NULL on failure. */
-char *sjs_session_generate_id(char *buf);
+char *sjs_session_generate_id(char *buf, sjs_request_ctx_t *req);
 
 /* Extract session ID from a Cookie header value.
  * Returns a malloc'd string with the session ID, or NULL if not found. */

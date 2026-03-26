@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "worker.h"
+#include "crypto.h"
 #include "kvstore.h"
 #include "js_runtime.h"
 #include "router.h"
@@ -497,6 +498,7 @@ void *sjs_worker_fn(void *arg) {
                  * are now owned by resp_fields. Free the pointer arrays only. */
                 free(req.resp_header_names);
                 free(req.resp_header_values);
+                sjs_random_tape_free(&req);
             }
         }
 
