@@ -30,6 +30,11 @@ FetchContent_Declare(sqlite3
     URL https://www.sqlite.org/2024/sqlite-amalgamation-3450000.zip
 )
 
+FetchContent_Declare(dmon
+    GIT_REPOSITORY https://github.com/septag/dmon.git
+    GIT_TAG        master
+)
+
 # -- shift and shift-h2 have their own CMakeLists ---
 set(ENABLE_TLS ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(shift shift_h2)
@@ -53,6 +58,12 @@ target_compile_definitions(sqlite3 PRIVATE
     SQLITE_DQS=0
 )
 target_compile_options(sqlite3 PRIVATE -w)
+
+# -- dmon: header-only file watcher ----------------------------------------
+FetchContent_GetProperties(dmon)
+if(NOT dmon_POPULATED)
+    FetchContent_Populate(dmon)
+endif()
 
 # ----------------------------------------------------------------------
 # shift-js server
@@ -83,5 +94,5 @@ add_executable(sjsctl
     tools/sjsctl.c
     src/kvstore.c
 )
-target_include_directories(sjsctl PRIVATE src)
+target_include_directories(sjsctl PRIVATE src ${dmon_SOURCE_DIR})
 target_link_libraries(sjsctl PRIVATE sqlite3 pthread)

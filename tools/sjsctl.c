@@ -1,15 +1,23 @@
 #include "kvstore.h"
 
+#define DMON_IMPL
+#include "dmon.h"
+
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <unistd.h>
 
-/* Prepend tenant prefix to a key. Returns key as-is if prefix is NULL. */
+/* Forward declarations */
 static const char *prefixed_key(const char *prefix, const char *key,
                                 char *buf, size_t bufsize);
+static char *read_file(const char *path, size_t *out_len);
+static void invalidate_cache(kvstore_t *kv, const char *key,
+                             const char *tenant_prefix);
 
 static int write_file(const char *path, const void *data, size_t len) {
     FILE *f = fopen(path, "wb");
@@ -83,6 +91,106 @@ static int export_code(kvstore_t *kv, const char *out_dir,
     return count;
 }
 
+/* ---- watch command ---------------------------------------------------- */
+
+static volatile sig_atomic_t g_running = 1;
+
+static void sigint_handler(int sig) {
+    (void)sig;
+    g_running = 0;
+}
+
+typedef struct {
+    kvstore_t   *kv;
+    const char  *dir;
+    const char  *code_prefix;
+    const char  *tenant_prefix;
+} watch_ctx_t;
+
+static void sync_single_file(watch_ctx_t *ctx, const char *relpath) {
+    /* Build filesystem path */
+    char filepath[4096];
+    snprintf(filepath, sizeof(filepath), "%s/%s", ctx->dir, relpath);
+
+    /* Build KV key: [tenant_prefix]__code/[code_prefix/]<relpath> */
+    char raw_key[4096];
+    if (ctx->code_prefix[0])
+        snprintf(raw_key, sizeof(raw_key), "__code/%s/%s",
+                 ctx->code_prefix, relpath);
+    else
+        snprintf(raw_key, sizeof(raw_key), "__code/%s", relpath);
+
+    char key[4096];
+    const char *actual_key = prefixed_key(ctx->tenant_prefix, raw_key,
+                                          key, sizeof(key));
+
+    size_t flen;
+    char *contents = read_file(filepath, &flen);
+    if (!contents) {
+        fprintf(stderr, "  [watch] cannot read %s\n", filepath);
+        return;
+    }
+
+    if (kv_put(ctx->kv, actual_key, contents, flen) == 0) {
+        invalidate_cache(ctx->kv, actual_key, ctx->tenant_prefix);
+        printf("  [watch] %s → %s (%zu bytes)\n", relpath, actual_key, flen);
+    } else {
+        fprintf(stderr, "  [watch] FAILED: %s\n", actual_key);
+    }
+
+    free(contents);
+}
+
+static void delete_single_file(watch_ctx_t *ctx, const char *relpath) {
+    char raw_key[4096];
+    if (ctx->code_prefix[0])
+        snprintf(raw_key, sizeof(raw_key), "__code/%s/%s",
+                 ctx->code_prefix, relpath);
+    else
+        snprintf(raw_key, sizeof(raw_key), "__code/%s", relpath);
+
+    char key[4096];
+    const char *actual_key = prefixed_key(ctx->tenant_prefix, raw_key,
+                                          key, sizeof(key));
+
+    if (kv_delete(ctx->kv, actual_key) == 0) {
+        invalidate_cache(ctx->kv, actual_key, ctx->tenant_prefix);
+        printf("  [watch] deleted %s\n", actual_key);
+    }
+}
+
+static void watch_callback(dmon_watch_id watch_id, dmon_action action,
+                            const char *rootdir, const char *filepath,
+                            const char *oldfilepath, void *user) {
+    (void)watch_id;
+    (void)rootdir;
+    watch_ctx_t *ctx = (watch_ctx_t *)user;
+
+    /* Skip hidden files/directories */
+    if (filepath[0] == '.') return;
+    const char *slash = filepath;
+    while ((slash = strchr(slash, '/')) != NULL) {
+        slash++;
+        if (*slash == '.') return;
+    }
+
+    switch (action) {
+    case DMON_ACTION_CREATE:
+    case DMON_ACTION_MODIFY:
+        sync_single_file(ctx, filepath);
+        break;
+    case DMON_ACTION_DELETE:
+        delete_single_file(ctx, filepath);
+        break;
+    case DMON_ACTION_MOVE:
+        if (oldfilepath) delete_single_file(ctx, oldfilepath);
+        sync_single_file(ctx, filepath);
+        break;
+    }
+}
+
+/* ---- end watch -------------------------------------------------------- */
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s -d <db> [-t <tenant_id>] <command> [args...]\n\n"
@@ -95,6 +203,7 @@ static void usage(const char *prog) {
         "  upload <dir> [prefix]       Upload directory tree as __code/<prefix>/...\n"
         "  import <dir> [prefix]       Alias for upload\n"
         "  export <dir>                Export all __code/ entries to directory\n"
+        "  watch <dir> [prefix]        Watch directory and sync changes to server\n"
         "  list [prefix]               List all keys with optional prefix\n"
         "  domain-map <host> <id>      Map hostname to tenant ID\n"
         "  domain-unmap <host>         Remove hostname mapping\n"
@@ -381,6 +490,45 @@ int main(int argc, char **argv) {
 
         int n = upload_dir(kv, dir, prefix, tenant_prefix_str);
         printf("Imported %d files\n", n);
+
+    } else if (!strcmp(cmd, "watch")) {
+        if (arg_start + 1 >= argc) { usage(argv[0]); rc = 1; goto done; }
+        const char *dir = argv[arg_start + 1];
+        const char *prefix = (arg_start + 2 < argc) ? argv[arg_start + 2] : "";
+
+        /* Initial sync */
+        int n = upload_dir(kv, dir, prefix, tenant_prefix_str);
+        printf("Initial sync: %d files\n", n);
+
+        /* Set up file watcher */
+        dmon_init();
+
+        watch_ctx_t ctx = {
+            .kv = kv,
+            .dir = dir,
+            .code_prefix = prefix,
+            .tenant_prefix = tenant_prefix_str
+        };
+
+        dmon_watch_id wid = dmon_watch(dir, watch_callback,
+                                        DMON_WATCHFLAGS_RECURSIVE, &ctx);
+        if (wid.id == 0) {
+            fprintf(stderr, "Failed to watch directory: %s\n", dir);
+            dmon_deinit();
+            rc = 1;
+            goto done;
+        }
+
+        signal(SIGINT, sigint_handler);
+        signal(SIGTERM, sigint_handler);
+        printf("Watching %s for changes (Ctrl-C to stop)...\n", dir);
+
+        while (g_running) {
+            usleep(100000); /* 100ms */
+        }
+
+        printf("\nStopping watch...\n");
+        dmon_deinit();
 
     } else if (!strcmp(cmd, "export")) {
         if (arg_start + 1 >= argc) { usage(argv[0]); rc = 1; goto done; }

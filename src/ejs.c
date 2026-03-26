@@ -69,13 +69,8 @@ static const char PREAMBLE[] =
     "function __esc(s){return String(s).replace(/&/g,'&amp;')"
     ".replace(/</g,'&lt;').replace(/>/g,'&gt;')"
     ".replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}\n"
-    "function __render(){\n"
+    "export function __render(){\n"
     "let __out=\"\";\n";
-
-static const char *METHODS[] = {
-    "get", "post", "put", "patch", "destroy", "head", "options"
-};
-#define N_METHODS (sizeof(METHODS) / sizeof(METHODS[0]))
 
 char *sjs_ejs_transform(const char *source, size_t len, size_t *out_len) {
     ejs_buf_t buf;
@@ -146,16 +141,8 @@ char *sjs_ejs_transform(const char *source, size_t len, size_t *out_len) {
         p = close + 2;  /* skip %> */
     }
 
-    /* Close __render and emit method exports */
+    /* Close __render */
     if (buf_str(&buf, "return __out;\n}\n") != 0) goto fail;
-
-    for (size_t i = 0; i < N_METHODS; i++) {
-        if (buf_str(&buf, "export function ") != 0) goto fail;
-        if (buf_str(&buf, METHODS[i]) != 0) goto fail;
-        if (buf_str(&buf, "(){response.header(\"content-type\","
-                          "\"text/html\");return __render();}\n") != 0)
-            goto fail;
-    }
 
     /* Null-terminate for convenience (not counted in out_len) */
     if (buf_ensure(&buf, 1) != 0) goto fail;

@@ -2,33 +2,90 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
-char *sjs_resolve_module(const char *url_path) {
-    if (!url_path) return NULL;
+/* Build "index" or "<path>/index" from a cleaned path segment. */
+static char *make_module_path(const char *p, size_t len) {
+    if (len == 0)
+        return strdup("index");
 
-    /* Skip leading slash */
+    const char *suffix = "/index";
+    size_t suffix_len = 6;
+    char *result = malloc(len + suffix_len + 1);
+    if (!result) return NULL;
+    memcpy(result, p, len);
+    memcpy(result + len, suffix, suffix_len);
+    result[len + suffix_len] = '\0';
+    return result;
+}
+
+/* Strip leading slashes, trailing slashes, and query string.
+ * Returns pointer into url_path; sets *len to the cleaned length.
+ * Sets *query to the query string (after '?') or NULL. */
+static const char *clean_path(const char *url_path,
+                               size_t *len, char **query) {
     const char *p = url_path;
     while (*p == '/') p++;
 
-    /* Strip trailing slash */
-    size_t len = strlen(p);
-    while (len > 0 && p[len - 1] == '/') len--;
-
-    /* Build: <path>/index or just index for root (extensionless) */
-    const char *suffix = "/index";
-    size_t suffix_len = strlen(suffix);
-
-    char *result;
-    if (len == 0) {
-        result = strdup("index");
+    /* Find query string */
+    const char *qmark = strchr(p, '?');
+    size_t path_len;
+    if (qmark) {
+        path_len = (size_t)(qmark - p);
+        *query = strdup(qmark + 1);
     } else {
-        result = malloc(len + suffix_len + 1);
-        if (!result) return NULL;
-        memcpy(result, p, len);
-        memcpy(result + len, suffix, suffix_len);
-        result[len + suffix_len] = '\0';
+        path_len = strlen(p);
+        *query = NULL;
     }
 
-    return result;
+    /* Strip trailing slashes */
+    while (path_len > 0 && p[path_len - 1] == '/') path_len--;
+
+    *len = path_len;
+    return p;
+}
+
+void sjs_resolve_route(const char *url_path, sjs_route_t *route) {
+    memset(route, 0, sizeof(*route));
+    if (!url_path) return;
+
+    size_t len;
+    const char *p = clean_path(url_path, &len, &route->query_string);
+
+    route->module_path = make_module_path(p, len);
+    route->func_name = NULL;
+}
+
+void sjs_resolve_route_fallback(const char *url_path, sjs_route_t *route) {
+    memset(route, 0, sizeof(*route));
+    if (!url_path) return;
+
+    size_t len;
+    char *query = NULL;
+    const char *p = clean_path(url_path, &len, &query);
+    free(query);  /* fallback reuses query from primary route */
+
+    /* Find the last '/' to split path from function name */
+    const char *last_slash = NULL;
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] == '/') last_slash = p + i;
+    }
+
+    if (!last_slash) {
+        /* Single segment like "/bar" — module is "index", func is "bar" */
+        route->module_path = strdup("index");
+        route->func_name = strndup(p, len);
+    } else {
+        /* "/foo/bar" — module is "foo/index", func is "bar" */
+        size_t dir_len = (size_t)(last_slash - p);
+        route->module_path = make_module_path(p, dir_len);
+        size_t func_start = (size_t)(last_slash - p) + 1;
+        route->func_name = strndup(p + func_start, len - func_start);
+    }
+}
+
+void sjs_route_free(sjs_route_t *route) {
+    free(route->module_path);
+    free(route->func_name);
+    free(route->query_string);
+    memset(route, 0, sizeof(*route));
 }

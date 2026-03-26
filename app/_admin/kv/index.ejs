@@ -27,6 +27,11 @@
       return { raw: codes };
     }
 
+    if (body.action === "put") {
+      kv.put(body.key, body.value);
+      return { ok: true };
+    }
+
     if (body.action === "delete") {
       kv.delete(body.key);
       return { ok: true };
@@ -78,6 +83,12 @@
     .hex-view .offset { color: #6c7086; }
     .hex-view .hex-bytes { color: #89b4fa; }
     .hex-view .ascii { color: #a6e3a1; }
+    .value-body textarea { width: 100%; height: 100%; background: transparent; border: none; color: #cdd6f4; font-family: "SF Mono", "Fira Code", monospace; font-size: 13px; line-height: 1.6; resize: none; outline: none; padding: 0; }
+    .btn-save { padding: 0.25rem 0.6rem; border: none; background: #89b4fa; color: #1e1e2e; border-radius: 3px; font-size: 0.75rem; cursor: pointer; font-weight: 500; }
+    .btn-save:hover { background: #74c7ec; }
+    .btn-save:disabled { opacity: 0.4; cursor: default; }
+    .saved-indicator { font-size: 0.75rem; color: #a6e3a1; opacity: 0; transition: opacity 0.3s; }
+    .saved-indicator.show { opacity: 1; }
     .empty-state { display: flex; align-items: center; justify-content: center; height: 100%; color: #6c7086; font-size: 0.95rem; }
   </style>
 </head>
@@ -101,6 +112,8 @@
         <button class="mode-btn active" data-mode="text">Text</button>
         <button class="mode-btn" data-mode="json">JSON</button>
         <button class="mode-btn" data-mode="hex">Hex</button>
+        <span class="saved-indicator" id="saved-indicator">Saved</span>
+        <button class="btn-save" id="btn-save" onclick="saveValue()" disabled>Save</button>
         <button class="btn-del" id="btn-del" onclick="deleteKey()">Delete</button>
       </div>
       <div class="value-body" id="value-body">
@@ -113,6 +126,7 @@
     var currentKey = null;
     var currentRaw = null; // array of char codes
     var currentMode = "text";
+    var dirty = false;
     var debounceTimer = null;
 
     function api(action, data) {
@@ -155,10 +169,15 @@
     }
 
     function loadValue(key) {
+      if (dirty && currentKey) {
+        if (!confirm("Discard unsaved changes to " + currentKey + "?")) return;
+      }
       currentKey = key;
       api("get", { key: key }).then(function(res) {
         if (res.error) { alert("Not found"); return; }
         currentRaw = res.raw;
+        dirty = false;
+        document.getElementById("btn-save").disabled = true;
         document.getElementById("value-header").style.display = "";
         document.getElementById("key-path").textContent = key;
         document.getElementById("key-path").title = key;
@@ -187,10 +206,23 @@
       var body = document.getElementById("value-body");
 
       if (currentMode === "text") {
-        var pre = document.createElement("pre");
-        pre.textContent = rawToString(currentRaw);
+        var ta = document.createElement("textarea");
+        ta.value = rawToString(currentRaw);
+        ta.spellcheck = false;
+        ta.addEventListener("input", function() {
+          if (!dirty) {
+            dirty = true;
+            document.getElementById("btn-save").disabled = false;
+          }
+        });
+        ta.addEventListener("keydown", function(e) {
+          if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+            e.preventDefault();
+            saveValue();
+          }
+        });
         body.innerHTML = "";
-        body.appendChild(pre);
+        body.appendChild(ta);
 
       } else if (currentMode === "json") {
         var text = rawToString(currentRaw);
@@ -242,6 +274,29 @@
         }
         body.appendChild(container);
       }
+    }
+
+    function saveValue() {
+      if (!currentKey || !dirty) return;
+      var ta = document.querySelector(".value-body textarea");
+      if (!ta) return;
+      var val = ta.value;
+      document.getElementById("btn-save").disabled = true;
+      api("put", { key: currentKey, value: val }).then(function(res) {
+        if (res.ok) {
+          dirty = false;
+          // Update currentRaw to match
+          currentRaw = [];
+          for (var i = 0; i < val.length; i++) currentRaw.push(val.charCodeAt(i));
+          var ind = document.getElementById("saved-indicator");
+          ind.classList.add("show");
+          setTimeout(function() { ind.classList.remove("show"); }, 1500);
+          loadKeys();
+        } else {
+          alert("Save failed");
+          document.getElementById("btn-save").disabled = false;
+        }
+      });
     }
 
     function deleteKey() {
