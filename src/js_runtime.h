@@ -2,6 +2,7 @@
 
 #include "kvstore.h"
 #include "preprocessor.h"
+#include <shift.h>
 #include <shift_h2.h>
 #include <quickjs.h>
 #include <stddef.h>
@@ -51,37 +52,82 @@ typedef struct {
     const sjs_preprocessor_registry_t *preprocessors;
 } sjs_runtime_t;
 
-/* Per-request context passed through to JS globals. */
+/* ======================================================================
+ * ECS component types — each manages one concern with its own lifecycle.
+ * Registered with shift via sjs_register_components().
+ * ====================================================================== */
+
+/* Response headers (destructor frees all strings + arrays) */
+typedef struct {
+    char    **names;
+    char    **values;
+    uint32_t  count;
+    uint32_t  cap;
+} sjs_resp_headers_t;
+
+/* Session state (destructor frees id) */
+typedef struct {
+    char *id;
+    bool  is_new;
+    bool  is_dirty;
+} sjs_session_t;
+
+/* Random byte capture/replay (destructor frees data) */
+typedef struct {
+    uint8_t *data;
+    size_t   len;
+    size_t   cap;
+    size_t   pos;
+    bool     replay;
+} sjs_random_tape_t;
+
+/* Route info (destructor frees all strings) */
+typedef struct {
+    char *module_path;
+    char *func_name;
+    char *query_string;
+} sjs_route_info_t;
+
+/* Compiled bytecode (destructor frees data) */
+typedef struct {
+    void  *data;
+    size_t len;
+} sjs_bytecode_t;
+
+/* Response status (constructor sets code = 200) */
+typedef struct {
+    uint16_t code;
+} sjs_resp_status_t;
+
+/* Component IDs for sjs ECS components */
+typedef struct {
+    shift_component_id_t resp_headers;
+    shift_component_id_t session;
+    shift_component_id_t random_tape;
+    shift_component_id_t route;
+    shift_component_id_t bytecode;
+    shift_component_id_t resp_status;
+} sjs_component_ids_t;
+
+/* Per-request view — thin struct of pointers into ECS components.
+ * Passed to JS globals via JS_SetContextOpaque(). */
 typedef struct sjs_request_ctx {
-    /* Request info (read from sh2 components) */
-    const char             *method;
-    const char             *path;
+    /* Borrowed from sh2 components (read-only request data) */
+    const char               *method;
+    const char               *path;
     const sh2_header_field_t *headers;
-    uint32_t                header_count;
-    const void             *body;
-    uint32_t                body_len;
+    uint32_t                  header_count;
+    const void               *body;
+    uint32_t                  body_len;
 
     /* Tenant KV prefix (e.g. "tenants/acme/"). NULL for system domain. */
     const char *kv_prefix;
 
-    /* Response state (written by JS, read by C to build sh2 response) */
-    uint16_t  resp_status;
-    char    **resp_header_names;
-    char    **resp_header_values;
-    uint32_t  resp_header_count;
-    uint32_t  resp_header_cap;
-
-    /* Session state */
-    char   *session_id;       /* heap-allocated session ID, or NULL */
-    bool    session_new;      /* true if we generated a new session ID */
-    bool    session_dirty;    /* true if session data was modified by JS */
-
-    /* Random byte capture/replay for deterministic replay */
-    uint8_t  *random_tape;        /* malloc'd buffer */
-    size_t    random_tape_len;    /* bytes written (capture) or total (replay) */
-    size_t    random_tape_cap;    /* allocated capacity */
-    size_t    random_tape_pos;    /* read position (replay mode) */
-    bool      random_tape_replay; /* true = replay from tape, false = capture */
+    /* Pointers into sjs ECS components (mutable) */
+    sjs_resp_headers_t  *resp_hdrs;
+    sjs_resp_status_t   *resp_st;
+    sjs_session_t       *session;
+    sjs_random_tape_t   *tape;
 } sjs_request_ctx_t;
 
 /* Create/destroy the per-worker runtime. */
@@ -89,8 +135,17 @@ int  sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
                       const sjs_preprocessor_registry_t *preprocessors);
 void sjs_runtime_free(sjs_runtime_t *sjs);
 
+/* Register sjs ECS components with the shift context.
+ * Call after sh2_register_components(). */
+int sjs_register_components(shift_t *sh, sjs_component_ids_t *out);
+
+/* Reset response headers for transaction retry (frees strings, keeps arrays). */
+void sjs_resp_headers_reset(sjs_resp_headers_t *h);
+
 /* Execute a module's handler for the given HTTP verb.
+ * Route and bytecode components are populated by the caller or by this function.
  * Returns a malloc'd response body string (caller frees), or NULL on error.
  * out_len receives the body length. */
 char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
+                   sjs_route_info_t *route, sjs_bytecode_t *bc,
                    uint32_t *out_len);

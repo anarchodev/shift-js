@@ -107,6 +107,17 @@ Available in all modules:
 | `kv.put(key, value)` | Store a value |
 | `kv.delete(key)` | Delete a key |
 | `kv.range(start, end, count?)` | Range query, returns `[{key, value, value_size}]` |
+| `session.id` | Read-only session ID (auto-generated if no `_sjs_sid` cookie) |
+| `session.get(key)` | Get a value from the session |
+| `session.set(key, value)` | Set a session value (persisted to KV on request end) |
+| `session.delete(key)` | Delete a session key |
+| `crypto.getRandomValues(buf)` | Fill a TypedArray with random bytes |
+| `crypto.randomUUID()` | Generate a UUID v4 string |
+| `crypto.subtle.digest(algo, data)` | Hash data (SHA-256, SHA-384, SHA-512) |
+| `crypto.subtle.importKey(...)` | Import a cryptographic key (HMAC) |
+| `crypto.subtle.sign(...)` | Sign data with HMAC |
+| `crypto.subtle.verify(...)` | Verify an HMAC signature |
+| `crypto.subtle.deriveBits(...)` | Derive bits (HKDF) |
 
 ## Server options
 

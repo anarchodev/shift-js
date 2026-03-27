@@ -353,7 +353,7 @@ static JSValue js_response_status(JSContext *ctx, JSValue this_val,
 
     int32_t code;
     if (JS_ToInt32(ctx, &code, argv[0])) return JS_EXCEPTION;
-    req->resp_status = (uint16_t)code;
+    req->resp_st->code = (uint16_t)code;
     return JS_UNDEFINED;
 }
 
@@ -367,23 +367,24 @@ static JSValue js_response_header(JSContext *ctx, JSValue this_val,
     const char *value = JS_ToCString(ctx, argv[1]);
     if (!value) { JS_FreeCString(ctx, name); return JS_EXCEPTION; }
 
-    if (req->resp_header_count == req->resp_header_cap) {
-        uint32_t new_cap = req->resp_header_cap ? req->resp_header_cap * 2 : 8;
-        char **nn = realloc(req->resp_header_names, new_cap * sizeof(char *));
-        char **nv = realloc(req->resp_header_values, new_cap * sizeof(char *));
+    sjs_resp_headers_t *h = req->resp_hdrs;
+    if (h->count == h->cap) {
+        uint32_t new_cap = h->cap ? h->cap * 2 : 8;
+        char **nn = realloc(h->names, new_cap * sizeof(char *));
+        char **nv = realloc(h->values, new_cap * sizeof(char *));
         if (!nn || !nv) {
             JS_FreeCString(ctx, name);
             JS_FreeCString(ctx, value);
             return JS_ThrowInternalError(ctx, "response header allocation failed");
         }
-        req->resp_header_names = nn;
-        req->resp_header_values = nv;
-        req->resp_header_cap = new_cap;
+        h->names = nn;
+        h->values = nv;
+        h->cap = new_cap;
     }
 
-    req->resp_header_names[req->resp_header_count] = strdup(name);
-    req->resp_header_values[req->resp_header_count] = strdup(value);
-    req->resp_header_count++;
+    h->names[h->count] = strdup(name);
+    h->values[h->count] = strdup(value);
+    h->count++;
 
     JS_FreeCString(ctx, name);
     JS_FreeCString(ctx, value);
@@ -411,8 +412,8 @@ static void js_install_response(JSContext *ctx) {
 static JSValue js_session_id_get(JSContext *ctx, JSValue this_val, int magic) {
     (void)magic;
     sjs_request_ctx_t *req = js_get_req_ctx(ctx);
-    if (!req || !req->session_id) return JS_NULL;
-    return JS_NewString(ctx, req->session_id);
+    if (!req || !req->session || !req->session->id) return JS_NULL;
+    return JS_NewString(ctx, req->session->id);
 }
 
 /* session.get(key) — read from the __data property */
@@ -442,7 +443,7 @@ static JSValue js_session_set(JSContext *ctx, JSValue this_val,
     JS_FreeValue(ctx, data);
     JS_FreeCString(ctx, key);
 
-    req->session_dirty = true;
+    req->session->is_dirty = true;
     return JS_UNDEFINED;
 }
 
@@ -460,7 +461,7 @@ static JSValue js_session_delete(JSContext *ctx, JSValue this_val,
     JS_FreeValue(ctx, data);
     JS_FreeAtom(ctx, atom);
 
-    req->session_dirty = true;
+    req->session->is_dirty = true;
     return JS_UNDEFINED;
 }
 
@@ -725,6 +726,110 @@ static int snapshot_restore(const sjs_snapshot_t *snap, sjs_arena_t *arena,
 }
 
 /* ======================================================================
+ * ECS component constructors and destructors
+ * ====================================================================== */
+
+static void sjs_resp_status_ctor(shift_t *ctx, shift_collection_id_t col_id,
+                                  const shift_entity_t *entities, void *data,
+                                  uint32_t offset, uint32_t count,
+                                  void *user_data) {
+    (void)ctx; (void)col_id; (void)entities; (void)user_data;
+    sjs_resp_status_t *p = (sjs_resp_status_t *)data + offset;
+    for (uint32_t i = 0; i < count; i++)
+        p[i].code = 200;
+}
+
+static void sjs_resp_headers_dtor(shift_t *ctx, shift_collection_id_t col_id,
+                                   const shift_entity_t *entities, void *data,
+                                   uint32_t offset, uint32_t count,
+                                   void *user_data) {
+    (void)ctx; (void)col_id; (void)entities; (void)user_data;
+    sjs_resp_headers_t *p = (sjs_resp_headers_t *)data + offset;
+    for (uint32_t i = 0; i < count; i++) {
+        for (uint32_t j = 0; j < p[i].count; j++) {
+            free(p[i].names[j]);
+            free(p[i].values[j]);
+        }
+        free(p[i].names);
+        free(p[i].values);
+    }
+}
+
+static void sjs_session_dtor(shift_t *ctx, shift_collection_id_t col_id,
+                              const shift_entity_t *entities, void *data,
+                              uint32_t offset, uint32_t count,
+                              void *user_data) {
+    (void)ctx; (void)col_id; (void)entities; (void)user_data;
+    sjs_session_t *p = (sjs_session_t *)data + offset;
+    for (uint32_t i = 0; i < count; i++)
+        free(p[i].id);
+}
+
+static void sjs_random_tape_dtor(shift_t *ctx, shift_collection_id_t col_id,
+                                  const shift_entity_t *entities, void *data,
+                                  uint32_t offset, uint32_t count,
+                                  void *user_data) {
+    (void)ctx; (void)col_id; (void)entities; (void)user_data;
+    sjs_random_tape_t *p = (sjs_random_tape_t *)data + offset;
+    for (uint32_t i = 0; i < count; i++)
+        free(p[i].data);
+}
+
+static void sjs_route_info_dtor(shift_t *ctx, shift_collection_id_t col_id,
+                                 const shift_entity_t *entities, void *data,
+                                 uint32_t offset, uint32_t count,
+                                 void *user_data) {
+    (void)ctx; (void)col_id; (void)entities; (void)user_data;
+    sjs_route_info_t *p = (sjs_route_info_t *)data + offset;
+    for (uint32_t i = 0; i < count; i++) {
+        free(p[i].module_path);
+        free(p[i].func_name);
+        free(p[i].query_string);
+    }
+}
+
+static void sjs_bytecode_dtor(shift_t *ctx, shift_collection_id_t col_id,
+                               const shift_entity_t *entities, void *data,
+                               uint32_t offset, uint32_t count,
+                               void *user_data) {
+    (void)ctx; (void)col_id; (void)entities; (void)user_data;
+    sjs_bytecode_t *p = (sjs_bytecode_t *)data + offset;
+    for (uint32_t i = 0; i < count; i++)
+        free(p[i].data);
+}
+
+int sjs_register_components(shift_t *sh, sjs_component_ids_t *out) {
+    shift_result_t r;
+    out->resp_headers = shift_component_add_ex(sh, sizeof(sjs_resp_headers_t),
+                                                NULL, sjs_resp_headers_dtor, &r);
+    if (r != shift_ok) return -1;
+    out->session = shift_component_add_ex(sh, sizeof(sjs_session_t),
+                                           NULL, sjs_session_dtor, &r);
+    if (r != shift_ok) return -1;
+    out->random_tape = shift_component_add_ex(sh, sizeof(sjs_random_tape_t),
+                                               NULL, sjs_random_tape_dtor, &r);
+    if (r != shift_ok) return -1;
+    out->route = shift_component_add_ex(sh, sizeof(sjs_route_info_t),
+                                         NULL, sjs_route_info_dtor, &r);
+    if (r != shift_ok) return -1;
+    out->bytecode = shift_component_add_ex(sh, sizeof(sjs_bytecode_t),
+                                            NULL, sjs_bytecode_dtor, &r);
+    if (r != shift_ok) return -1;
+    out->resp_status = shift_component_add_ex(sh, sizeof(sjs_resp_status_t),
+                                               sjs_resp_status_ctor, NULL, &r);
+    if (r != shift_ok) return -1;
+    return 0;
+}
+
+void sjs_resp_headers_reset(sjs_resp_headers_t *h) {
+    for (uint32_t i = 0; i < h->count; i++) {
+        free(h->names[i]);
+        free(h->values[i]);
+    }
+    h->count = 0;
+}
+
+/* ======================================================================
  * Runtime lifecycle
  * ====================================================================== */
 
@@ -789,22 +894,22 @@ void sjs_runtime_free(sjs_runtime_t *sjs) {
 
 /* ---- helpers: response header manipulation ---- */
 
-static void resp_add_header(sjs_request_ctx_t *req,
+static void resp_add_header(sjs_resp_headers_t *h,
                             const char *name, const char *value) {
-    if (req->resp_header_count == req->resp_header_cap) {
-        uint32_t nc = req->resp_header_cap ? req->resp_header_cap * 2 : 8;
-        req->resp_header_names  = realloc(req->resp_header_names,  nc * sizeof(char *));
-        req->resp_header_values = realloc(req->resp_header_values, nc * sizeof(char *));
-        req->resp_header_cap = nc;
+    if (h->count == h->cap) {
+        uint32_t nc = h->cap ? h->cap * 2 : 8;
+        h->names  = realloc(h->names,  nc * sizeof(char *));
+        h->values = realloc(h->values, nc * sizeof(char *));
+        h->cap = nc;
     }
-    req->resp_header_names[req->resp_header_count]  = strdup(name);
-    req->resp_header_values[req->resp_header_count] = strdup(value);
-    req->resp_header_count++;
+    h->names[h->count]  = strdup(name);
+    h->values[h->count] = strdup(value);
+    h->count++;
 }
 
-static bool resp_has_header(const sjs_request_ctx_t *req, const char *name) {
-    for (uint32_t i = 0; i < req->resp_header_count; i++)
-        if (!strcasecmp(req->resp_header_names[i], name)) return true;
+static bool resp_has_header(const sjs_resp_headers_t *h, const char *name) {
+    for (uint32_t i = 0; i < h->count; i++)
+        if (!strcasecmp(h->names[i], name)) return true;
     return false;
 }
 
@@ -867,8 +972,8 @@ static JSValue parse_query_string(JSContext *ctx, const char *qs) {
 
 /* Try to resolve, preprocess, compile, and cache a module at base_path.
  * Returns 0 on success (bytecode/bc_len filled), -1 on not found,
- * positive on error (resp_status and body filled). */
-static int compile_module(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
+ * positive on error (err_body filled, caller sets status). */
+static int compile_module(sjs_runtime_t *sjs, const char *kv_prefix,
                           const char *base_path, const char *cache_key,
                           void **bytecode, size_t *bc_len,
                           char **out_module_path,
@@ -877,7 +982,7 @@ static int compile_module(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
     size_t source_len = 0;
     char *module_path = sjs_resolve_with_extensions(
         sjs->preprocessors, sjs->kv, base_path,
-        req->kv_prefix, &source, &source_len);
+        kv_prefix, &source, &source_len);
 
     if (!module_path) return -1;   /* not found */
 
@@ -894,7 +999,6 @@ static int compile_module(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         free(source);
         if (!js) {
             free(module_path);
-            req->resp_status = 500;
             *err_body = strdup("Preprocessor Error");
             *err_len = (uint32_t)strlen(*err_body);
             return 1;
@@ -903,7 +1007,7 @@ static int compile_module(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         compile_len    = js_len;
     }
 
-    sjs->current_prefix = req->kv_prefix;
+    sjs->current_prefix = kv_prefix;
     JSContext *cc = sjs->compile_ctx;
     JSValue module_val = JS_Eval(cc, compile_source, compile_len,
                                  module_path,
@@ -921,7 +1025,6 @@ static int compile_module(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         JS_FreeCString(cc, err);
         JS_FreeValue(cc, exc);
         free(module_path);
-        req->resp_status = 500;
         *err_len = (uint32_t)strlen(*err_body);
         return 1;
     }
@@ -933,7 +1036,6 @@ static int compile_module(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 
     if (!bc) {
         free(module_path);
-        req->resp_status = 500;
         *err_body = strdup("Bytecode Serialization Error");
         *err_len = (uint32_t)strlen(*err_body);
         return 1;
@@ -949,7 +1051,7 @@ static int compile_module(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 /* ---- helpers: body extraction (return value → libc heap string) ---- */
 
 static char *extract_body_string(JSContext *ctx, sjs_arena_t *arena,
-                                 sjs_request_ctx_t *req,
+                                 sjs_resp_headers_t *resp_hdrs,
                                  JSValue ret, const char *module_path,
                                  const char *func_name,
                                  uint32_t *out_len,
@@ -992,147 +1094,319 @@ static char *extract_body_string(JSContext *ctx, sjs_arena_t *arena,
             memcpy(body, str, len);
             *out_len = (uint32_t)len;
         }
-        if (!resp_has_header(req, "content-type"))
-            resp_add_header(req, "content-type", "application/json");
+        if (!resp_has_header(resp_hdrs, "content-type"))
+            resp_add_header(resp_hdrs, "content-type", "application/json");
     }
     return body;
+}
+
+/* ---- route resolution ---- */
+
+/* Resolve route and load/compile bytecode. Populates route and bc components.
+ * Returns 0 on success, or an HTTP status code on error (with err_body set). */
+static int sjs_resolve_request_route(sjs_runtime_t *sjs, const char *path,
+                              const char *kv_prefix,
+                              sjs_route_info_t *route, sjs_bytecode_t *bc,
+                              char **err_body, uint32_t *err_len) {
+    sjs_route_t parsed;
+    sjs_resolve_route(path, &parsed);
+
+    char *base_path = parsed.module_path;
+    route->query_string = parsed.query_string;
+    parsed.module_path = NULL;
+    parsed.query_string = NULL;
+    sjs_route_free(&parsed);
+
+    if (!base_path) {
+        *err_body = strdup("Internal Server Error");
+        *err_len = (uint32_t)strlen(*err_body);
+        return 500;
+    }
+
+    /* Build cache key */
+    char raw_cache[256];
+    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base_path);
+    char cache_key_buf[512];
+    const char *ck = sjs_prefixed_key(kv_prefix, raw_cache,
+                                       cache_key_buf, sizeof(cache_key_buf));
+    if (!ck) {
+        free(base_path);
+        *err_body = strdup("Key Too Long");
+        *err_len = (uint32_t)strlen(*err_body);
+        return 500;
+    }
+
+    /* Try cache hit */
+    if (kv_get(sjs->kv, ck, &bc->data, &bc->len) == 0)
+        goto found;
+
+    /* Cache miss — compile primary route */
+    {
+        char *comp_err = NULL;
+        uint32_t comp_err_len = 0;
+        int rc = compile_module(sjs, kv_prefix, base_path, ck,
+                                &bc->data, &bc->len, &route->module_path,
+                                &comp_err, &comp_err_len);
+        if (rc == 0) goto found;
+        if (rc > 0) {
+            free(base_path);
+            *err_body = comp_err;
+            *err_len = comp_err_len;
+            return 500;
+        }
+    }
+
+    /* Primary not found — try fallback route */
+    free(base_path);
+    {
+        sjs_route_t fb;
+        sjs_resolve_route_fallback(path, &fb);
+        base_path = fb.module_path;
+        route->func_name = fb.func_name;
+        fb.module_path = NULL;
+        fb.func_name = NULL;
+        sjs_route_free(&fb);
+    }
+
+    if (!base_path) {
+        *err_body = strdup("Not Found");
+        *err_len = (uint32_t)strlen(*err_body);
+        return 404;
+    }
+
+    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base_path);
+    ck = sjs_prefixed_key(kv_prefix, raw_cache,
+                           cache_key_buf, sizeof(cache_key_buf));
+    if (!ck) {
+        free(base_path);
+        *err_body = strdup("Key Too Long");
+        *err_len = (uint32_t)strlen(*err_body);
+        return 500;
+    }
+
+    if (kv_get(sjs->kv, ck, &bc->data, &bc->len) == 0)
+        goto found;
+
+    /* Compile fallback route */
+    {
+        char *comp_err = NULL;
+        uint32_t comp_err_len = 0;
+        int rc = compile_module(sjs, kv_prefix, base_path, ck,
+                                &bc->data, &bc->len, &route->module_path,
+                                &comp_err, &comp_err_len);
+        if (rc == 0) goto found;
+        if (rc > 0) {
+            free(base_path);
+            *err_body = comp_err;
+            *err_len = comp_err_len;
+            return 500;
+        }
+    }
+
+    free(base_path);
+    *err_body = strdup("Not Found");
+    *err_len = (uint32_t)strlen(*err_body);
+    return 404;
+
+found:
+    if (!route->module_path) route->module_path = strdup(base_path);
+    free(base_path);
+    return 0;
+}
+
+/* ---- session loading ---- */
+
+static void sjs_session_load(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
+                              JSContext *ctx) {
+    sjs_session_t *sess = req->session;
+    sess->is_dirty = false;
+
+    /* Extract session ID from Cookie header */
+    if (!sess->id) {
+        for (uint32_t i = 0; i < req->header_count; i++) {
+            if (req->headers[i].name_len == 6 &&
+                memcmp(req->headers[i].name, "cookie", 6) == 0) {
+                sess->id = sjs_session_parse_cookie(
+                    req->headers[i].value, req->headers[i].value_len);
+                break;
+            }
+        }
+        if (!sess->id) {
+            char id_buf[SJS_SESSION_ID_LEN + 1];
+            if (sjs_session_generate_id(id_buf, req))
+                sess->id = strdup(id_buf);
+            sess->is_new = true;
+        }
+    }
+
+    /* Load session data from KV into session.__data */
+    if (sess->id && !sess->is_new) {
+        char sess_key[80];
+        snprintf(sess_key, sizeof(sess_key), "sessions/%s", sess->id);
+
+        char pfx_buf[512];
+        const char *actual_key = sjs_prefixed_key(req->kv_prefix, sess_key,
+                                                   pfx_buf, sizeof(pfx_buf));
+        if (actual_key) {
+            void  *sdata = NULL;
+            size_t sdata_len = 0;
+            if (kv_get(sjs->kv, actual_key, &sdata, &sdata_len) == 0 && sdata) {
+                JSValue global = JS_GetGlobalObject(ctx);
+                JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
+                JSValue parse_fn = JS_GetPropertyStr(ctx, json_obj, "parse");
+                JSValue json_str = JS_NewStringLen(ctx, sdata, sdata_len);
+                JSValue parsed = JS_Call(ctx, parse_fn, json_obj, 1, &json_str);
+
+                if (!JS_IsException(parsed)) {
+                    JSValue s = JS_GetPropertyStr(ctx, global, "session");
+                    JS_SetPropertyStr(ctx, s, "__data", parsed);
+                    JS_FreeValue(ctx, s);
+                } else {
+                    JS_GetException(ctx); /* clear */
+                }
+
+                JS_FreeValue(ctx, global);
+                free(sdata);
+            }
+        }
+    }
+}
+
+/* ---- session persistence ---- */
+
+static void sjs_session_persist(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
+                                 JSContext *ctx) {
+    sjs_session_t *sess = req->session;
+    if (!sess->id || (!sess->is_dirty && !sess->is_new))
+        return;
+
+    if (sess->is_dirty) {
+        JSValue global = JS_GetGlobalObject(ctx);
+        JSValue s = JS_GetPropertyStr(ctx, global, "session");
+        JSValue data = JS_GetPropertyStr(ctx, s, "__data");
+        JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
+        JSValue stringify = JS_GetPropertyStr(ctx, json_obj, "stringify");
+        JSValue json_val = JS_Call(ctx, stringify, json_obj, 1, &data);
+
+        if (JS_IsString(json_val)) {
+            size_t jlen;
+            const char *jstr = JS_ToCStringLen(ctx, &jlen, json_val);
+            if (jstr) {
+                char sess_key[80];
+                snprintf(sess_key, sizeof(sess_key), "sessions/%s", sess->id);
+                char pfx_buf[512];
+                const char *actual_key = sjs_prefixed_key(
+                    req->kv_prefix, sess_key, pfx_buf, sizeof(pfx_buf));
+                if (actual_key)
+                    kv_put(sjs->kv, actual_key, jstr, jlen);
+            }
+        }
+
+        JS_FreeValue(ctx, global);
+    }
+
+    if (sess->is_new) {
+        char *cookie = sjs_session_cookie_header(sess->id);
+        if (cookie) {
+            resp_add_header(req->resp_hdrs, "set-cookie", cookie);
+            free(cookie);
+        }
+    }
+}
+
+/* ---- JSONP wrapping ---- */
+
+static void sjs_jsonp_wrap(char **body, uint32_t *body_len,
+                            const char *query_str, const char *method,
+                            sjs_resp_headers_t *resp_hdrs) {
+    if (!*body || (strcmp(method, "GET") && strcmp(method, "HEAD")))
+        return;
+    if (!query_str)
+        return;
+
+    /* Quick scan for callback= param */
+    const char *cb = NULL;
+    char *cb_buf = NULL;
+    char *qs_copy = strdup(query_str);
+    char *p = qs_copy;
+    while (p && *p) {
+        char *amp = strchr(p, '&');
+        if (amp) *amp = '\0';
+        if (strncmp(p, "callback=", 9) == 0) {
+            cb_buf = strdup(p + 9);
+            url_decode(cb_buf, strlen(cb_buf));
+            cb = cb_buf;
+            break;
+        }
+        p = amp ? amp + 1 : NULL;
+    }
+    free(qs_copy);
+
+    if (!cb || !cb[0]) { free(cb_buf); return; }
+
+    /* Validate callback name (alphanumeric + _ + . only) */
+    bool valid = true;
+    for (const char *c = cb; *c; c++) {
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+              (*c >= '0' && *c <= '9') || *c == '_' || *c == '.')) {
+            valid = false;
+            break;
+        }
+    }
+
+    if (valid) {
+        size_t cb_len = strlen(cb);
+        size_t blen = *body_len;
+        size_t wrapped_len = cb_len + 1 + blen + 2;
+        char *wrapped = malloc(wrapped_len);
+        if (wrapped) {
+            memcpy(wrapped, cb, cb_len);
+            wrapped[cb_len] = '(';
+            memcpy(wrapped + cb_len + 1, *body, blen);
+            wrapped[cb_len + 1 + blen] = ')';
+            wrapped[cb_len + 1 + blen + 1] = ';';
+            free(*body);
+            *body = wrapped;
+            *body_len = (uint32_t)wrapped_len;
+
+            /* Override content-type for JSONP */
+            for (uint32_t i = 0; i < resp_hdrs->count; i++) {
+                if (!strcasecmp(resp_hdrs->names[i], "content-type")) {
+                    free(resp_hdrs->values[i]);
+                    resp_hdrs->values[i] = strdup("application/javascript");
+                    break;
+                }
+            }
+        }
+    }
+    free(cb_buf);
 }
 
 /* ---- main dispatch ---- */
 
 char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
+                   sjs_route_info_t *route, sjs_bytecode_t *bc,
                    uint32_t *out_len) {
-    req->resp_status = 200;
-    req->resp_header_names = NULL;
-    req->resp_header_values = NULL;
-    req->resp_header_count = 0;
-    req->resp_header_cap = 0;
-
-    /* ---- Route resolution ----
-     * Primary: full URL path as module (e.g. /foo/bar → foo/bar/index)
-     * Fallback: peel last segment as function name (e.g. /foo/bar → foo/index + "bar")
-     */
-    sjs_route_t route;
-    sjs_resolve_route(req->path, &route);
-
-    char *base_path = route.module_path;
-    char *url_func  = NULL;
-    char *query_str = route.query_string;
-
-    /* Detach from route so we can free independently */
-    route.module_path = NULL;
-    route.query_string = NULL;
-    sjs_route_free(&route);
-
-    if (!base_path) {
-        req->resp_status = 500;
-        char *body = strdup("Internal Server Error");
-        *out_len = (uint32_t)strlen(body);
-        return body;
-    }
-
-    /* ---- Phase 1: Ensure bytecode exists in KV cache ---- */
-    char raw_cache[256];
-    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base_path);
-
-    char cache_key_buf[512];
-    const char *ck = sjs_prefixed_key(req->kv_prefix, raw_cache,
-                                       cache_key_buf, sizeof(cache_key_buf));
-    if (!ck) {
-        free(base_path); free(query_str);
-        req->resp_status = 500;
-        char *body = strdup("Key Too Long");
-        *out_len = (uint32_t)strlen(body);
-        return body;
-    }
-
-    char *module_path = NULL;
-    void  *bytecode = NULL;
-    size_t bc_len = 0;
-
-    if (kv_get(sjs->kv, ck, &bytecode, &bc_len) != 0) {
-        /* Cache miss — try to compile */
+    /* ---- Phase 1: Route resolution and bytecode loading ---- */
+    {
         char *err_body = NULL;
         uint32_t err_len = 0;
-        int rc = compile_module(sjs, req, base_path, ck,
-                                &bytecode, &bc_len, &module_path,
-                                &err_body, &err_len);
-        if (rc < 0) {
-            /* Primary not found — try fallback route */
-            free(base_path);
-            sjs_route_t fb;
-            sjs_resolve_route_fallback(req->path, &fb);
-            base_path = fb.module_path;
-            url_func  = fb.func_name;
-            fb.module_path = NULL;
-            fb.func_name = NULL;
-            sjs_route_free(&fb);
-
-            if (!base_path) {
-                free(query_str);
-                req->resp_status = 404;
-                char *body = strdup("Not Found");
-                *out_len = (uint32_t)strlen(body);
-                return body;
-            }
-
-            snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base_path);
-            ck = sjs_prefixed_key(req->kv_prefix, raw_cache,
-                                   cache_key_buf, sizeof(cache_key_buf));
-            if (!ck) {
-                free(base_path); free(url_func); free(query_str);
-                req->resp_status = 500;
-                char *body = strdup("Key Too Long");
-                *out_len = (uint32_t)strlen(body);
-                return body;
-            }
-
-            if (kv_get(sjs->kv, ck, &bytecode, &bc_len) != 0) {
-                rc = compile_module(sjs, req, base_path, ck,
-                                    &bytecode, &bc_len, &module_path,
-                                    &err_body, &err_len);
-                if (rc < 0) {
-                    free(base_path); free(url_func); free(query_str);
-                    req->resp_status = 404;
-                    char *body = strdup("Not Found");
-                    *out_len = (uint32_t)strlen(body);
-                    return body;
-                }
-                if (rc > 0) {
-                    free(base_path); free(url_func); free(query_str);
-                    *out_len = err_len;
-                    return err_body;
-                }
-            }
-        } else if (rc > 0) {
-            free(base_path); free(query_str);
+        int status = sjs_resolve_request_route(sjs, req->path, req->kv_prefix,
+                                        route, bc, &err_body, &err_len);
+        if (status != 0) {
+            req->resp_st->code = (uint16_t)status;
             *out_len = err_len;
             return err_body;
         }
     }
 
-    if (!module_path) module_path = strdup(base_path);
-    free(base_path);
-
-    /* ---- Session: extract session ID from Cookie header ---- */
-    req->session_id = NULL;
-    req->session_new = false;
-    req->session_dirty = false;
-
-    for (uint32_t i = 0; i < req->header_count; i++) {
-        if (req->headers[i].name_len == 6 &&
-            memcmp(req->headers[i].name, "cookie", 6) == 0) {
-            req->session_id = sjs_session_parse_cookie(
-                req->headers[i].value, req->headers[i].value_len);
-            break;
-        }
-    }
-    if (!req->session_id) {
-        char id_buf[SJS_SESSION_ID_LEN + 1];
-        if (sjs_session_generate_id(id_buf, req))
-            req->session_id = strdup(id_buf);
-        req->session_new = true;
-    }
+    /* Cache key for bytecode reload on retry */
+    char raw_cache[256];
+    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s",
+             route->module_path);
+    char cache_key_buf[512];
+    const char *ck = sjs_prefixed_key(req->kv_prefix, raw_cache,
+                                       cache_key_buf, sizeof(cache_key_buf));
 
     /* ---- Phases 2-4 with transaction retry on conflict ---- */
     #define MAX_TXN_RETRIES 3
@@ -1141,26 +1415,15 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 
     for (int attempt = 0; attempt <= MAX_TXN_RETRIES; attempt++) {
 
-        /* Reset response state on retry */
+        /* Reset mutable state on retry */
         if (attempt > 0) {
-            for (uint32_t i = 0; i < req->resp_header_count; i++) {
-                free(req->resp_header_names[i]);
-                free(req->resp_header_values[i]);
-            }
-            free(req->resp_header_names);
-            free(req->resp_header_values);
-            req->resp_status = 200;
-            req->resp_header_names = NULL;
-            req->resp_header_values = NULL;
-            req->resp_header_count = 0;
-            req->resp_header_cap = 0;
+            sjs_resp_headers_reset(req->resp_hdrs);
+            req->resp_st->code = 200;
 
-            free(bytecode);
-            bytecode = NULL;
-            if (kv_get(sjs->kv, ck, &bytecode, &bc_len) != 0) {
-                free(module_path); free(url_func); free(query_str);
-                free(req->session_id); req->session_id = NULL;
-                req->resp_status = 500;
+            free(bc->data);
+            bc->data = NULL;
+            if (!ck || kv_get(sjs->kv, ck, &bc->data, &bc->len) != 0) {
+                req->resp_st->code = 500;
                 char *body = strdup("Internal Server Error");
                 *out_len = (uint32_t)strlen(body);
                 return body;
@@ -1173,9 +1436,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         JSRuntime *rt = NULL;
         JSContext *ctx = NULL;
         if (snapshot_restore(&sjs->snapshot, arena, sjs, &rt, &ctx) != 0) {
-            free(bytecode); free(module_path); free(url_func); free(query_str);
-            free(req->session_id); req->session_id = NULL;
-            req->resp_status = 500;
+            req->resp_st->code = 500;
             char *body = strdup("Internal Server Error");
             *out_len = (uint32_t)strlen(body);
             return body;
@@ -1189,57 +1450,26 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             continue;
         }
 
-        /* Load session data from KV into session.__data */
-        req->session_dirty = false;
-        if (req->session_id && !req->session_new) {
-            char sess_key[80];
-            snprintf(sess_key, sizeof(sess_key), "sessions/%s", req->session_id);
+        /* Load session */
+        sjs_session_load(sjs, req, ctx);
 
-            char pfx_buf[512];
-            const char *actual_key = sjs_prefixed_key(req->kv_prefix, sess_key,
-                                                       pfx_buf, sizeof(pfx_buf));
-            if (actual_key) {
-                void  *sdata = NULL;
-                size_t sdata_len = 0;
-                if (kv_get(sjs->kv, actual_key, &sdata, &sdata_len) == 0 && sdata) {
-                    /* Parse JSON into session.__data */
-                    JSValue global = JS_GetGlobalObject(ctx);
-                    JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
-                    JSValue parse_fn = JS_GetPropertyStr(ctx, json_obj, "parse");
-                    JSValue json_str = JS_NewStringLen(ctx, sdata, sdata_len);
-                    JSValue parsed = JS_Call(ctx, parse_fn, json_obj, 1, &json_str);
-
-                    if (!JS_IsException(parsed)) {
-                        JSValue sess = JS_GetPropertyStr(ctx, global, "session");
-                        JS_SetPropertyStr(ctx, sess, "__data", parsed);
-                        JS_FreeValue(ctx, sess);
-                    } else {
-                        JS_GetException(ctx); /* clear */
-                    }
-
-                    JS_FreeValue(ctx, global);
-                    free(sdata);
-                }
-            }
-        }
-
-        JSValue module_val = JS_ReadObject(ctx, bytecode, bc_len,
+        JSValue module_val = JS_ReadObject(ctx, bc->data, bc->len,
                                            JS_READ_OBJ_BYTECODE);
-        free(bytecode);
-        bytecode = NULL;
+        /* Bytecode was consumed; clear so destructor doesn't double-free
+         * (we'll reload from KV on retry) */
+        free(bc->data);
+        bc->data = NULL;
 
         if (JS_IsException(module_val)) {
             const char *err = js_err_string(ctx, arena);
             fprintf(stderr, "shift-js: bytecode load error in %s: %s\n",
-                    module_path, err);
+                    route->module_path, err);
             char *body;
             asprintf(&body, "bytecode load error in %s: %s",
-                     module_path, err);
+                     route->module_path, err);
             kv_rollback(sjs->kv);
             arena_reset(sjs);
-            free(module_path); free(url_func); free(query_str);
-            free(req->session_id); req->session_id = NULL;
-            req->resp_status = 500;
+            req->resp_st->code = 500;
             *out_len = (uint32_t)strlen(body);
             return body;
         }
@@ -1250,9 +1480,9 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         if (JS_IsException(result)) {
             const char *err = js_err_string(ctx, arena);
             fprintf(stderr, "shift-js: module eval error in %s: %s\n",
-                    module_path, err);
+                    route->module_path, err);
             asprintf(&err_msg, "module eval error in %s: %s",
-                     module_path, err);
+                     route->module_path, err);
             goto txn_fail;
         }
 
@@ -1268,9 +1498,9 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             const char *err = JS_ToCString(ctx, reason);
             if (!err) err = "(unknown)";
             fprintf(stderr, "shift-js: module rejected in %s: %s\n",
-                    module_path, err);
+                    route->module_path, err);
             asprintf(&err_msg, "module rejected in %s: %s",
-                     module_path, err);
+                     route->module_path, err);
             goto txn_fail;
         }
 
@@ -1283,49 +1513,39 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         const char *called_func = NULL;
 
         if (is_render) {
-            /* ---- Render mode (EJS pages) ----
-             * Call __render() for any HTTP method.
-             * Auto-set content-type: text/html. */
             called_func = "__render";
-            if (!resp_has_header(req, "content-type"))
-                resp_add_header(req, "content-type", "text/html");
+            if (!resp_has_header(req->resp_hdrs, "content-type"))
+                resp_add_header(req->resp_hdrs, "content-type", "text/html");
 
             ret = JS_Call(ctx, render_fn, JS_UNDEFINED, 0, NULL);
         } else {
-            /* ---- API mode (.mjs modules) ----
-             * Function name from URL path segment, or "index" as default.
-             * GET:  args from query string
-             * POST/PUT/PATCH/DELETE: args from JSON body */
-            const char *fn_name = (url_func && url_func[0]) ? url_func : "index";
+            const char *fn_name = (route->func_name && route->func_name[0])
+                                  ? route->func_name : "index";
             called_func = fn_name;
 
             JSValue handler = JS_GetPropertyStr(ctx, ns, fn_name);
             if (!JS_IsFunction(ctx, handler)) {
                 kv_rollback(sjs->kv);
                 arena_reset(sjs);
-                req->resp_status = 404;
+                req->resp_st->code = 404;
                 char *body;
                 asprintf(&body, "function \"%s\" not found", fn_name);
-                free(module_path); free(url_func); free(query_str);
-                free(req->session_id); req->session_id = NULL;
                 *out_len = (uint32_t)strlen(body);
                 return body;
             }
 
-            /* Build args object from query string (GET) or JSON body (POST etc.) */
+            /* Build args object from query string (GET) or JSON body */
             JSValue args;
             if (!strcmp(req->method, "GET") || !strcmp(req->method, "HEAD")) {
-                args = parse_query_string(ctx, query_str);
+                args = parse_query_string(ctx, route->query_string);
             } else if (req->body && req->body_len > 0) {
-                /* Parse JSON body */
                 JSValue global = JS_GetGlobalObject(ctx);
                 JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
                 JSValue parse_fn = JS_GetPropertyStr(ctx, json_obj, "parse");
                 JSValue body_str = JS_NewStringLen(ctx, req->body, req->body_len);
                 args = JS_Call(ctx, parse_fn, json_obj, 1, &body_str);
                 if (JS_IsException(args)) {
-                    /* Body is not valid JSON — pass as string */
-                    JS_GetException(ctx);  /* clear */
+                    JS_GetException(ctx);
                     args = JS_NewObject(ctx);
                     JS_SetPropertyStr(ctx, args, "body",
                                       JS_NewStringLen(ctx, req->body, req->body_len));
@@ -1341,9 +1561,9 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         if (JS_IsException(ret)) {
             const char *err = js_err_string(ctx, arena);
             fprintf(stderr, "shift-js: handler error in %s.%s: %s\n",
-                    module_path, called_func, err);
+                    route->module_path, called_func, err);
             asprintf(&err_msg, "handler error in %s.%s: %s",
-                     module_path, called_func, err);
+                     route->module_path, called_func, err);
             goto txn_fail;
         }
 
@@ -1362,120 +1582,25 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             JSValue reason = JS_PromiseResult(ctx, ret);
             const char *err = JS_ToCString(ctx, reason);
             fprintf(stderr, "shift-js: async handler rejected in %s.%s: %s\n",
-                    module_path, called_func, err ? err : "(unknown)");
+                    route->module_path, called_func, err ? err : "(unknown)");
             asprintf(&err_msg, "async handler rejected in %s.%s: %s",
-                     module_path, called_func, err ? err : "(unknown)");
+                     route->module_path, called_func, err ? err : "(unknown)");
             goto txn_fail;
         }
 
         /* Phase 4: Extract response body to libc heap */
-        char *body = extract_body_string(ctx, arena, req, ret,
-                                         module_path, called_func,
+        char *body = extract_body_string(ctx, arena, req->resp_hdrs, ret,
+                                         route->module_path, called_func,
                                          out_len, &err_msg);
         if (err_msg) goto txn_fail;
 
         /* JSONP wrapping for API mode GET requests */
-        if (!is_render && body &&
-            (!strcmp(req->method, "GET") || !strcmp(req->method, "HEAD"))) {
-            /* Look for "callback" in query string */
-            const char *cb = NULL;
-            char *cb_buf = NULL;
-            if (query_str) {
-                /* Quick scan for callback= param */
-                char *qs_copy = strdup(query_str);
-                char *p = qs_copy;
-                while (p && *p) {
-                    char *amp = strchr(p, '&');
-                    if (amp) *amp = '\0';
-                    if (strncmp(p, "callback=", 9) == 0) {
-                        cb_buf = strdup(p + 9);
-                        url_decode(cb_buf, strlen(cb_buf));
-                        cb = cb_buf;
-                        break;
-                    }
-                    p = amp ? amp + 1 : NULL;
-                }
-                free(qs_copy);
-            }
-            if (cb && cb[0]) {
-                /* Validate callback name (alphanumeric + _ + . only) */
-                bool valid = true;
-                for (const char *c = cb; *c; c++) {
-                    if (!((*c >= 'a' && *c <= 'z') ||
-                          (*c >= 'A' && *c <= 'Z') ||
-                          (*c >= '0' && *c <= '9') ||
-                          *c == '_' || *c == '.')) {
-                        valid = false;
-                        break;
-                    }
-                }
-                if (valid) {
-                    /* Wrap: callback(body); */
-                    size_t cb_len = strlen(cb);
-                    size_t body_len = *out_len;
-                    size_t wrapped_len = cb_len + 1 + body_len + 2; /* cb(body);\n */
-                    char *wrapped = malloc(wrapped_len);
-                    if (wrapped) {
-                        memcpy(wrapped, cb, cb_len);
-                        wrapped[cb_len] = '(';
-                        memcpy(wrapped + cb_len + 1, body, body_len);
-                        wrapped[cb_len + 1 + body_len] = ')';
-                        wrapped[cb_len + 1 + body_len + 1] = ';';
-                        free(body);
-                        body = wrapped;
-                        *out_len = (uint32_t)wrapped_len;
+        if (!is_render)
+            sjs_jsonp_wrap(&body, out_len, route->query_string,
+                           req->method, req->resp_hdrs);
 
-                        /* Override content-type for JSONP */
-                        for (uint32_t i = 0; i < req->resp_header_count; i++) {
-                            if (!strcasecmp(req->resp_header_names[i], "content-type")) {
-                                free(req->resp_header_values[i]);
-                                req->resp_header_values[i] = strdup("application/javascript");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            free(cb_buf);
-        }
-
-        /* ---- Session: persist if dirty, set cookie if new ---- */
-        if (req->session_id && (req->session_dirty || req->session_new)) {
-            if (req->session_dirty) {
-                /* Serialize session.__data to JSON and write to KV */
-                JSValue global = JS_GetGlobalObject(ctx);
-                JSValue sess = JS_GetPropertyStr(ctx, global, "session");
-                JSValue data = JS_GetPropertyStr(ctx, sess, "__data");
-                JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
-                JSValue stringify = JS_GetPropertyStr(ctx, json_obj, "stringify");
-                JSValue json_val = JS_Call(ctx, stringify, json_obj, 1, &data);
-
-                if (JS_IsString(json_val)) {
-                    size_t jlen;
-                    const char *jstr = JS_ToCStringLen(ctx, &jlen, json_val);
-                    if (jstr) {
-                        char sess_key[80];
-                        snprintf(sess_key, sizeof(sess_key),
-                                 "sessions/%s", req->session_id);
-                        char pfx_buf[512];
-                        const char *actual_key = sjs_prefixed_key(
-                            req->kv_prefix, sess_key, pfx_buf, sizeof(pfx_buf));
-                        if (actual_key)
-                            kv_put(sjs->kv, actual_key, jstr, jlen);
-                    }
-                }
-
-                JS_FreeValue(ctx, global);
-            }
-
-            if (req->session_new) {
-                char *cookie = sjs_session_cookie_header(req->session_id);
-                if (cookie) {
-                    resp_add_header(req, "set-cookie", cookie);
-                    free(cookie);
-                }
-            }
-        }
+        /* Session persistence */
+        sjs_session_persist(sjs, req, ctx);
 
         /* Commit — retry on conflict */
         if (kv_commit(sjs->kv) == KV_CONFLICT) {
@@ -1485,9 +1610,6 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         }
 
         arena_reset(sjs);
-        free(module_path); free(url_func); free(query_str);
-        free(req->session_id);
-        req->session_id = NULL;
 
         if (!body) {
             body = strdup("");
@@ -1498,9 +1620,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
     txn_fail:
         kv_rollback(sjs->kv);
         arena_reset(sjs);
-        free(module_path); free(url_func); free(query_str);
-        free(req->session_id); req->session_id = NULL;
-        req->resp_status = 500;
+        req->resp_st->code = 500;
         {
             char *body = err_msg ? err_msg : strdup("Internal Server Error");
             *out_len = (uint32_t)strlen(body);
@@ -1509,10 +1629,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
     }
 
     /* All retries exhausted */
-    free(bytecode);
-    free(module_path); free(url_func); free(query_str);
-    free(req->session_id); req->session_id = NULL;
-    req->resp_status = 409;
+    req->resp_st->code = 409;
     char *body = strdup("Transaction Conflict");
     *out_len = (uint32_t)strlen(body);
     return body;

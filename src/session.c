@@ -6,7 +6,7 @@
 
 char *sjs_session_generate_id(char *buf, sjs_request_ctx_t *req) {
     uint8_t bytes[16];
-    if (sjs_random_fill(req, bytes, 16) != 0)
+    if (sjs_random_fill(req->tape, bytes, 16) != 0)
         return NULL;
 
     static const char hex[] = "0123456789abcdef";

@@ -13,15 +13,15 @@
  * Random byte capture/replay
  * ====================================================================== */
 
-int sjs_random_fill(sjs_request_ctx_t *req, uint8_t *buf, size_t n) {
+int sjs_random_fill(sjs_random_tape_t *tape, uint8_t *buf, size_t n) {
     if (n == 0) return 0;
 
-    if (req->random_tape_replay) {
+    if (tape->replay) {
         /* Replay mode: read from pre-filled tape */
-        if (req->random_tape_pos + n > req->random_tape_len)
+        if (tape->pos + n > tape->len)
             return -1;  /* tape exhausted */
-        memcpy(buf, req->random_tape + req->random_tape_pos, n);
-        req->random_tape_pos += n;
+        memcpy(buf, tape->data + tape->pos, n);
+        tape->pos += n;
         return 0;
     }
 
@@ -30,26 +30,18 @@ int sjs_random_fill(sjs_request_ctx_t *req, uint8_t *buf, size_t n) {
         return -1;
 
     /* Append to tape */
-    size_t need = req->random_tape_len + n;
-    if (need > req->random_tape_cap) {
-        size_t new_cap = req->random_tape_cap ? req->random_tape_cap * 2 : 256;
+    size_t need = tape->len + n;
+    if (need > tape->cap) {
+        size_t new_cap = tape->cap ? tape->cap * 2 : 256;
         while (new_cap < need) new_cap *= 2;
-        uint8_t *new_buf = realloc(req->random_tape, new_cap);
+        uint8_t *new_buf = realloc(tape->data, new_cap);
         if (!new_buf) return -1;
-        req->random_tape = new_buf;
-        req->random_tape_cap = new_cap;
+        tape->data = new_buf;
+        tape->cap = new_cap;
     }
-    memcpy(req->random_tape + req->random_tape_len, buf, n);
-    req->random_tape_len += n;
+    memcpy(tape->data + tape->len, buf, n);
+    tape->len += n;
     return 0;
-}
-
-void sjs_random_tape_free(sjs_request_ctx_t *req) {
-    free(req->random_tape);
-    req->random_tape = NULL;
-    req->random_tape_len = 0;
-    req->random_tape_cap = 0;
-    req->random_tape_pos = 0;
 }
 
 /* ======================================================================
@@ -165,7 +157,7 @@ static JSValue js_crypto_getRandomValues(JSContext *ctx, JSValue this_val,
     if (!ptr)
         return JS_ThrowInternalError(ctx, "could not access ArrayBuffer");
 
-    if (sjs_random_fill(req, ptr + offset, byte_length) != 0)
+    if (sjs_random_fill(req->tape, ptr + offset, byte_length) != 0)
         return JS_ThrowInternalError(ctx, "random generation failed");
 
     return JS_DupValue(ctx, argv[0]);
@@ -181,7 +173,7 @@ static JSValue js_crypto_randomUUID(JSContext *ctx, JSValue this_val,
     if (!req) return JS_ThrowInternalError(ctx, "no request context");
 
     uint8_t bytes[16];
-    if (sjs_random_fill(req, bytes, 16) != 0)
+    if (sjs_random_fill(req->tape, bytes, 16) != 0)
         return JS_ThrowInternalError(ctx, "random generation failed");
 
     /* UUID v4: set version and variant bits */

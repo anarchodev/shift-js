@@ -317,11 +317,28 @@ void *sjs_worker_fn(void *arg) {
         return NULL;
     }
 
-    /* ---- Create user collections (all sh2 components) ---- */
+    /* ---- Register sjs components ---- */
+    sjs_component_ids_t sjs_comp;
+    if (sjs_register_components(sh, &sjs_comp) != 0) {
+        fprintf(stderr, "Worker %d: sjs_register_components failed\n", wcfg->worker_id);
+        shift_context_destroy(sh);
+        sjs_runtime_free(&sjs);
+#ifdef SH2_HAS_TLS
+        if (tls) sh2_tls_config_destroy(tls);
+#endif
+        kv_close(kv);
+        return NULL;
+    }
+
+    /* ---- Create user collections (sh2 + sjs components) ---- */
     shift_component_id_t all_comps[] = {
+        /* sh2 components */
         comp.stream_id, comp.session, comp.req_headers, comp.req_body,
         comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
         comp.domain_tag,
+        /* sjs components */
+        sjs_comp.resp_headers, sjs_comp.session, sjs_comp.random_tape,
+        sjs_comp.route, sjs_comp.bytecode, sjs_comp.resp_status,
     };
     size_t ncomps = sizeof(all_comps) / sizeof(all_comps[0]);
 
@@ -445,7 +462,21 @@ void *sjs_worker_fn(void *arg) {
                 char *method_str = header_to_str(method_val, method_len);
                 char *path_str   = header_to_str(path_val, path_len);
 
-                /* Build request context for JS dispatch */
+                /* Get sjs component pointers (initialized by constructors) */
+                sjs_resp_headers_t *resp_hdrs = NULL;
+                sjs_resp_status_t  *resp_st   = NULL;
+                sjs_session_t      *session   = NULL;
+                sjs_random_tape_t  *tape      = NULL;
+                sjs_route_info_t   *route     = NULL;
+                sjs_bytecode_t     *bc        = NULL;
+                shift_entity_get_component(sh, e, sjs_comp.resp_headers, (void **)&resp_hdrs);
+                shift_entity_get_component(sh, e, sjs_comp.resp_status,  (void **)&resp_st);
+                shift_entity_get_component(sh, e, sjs_comp.session,      (void **)&session);
+                shift_entity_get_component(sh, e, sjs_comp.random_tape,  (void **)&tape);
+                shift_entity_get_component(sh, e, sjs_comp.route,        (void **)&route);
+                shift_entity_get_component(sh, e, sjs_comp.bytecode,     (void **)&bc);
+
+                /* Build view struct for JS dispatch */
                 sjs_request_ctx_t req = {
                     .method       = method_str,
                     .path         = path_str,
@@ -454,31 +485,39 @@ void *sjs_worker_fn(void *arg) {
                     .body         = rqb->data,
                     .body_len     = rqb->len,
                     .kv_prefix    = prefix,
+                    .resp_hdrs    = resp_hdrs,
+                    .resp_st      = resp_st,
+                    .session      = session,
+                    .tape         = tape,
                 };
 
                 uint32_t body_len = 0;
-                char *body = sjs_dispatch(&sjs, &req, &body_len);
+                char *body = sjs_dispatch(&sjs, &req, route, bc, &body_len);
 
                 /* Build sh2 response */
                 sh2_status_t *st = NULL;
                 shift_entity_get_component(sh, e, comp.status, (void **)&st);
-                st->code = req.resp_status;
+                st->code = resp_st->code;
 
-                /* Response headers */
-                uint32_t nhdr = req.resp_header_count;
+                /* Transfer response headers to sh2 (string ownership moves) */
+                uint32_t nhdr = resp_hdrs->count;
                 sh2_header_field_t *resp_fields = NULL;
                 if (nhdr > 0) {
                     resp_fields = malloc(nhdr * sizeof(sh2_header_field_t));
                     for (uint32_t h = 0; h < nhdr; h++) {
                         resp_fields[h] = (sh2_header_field_t){
-                            .name      = req.resp_header_names[h],
-                            .name_len  = (uint32_t)strlen(req.resp_header_names[h]),
-                            .value     = req.resp_header_values[h],
-                            .value_len = (uint32_t)strlen(req.resp_header_values[h]),
+                            .name      = resp_hdrs->names[h],
+                            .name_len  = (uint32_t)strlen(resp_hdrs->names[h]),
+                            .value     = resp_hdrs->values[h],
+                            .value_len = (uint32_t)strlen(resp_hdrs->values[h]),
                         };
                     }
-                    /* Transfer ownership of name/value strings to sh2 */
                 }
+                /* Null out sjs component to prevent destructor double-free.
+                 * String ownership is now with resp_fields / sh2. */
+                resp_hdrs->count = 0;
+                free(resp_hdrs->names);  resp_hdrs->names  = NULL;
+                free(resp_hdrs->values); resp_hdrs->values = NULL;
 
                 sh2_resp_headers_t *rh = NULL;
                 shift_entity_get_component(sh, e, comp.resp_headers, (void **)&rh);
@@ -494,11 +533,8 @@ void *sjs_worker_fn(void *arg) {
 
                 free(method_str);
                 free(path_str);
-                /* Don't free req.resp_header_names/values arrays — strings
-                 * are now owned by resp_fields. Free the pointer arrays only. */
-                free(req.resp_header_names);
-                free(req.resp_header_values);
-                sjs_random_tape_free(&req);
+                /* No manual cleanup needed — sjs component destructors
+                 * handle route, session, tape, bytecode on entity destroy. */
             }
         }
 
