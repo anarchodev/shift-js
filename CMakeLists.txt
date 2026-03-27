@@ -23,7 +23,8 @@ FetchContent_Declare(shift_h2
 
 FetchContent_Declare(quickjs
     GIT_REPOSITORY https://github.com/quickjs-ng/quickjs.git
-    GIT_TAG        master
+    GIT_TAG        71a3c54ff3555f56cf2a56e1774e25b7a2b7ff5b
+    PATCH_COMMAND   git checkout -- . && git apply ${CMAKE_SOURCE_DIR}/patches/quickjs-stable-shape-hash.patch
 )
 
 FetchContent_Declare(sqlite3

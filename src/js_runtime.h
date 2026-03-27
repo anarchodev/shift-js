@@ -20,6 +20,9 @@ typedef struct sjs_arena {
 
 /* Frozen snapshot of a JS runtime+context with intrinsics set up.
  * Created once at worker init. Restored per-request via memcpy + relocation. */
+
+#define SJS_SNAPSHOT_MAX_VOLATILE 8  /* max non-deterministic slots to track */
+
 typedef struct {
     void     *data;         /* saved arena content */
     size_t    used;         /* bytes used in arena */
@@ -30,6 +33,11 @@ typedef struct {
      * so we can find them after restore without searching. */
     size_t    rt_offset;
     size_t    ctx_offset;
+    /* Byte offsets of non-deterministic data slots (e.g. random_state,
+     * time_origin, stack_top).  Zeroed in the snapshot, re-initialized
+     * after each restore. */
+    size_t    volatile_offsets[SJS_SNAPSHOT_MAX_VOLATILE];
+    size_t    volatile_count;
 } sjs_snapshot_t;
 
 /* Per-worker JS state — one per thread, long-lived. */

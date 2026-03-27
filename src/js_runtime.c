@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <sys/time.h>
 
 /* ======================================================================
  * Fixed-size bump allocator for per-request JS runtimes
@@ -583,15 +584,19 @@ static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
  * relocatable image. Restore per-request via memcpy + pointer fixup.
  * ====================================================================== */
 
-static int snapshot_create(sjs_runtime_t *sjs, sjs_snapshot_t *snap) {
-    /* Use the worker's arena to build the template */
-    sjs_arena_t *arena = sjs->arena;
+/* Initialize a JS runtime+context in the given arena with all intrinsics
+ * and globals installed. Arena must be zeroed and empty. Returns offsets
+ * of JSRuntime and JSContext within the arena data, or -1 on error. */
+static int snapshot_init_runtime(sjs_arena_t *arena,
+                                 size_t *out_rt_offset, size_t *out_ctx_offset) {
     arena->used = 0;
 
     JSRuntime *rt = JS_NewRuntime2(&bump_mf, arena);
     if (!rt) return -1;
 
-    JS_SetRuntimeOpaque(rt, sjs);
+    /* Do NOT call JS_SetRuntimeOpaque here — the runtime opaque is a
+     * per-worker external pointer (sjs_runtime_t*) that must not be
+     * baked into the snapshot.  It is set after each restore instead. */
 
     JSContext *ctx = JS_NewContextRaw(rt);
     if (!ctx) return -1;
@@ -611,43 +616,158 @@ static int snapshot_create(sjs_runtime_t *sjs, sjs_snapshot_t *snap) {
     js_install_session(ctx);
     js_install_crypto(ctx);
 
-    /* Save the arena content */
-    snap->used = arena->used;
-    snap->data = malloc(snap->used);
-    if (!snap->data) return -1;
-    memcpy(snap->data, arena->data, snap->used);
-    snap->old_base = arena->data;
+    /* Disable stack checking — zeroes stack_limit (stack_top becomes
+     * irrelevant).  Re-enabled after each snapshot restore. */
+    JS_SetMaxStackSize(rt, 0);
 
-    /* Record offsets of rt and ctx within the arena so we can find them
-     * after restore. They are the first two allocations. */
-    snap->rt_offset  = (char *)rt  - arena->data;
-    snap->ctx_offset = (char *)ctx - arena->data;
+    *out_rt_offset  = (char *)rt  - arena->data;
+    *out_ctx_offset = (char *)ctx - arena->data;
+    return 0;
+}
 
-    /* Build relocation bitmap: 1 bit per 8-byte-aligned slot.
-     * A bit is set if the 8-byte value at that offset is a pointer
-     * into the arena range [base, base+used). */
-    size_t num_slots = snap->used / sizeof(void *);
+static int snapshot_create(sjs_runtime_t *sjs, sjs_snapshot_t *snap) {
+    sjs_arena_t *arena_a = sjs->arena;
+
+    /* Zero before init so padding/alignment holes are deterministic. */
+    memset(arena_a->data, 0, SJS_ARENA_SIZE);
+
+    size_t rt_off, ctx_off;
+    if (snapshot_init_runtime(arena_a, &rt_off, &ctx_off) != 0)
+        return -1;
+
+    size_t used_a = arena_a->used;
+
+    /* Save arena A's content. */
+    char *data_a = malloc(used_a);
+    if (!data_a) return -1;
+    memcpy(data_a, arena_a->data, used_a);
+
+    /* Allocate a second arena at a different address and repeat. The
+     * two copies let us diff: any 8-byte slot whose value shifted by
+     * exactly (base_b - base_a) is a real pointer; everything else is
+     * data.  This eliminates the old heuristic that could mistake
+     * integers for pointers (or vice-versa) depending on heap layout. */
+    sjs_arena_t *arena_b = malloc(sizeof(sjs_arena_t) + SJS_ARENA_SIZE);
+    if (!arena_b) { free(data_a); return -1; }
+    memset(arena_b->data, 0, SJS_ARENA_SIZE);
+
+    size_t rt_off_b, ctx_off_b;
+    if (snapshot_init_runtime(arena_b, &rt_off_b, &ctx_off_b) != 0) {
+        free(arena_b);
+        free(data_a);
+        return -1;
+    }
+
+    size_t used_b = arena_b->used;
+
+    /* Sanity: deterministic init must produce identical layout. */
+    if (used_a != used_b || rt_off != rt_off_b || ctx_off != ctx_off_b) {
+        fprintf(stderr, "shift-js: snapshot_create: non-deterministic init "
+                "(used %zu vs %zu, rt_off %zu vs %zu, ctx_off %zu vs %zu)\n",
+                used_a, used_b, rt_off, rt_off_b, ctx_off, ctx_off_b);
+        free(arena_b);
+        free(data_a);
+        return -1;
+    }
+
+    /* Build relocation bitmap by diffing the two copies. */
+    size_t num_slots = used_a / sizeof(void *);
     snap->bitmap_words = (num_slots + 63) / 64;
     snap->bitmap = calloc(snap->bitmap_words, sizeof(uint64_t));
-    if (!snap->bitmap) { free(snap->data); return -1; }
+    if (!snap->bitmap) { free(arena_b); free(data_a); return -1; }
 
-    char *base = arena->data;
-    char *end  = base + arena->used;
+    ptrdiff_t base_delta = arena_b->data - arena_a->data;
     size_t reloc_count = 0;
+    size_t volatile_count = 0;
+    size_t error_count = 0;
 
     for (size_t i = 0; i < num_slots; i++) {
-        void *val;
-        memcpy(&val, base + i * sizeof(void *), sizeof(void *));
-        if ((char *)val >= base && (char *)val < end) {
+        uint64_t val_a, val_b;
+        memcpy(&val_a, data_a        + i * sizeof(void *), sizeof(uint64_t));
+        memcpy(&val_b, arena_b->data + i * sizeof(void *), sizeof(uint64_t));
+
+        if (val_a == val_b)
+            continue;  /* identical — data or external pointer, no relocation */
+
+        if ((int64_t)(val_b - val_a) == base_delta) {
+            /* Value shifted by exactly the arena base delta — real pointer. */
             snap->bitmap[i / 64] |= (uint64_t)1 << (i % 64);
             reloc_count++;
+        } else {
+            /* Non-deterministic data (e.g. random_state, time_origin).
+             * Record its byte offset so restore can re-seed it, and
+             * zero it in the snapshot. */
+            size_t byte_off = i * sizeof(void *);
+            if (volatile_count < SJS_SNAPSHOT_MAX_VOLATILE) {
+                snap->volatile_offsets[volatile_count++] = byte_off;
+                uint64_t zero = 0;
+                memcpy(data_a + byte_off, &zero, sizeof(uint64_t));
+            } else {
+                fprintf(stderr, "shift-js: snapshot_create: too many "
+                        "non-deterministic slots (slot %zu, max %d)\n",
+                        i, SJS_SNAPSHOT_MAX_VOLATILE);
+                error_count++;
+            }
         }
     }
 
-    fprintf(stderr, "shift-js: snapshot created: %zu bytes, %zu relocations\n",
-            snap->used, reloc_count);
+    snap->volatile_count = volatile_count;
+    free(arena_b);
 
-    /* Arena is reused for requests — snapshot is in snap->data */
+    if (error_count > 0) {
+        free(snap->bitmap);
+        free(data_a);
+        return -1;
+    }
+
+    /* Safety check: all known volatile fields (random_state, time_origin)
+     * live inside the JSContext struct.  The JSRuntime volatile fields
+     * (stack_top, stack_limit) are pre-zeroed via JS_SetMaxStackSize(rt,0).
+     *
+     * If a volatile slot appears outside the JSContext region, it means
+     * an upstream QuickJS change introduced new non-deterministic state
+     * that we haven't accounted for.  Abort rather than silently
+     * corrupting data at runtime.
+     *
+     * We allow up to 2 volatile slots (random_state is always present;
+     * time_origin appears when the two arena inits straddle a millisecond
+     * boundary).  More than that also indicates an upstream change. */
+    {
+        /* JSContext is bump-allocated: bump_hdr_t (8 bytes) then the struct.
+         * The struct ends before the next allocation after it. */
+        size_t ctx_start = ctx_off;
+        size_t ctx_end   = ctx_off + 1024; /* generous upper bound for JSContext */
+        if (ctx_end > used_a) ctx_end = used_a;
+
+        for (size_t i = 0; i < volatile_count; i++) {
+            size_t off = snap->volatile_offsets[i];
+            if (off < ctx_start || off >= ctx_end) {
+                fprintf(stderr, "shift-js: FATAL: volatile slot at byte "
+                        "offset %zu is outside JSContext [%zu, %zu). "
+                        "Likely a QuickJS upstream change — audit the "
+                        "snapshot system before proceeding.\n",
+                        off, ctx_start, ctx_end);
+                abort();
+            }
+        }
+        if (volatile_count > 2) {
+            fprintf(stderr, "shift-js: FATAL: %zu volatile slots detected "
+                    "(expected at most 2: random_state, time_origin). "
+                    "Likely a QuickJS upstream change.\n", volatile_count);
+            abort();
+        }
+    }
+
+    snap->data     = data_a;
+    snap->used     = used_a;
+    snap->old_base = arena_a->data;
+    snap->rt_offset  = rt_off;
+    snap->ctx_offset = ctx_off;
+
+    fprintf(stderr, "shift-js: snapshot created: %zu bytes, %zu relocations, "
+            "%zu volatile slots\n",
+            snap->used, reloc_count, volatile_count);
+
     return 0;
 }
 
@@ -687,58 +807,30 @@ static int snapshot_restore(const sjs_snapshot_t *snap, sjs_arena_t *arena,
     JSRuntime *rt  = (JSRuntime *)(arena->data + snap->rt_offset);
     JSContext *ctx  = (JSContext *)(arena->data + snap->ctx_offset);
 
-    /* Patch the malloc state opaque to point to the new arena,
-     * and the runtime opaque to point to our sjs_runtime_t */
+    /* Patch runtime opaque to point to our per-worker sjs_runtime_t.
+     *
+     * The JSMallocState.opaque (arena pointer) is correctly handled by
+     * the bitmap: the two-address diff detected it as a pointer because
+     * the sjs_arena_t header sits at a fixed offset before arena->data,
+     * so its delta matches the base delta. After relocation it points
+     * to the restore arena's header — which is exactly right. */
     JS_SetRuntimeOpaque(rt, sjs);
 
-    /* The JSMallocState.opaque is an external pointer (points to sjs_arena_t,
-     * not inside the arena data). We need to set it to the new arena.
-     * JS_SetRuntimeOpaque doesn't do this — we need to find JSMallocState.
-     * It's stored inside JSRuntime. The custom allocator's opaque was the
-     * arena pointer. After memcpy it still points to the old arena.
-     * Unfortunately there's no public API for this, but JSMallocState is
-     * at a fixed offset within JSRuntime. We can use a workaround:
-     * the bump_mf functions receive opaque as the arena pointer. After
-     * restore, any new allocation will use the wrong arena. We fix this
-     * by knowing that JSRuntime stores JSMallocState which has .opaque.
-     *
-     * Since JSRuntime is opaque to us, we use a trick: create a tiny
-     * test allocation, and if it lands in our arena, the opaque is correct.
-     * Actually, simpler: the opaque pointer was set to &arena (the
-     * sjs_arena_t*) when we called JS_NewRuntime2. But the sjs_arena_t
-     * struct lives OUTSIDE the arena data (it's the header before data[]).
-     * So it was NOT relocated by the bitmap (it's external). But after
-     * restore, we're using a different sjs_arena_t. We need to patch it.
-     *
-     * The cleanest approach: scan for the old arena pointer in the restored
-     * data and replace it. The old opaque was snap->old_base - offsetof(sjs_arena_t, data).
-     * Actually, the opaque passed to JS_NewRuntime2 was the sjs_arena_t*
-     * itself, which equals (arena_header*). Let's just find and patch it.
-     */
+    /* Re-initialize volatile fields that were zeroed in the snapshot.
+     * These are non-deterministic data (timestamps, stack addresses)
+     * that must be set to fresh per-thread/per-request values. */
+    JS_UpdateStackTop(rt);
+    JS_SetMaxStackSize(rt, JS_DEFAULT_STACK_SIZE);
 
-    /* The JSMallocState.opaque field holds the sjs_arena_t pointer.
-     * When we created the snapshot, opaque pointed to the original arena.
-     * We need it to point to the new arena. The original arena pointer was:
-     *   old_arena = container_of(snap->old_base, sjs_arena_t, data)
-     * The new arena pointer is just `arena`.
-     * We scan the JSRuntime region for this value and patch it. */
-    {
-        sjs_arena_t *old_arena = (sjs_arena_t *)(snap->old_base - offsetof(sjs_arena_t, data));
-        /* JSMallocState is near the beginning of JSRuntime.
-         * Scan first 256 bytes — the opaque field is early in the struct. */
-        char *rt_bytes = (char *)rt;
-        size_t scan_len = 256;
-        if (snap->rt_offset + scan_len > arena->used)
-            scan_len = arena->used - snap->rt_offset;
-        for (size_t i = 0; i <= scan_len - sizeof(void *); i += sizeof(void *)) {
-            void *val;
-            memcpy(&val, rt_bytes + i, sizeof(void *));
-            if (val == old_arena) {
-                void *new_val = arena;
-                memcpy(rt_bytes + i, &new_val, sizeof(void *));
-                break;
-            }
-        }
+    /* Re-seed remaining volatile slots (random_state, time_origin) with
+     * a fresh microsecond timestamp. This gives each worker a unique
+     * PRNG sequence and correct performance.now() baseline. */
+    for (size_t i = 0; i < snap->volatile_count; i++) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        uint64_t seed = (uint64_t)tv.tv_sec * 1000000 + (uint64_t)tv.tv_usec;
+        if (seed == 0) seed = 1;  /* xorshift64* requires non-zero state */
+        memcpy(arena->data + snap->volatile_offsets[i], &seed, sizeof(seed));
     }
 
     *out_rt = rt;

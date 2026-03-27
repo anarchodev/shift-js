@@ -1,0 +1,20 @@
+diff --git a/quickjs.c b/quickjs.c
+index 991f0a6..e9f8ed6 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -5197,9 +5197,12 @@ static uint32_t get_shape_hash(uint32_t h, int hash_bits)
+ static uint32_t shape_initial_hash(JSObject *proto)
+ {
+     uint32_t h;
+-    h = shape_hash(1, (uintptr_t)proto);
+-    if (sizeof(proto) > 4)
+-        h = shape_hash(h, (uint64_t)(uintptr_t)proto >> 32);
++    /* Use class_id instead of the pointer address so that the hash is
++       deterministic across address spaces.  This matters when a frozen
++       runtime snapshot is relocated to a different base address -- the
++       shape hash table must be identical regardless of where the arena
++       was originally mapped. */
++    h = shape_hash(1, proto ? proto->class_id : 0);
+     return h;
+ }
+ 
