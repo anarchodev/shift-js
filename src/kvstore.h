@@ -26,6 +26,8 @@ void kv_close(kvstore_t *store);
  * Returns 0 on success, -1 on not-found, -2 on error. */
 int kv_get(kvstore_t *store, const char *key, void **out_value, size_t *out_len);
 int kv_put(kvstore_t *store, const char *key, const void *value, size_t len);
+int kv_put_seq(kvstore_t *store, const char *key, const void *value, size_t len,
+               uint64_t seq);
 int kv_delete(kvstore_t *store, const char *key);
 
 /* Transactions.  Returns 0 on success, -2 on error, -3 on conflict (BUSY). */
@@ -54,6 +56,11 @@ uint64_t kv_next_seq(kvstore_t *store);
 
 /* Delete sequence entries up to and including through_seq (compaction). */
 int kv_seq_truncate(kvstore_t *store, uint64_t through_seq);
+
+/* Delta query: get all KV entries with seq > after_seq.
+ * Used for incremental snapshot transfer instead of sending the whole DB.
+ * Caller must free the result with kv_range_free(). */
+int kv_delta(kvstore_t *store, uint64_t after_seq, kv_range_result_t *out);
 
 /* Disable automatic WAL checkpointing on this connection.
  * Call once after kv_open for connections managed by the raft leader. */

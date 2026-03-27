@@ -371,15 +371,22 @@ int raft_net_send(raft_net_t *net, uint32_t peer_id,
 int raft_net_poll(raft_net_t *net, uint32_t timeout_ms) {
     io_uring_submit(&net->ring);
 
-    struct __kernel_timespec ts = {
-        .tv_sec  = timeout_ms / 1000,
-        .tv_nsec = (long)(timeout_ms % 1000) * 1000000L,
-    };
-
     struct io_uring_cqe *cqe;
-    int rc = io_uring_wait_cqe_timeout(&net->ring, &cqe, &ts);
-    if (rc == -ETIME) return 0;
-    if (rc < 0) return -1;
+    int rc;
+    if (timeout_ms == 0) {
+        /* Non-blocking: peek without syscall if nothing ready */
+        rc = io_uring_peek_cqe(&net->ring, &cqe);
+        if (rc == -EAGAIN) return 0;
+        if (rc < 0) return -1;
+    } else {
+        struct __kernel_timespec ts = {
+            .tv_sec  = timeout_ms / 1000,
+            .tv_nsec = (long)(timeout_ms % 1000) * 1000000L,
+        };
+        rc = io_uring_wait_cqe_timeout(&net->ring, &cqe, &ts);
+        if (rc == -ETIME) return 0;
+        if (rc < 0) return -1;
+    }
 
     /* Process all available CQEs */
     unsigned head;

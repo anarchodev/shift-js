@@ -75,11 +75,15 @@ int main(int argc, char **argv) {
     int         raft_id    = -1;  /* -1 = disabled */
     const char *raft_peers = NULL;
     uint16_t    raft_port  = 9100;
+    int         batch_ms   = 2;
+    int         batch_max  = 256;
 
     static struct option long_opts[] = {
         { "raft-id",    required_argument, NULL, 'R' },
         { "raft-peers", required_argument, NULL, 'P' },
         { "raft-port",  required_argument, NULL, 'Q' },
+        { "batch-ms",   required_argument, NULL, 'B' },
+        { "batch-max",  required_argument, NULL, 'M' },
         { NULL, 0, NULL, 0 },
     };
 
@@ -94,6 +98,8 @@ int main(int argc, char **argv) {
         case 'R': raft_id    = atoi(optarg); break;
         case 'P': raft_peers = optarg; break;
         case 'Q': raft_port  = (uint16_t)atoi(optarg); break;
+        case 'B': batch_ms   = atoi(optarg); break;
+        case 'M': batch_max  = atoi(optarg); break;
         default:  usage(argv[0]); return 1;
         }
     }
@@ -139,8 +145,8 @@ int main(int argc, char **argv) {
             .peer_ports           = peer_ports,
             .election_base_ms     = 1000,
             .heartbeat_interval_ms = 200,
-            .batch_interval_ms    = 2,
-            .batch_max_entries    = 256,
+            .batch_interval_ms    = (uint64_t)batch_ms,
+            .batch_max_entries    = (uint32_t)batch_max,
             .worker_count         = (uint32_t)nworkers,
             .raft_core            = (uint32_t)ncpus - 1, /* last core */
             .running              = &g_running,

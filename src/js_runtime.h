@@ -143,6 +143,7 @@ typedef struct sjs_request_ctx {
      * for replication after the handler completes. */
     raft_write_set_t    *write_set;
     raft_handle_t       *raft;
+    uint64_t             raft_seq;  /* kv_seq for this request, 0 = not yet assigned */
 } sjs_request_ctx_t;
 
 /* Create/destroy the per-worker runtime. */

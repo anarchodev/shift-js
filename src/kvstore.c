@@ -9,6 +9,7 @@ struct kvstore {
     sqlite3      *db;
     sqlite3_stmt *stmt_get;
     sqlite3_stmt *stmt_put;
+    sqlite3_stmt *stmt_put_seq;
     sqlite3_stmt *stmt_del;
     sqlite3_stmt *stmt_range;
     sqlite3_stmt *stmt_begin;
@@ -16,18 +17,22 @@ struct kvstore {
     sqlite3_stmt *stmt_rollback;
     sqlite3_stmt *stmt_next_seq;
     sqlite3_stmt *stmt_seq_trunc;
+    sqlite3_stmt *stmt_delta;
 };
 
 static const char SQL_CREATE[] =
     "CREATE TABLE IF NOT EXISTS kv ("
     "  key   TEXT PRIMARY KEY NOT NULL,"
-    "  value BLOB NOT NULL"
+    "  value BLOB NOT NULL,"
+    "  seq   INTEGER NOT NULL DEFAULT 0"
     ") WITHOUT ROWID;";
 
-static const char SQL_GET[]   = "SELECT value FROM kv WHERE key = ?;";
-static const char SQL_PUT[]   = "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?);";
-static const char SQL_DEL[]   = "DELETE FROM kv WHERE key = ?;";
+static const char SQL_GET[]      = "SELECT value FROM kv WHERE key = ?;";
+static const char SQL_PUT[]      = "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?);";
+static const char SQL_PUT_SEQ[]  = "INSERT OR REPLACE INTO kv (key, value, seq) VALUES (?, ?, ?);";
+static const char SQL_DEL[]      = "DELETE FROM kv WHERE key = ?;";
 static const char SQL_RANGE[]    = "SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key LIMIT ?;";
+static const char SQL_DELTA[]    = "SELECT key, value FROM kv WHERE seq > ? ORDER BY seq;";
 static const char SQL_BEGIN[]    = "BEGIN;";
 static const char SQL_COMMIT[]   = "COMMIT;";
 static const char SQL_ROLLBACK[] = "ROLLBACK;";
@@ -70,9 +75,13 @@ int kv_open(const char *path, kvstore_t **out) {
         goto fail;
     if (sqlite3_prepare_v2(s->db, SQL_ROLLBACK, -1, &s->stmt_rollback, NULL) != SQLITE_OK)
         goto fail;
+    if (sqlite3_prepare_v2(s->db, SQL_PUT_SEQ, -1, &s->stmt_put_seq, NULL) != SQLITE_OK)
+        goto fail;
     if (sqlite3_prepare_v2(s->db, SQL_NEXT_SEQ, -1, &s->stmt_next_seq, NULL) != SQLITE_OK)
         goto fail;
     if (sqlite3_prepare_v2(s->db, SQL_SEQ_TRUNC, -1, &s->stmt_seq_trunc, NULL) != SQLITE_OK)
+        goto fail;
+    if (sqlite3_prepare_v2(s->db, SQL_DELTA, -1, &s->stmt_delta, NULL) != SQLITE_OK)
         goto fail;
 
     *out = s;
@@ -93,8 +102,10 @@ void kv_close(kvstore_t *store) {
     sqlite3_finalize(store->stmt_begin);
     sqlite3_finalize(store->stmt_commit);
     sqlite3_finalize(store->stmt_rollback);
+    sqlite3_finalize(store->stmt_put_seq);
     sqlite3_finalize(store->stmt_next_seq);
     sqlite3_finalize(store->stmt_seq_trunc);
+    sqlite3_finalize(store->stmt_delta);
     sqlite3_close(store->db);
     free(store);
 }
@@ -152,6 +163,19 @@ int kv_put(kvstore_t *store, const char *key, const void *value, size_t len) {
     sqlite3_reset(st);
     sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
     sqlite3_bind_blob(st, 2, value, (int)len, SQLITE_STATIC);
+
+    int rc = sqlite3_step(st);
+    sqlite3_reset(st);
+    return (rc == SQLITE_DONE) ? 0 : -2;
+}
+
+int kv_put_seq(kvstore_t *store, const char *key, const void *value, size_t len,
+               uint64_t seq) {
+    sqlite3_stmt *st = store->stmt_put_seq;
+    sqlite3_reset(st);
+    sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
+    sqlite3_bind_blob(st, 2, value, (int)len, SQLITE_STATIC);
+    sqlite3_bind_int64(st, 3, (int64_t)seq);
 
     int rc = sqlite3_step(st);
     sqlite3_reset(st);
@@ -258,6 +282,55 @@ int kv_seq_truncate(kvstore_t *store, uint64_t through_seq) {
     int rc = sqlite3_step(st);
     sqlite3_reset(st);
     return (rc == SQLITE_DONE) ? 0 : -2;
+}
+
+int kv_delta(kvstore_t *store, uint64_t after_seq, kv_range_result_t *out) {
+    out->entries = NULL;
+    out->count = 0;
+
+    sqlite3_stmt *st = store->stmt_delta;
+    sqlite3_reset(st);
+    sqlite3_bind_int64(st, 1, (int64_t)after_seq);
+
+    size_t cap = 64;
+    kv_entry_t *entries = malloc(cap * sizeof(kv_entry_t));
+    if (!entries) { sqlite3_reset(st); return -2; }
+
+    size_t n = 0;
+    int rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        if (n == cap) {
+            cap *= 2;
+            kv_entry_t *tmp = realloc(entries, cap * sizeof(kv_entry_t));
+            if (!tmp) goto oom;
+            entries = tmp;
+        }
+
+        const char *k = (const char *)sqlite3_column_text(st, 0);
+        const void *v = sqlite3_column_blob(st, 1);
+        int vlen = sqlite3_column_bytes(st, 1);
+
+        entries[n].key = strdup(k);
+        entries[n].value = malloc((size_t)vlen);
+        if (!entries[n].key || !entries[n].value) goto oom;
+        memcpy(entries[n].value, v, (size_t)vlen);
+        entries[n].value_len = (size_t)vlen;
+        n++;
+    }
+
+    sqlite3_reset(st);
+    out->entries = entries;
+    out->count = n;
+    return 0;
+
+oom:
+    for (size_t i = 0; i < n; i++) {
+        free(entries[i].key);
+        free(entries[i].value);
+    }
+    free(entries);
+    sqlite3_reset(st);
+    return -2;
 }
 
 void kv_disable_auto_checkpoint(kvstore_t *store) {

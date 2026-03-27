@@ -201,7 +201,7 @@ static int apply_batch(kvstore_t *kv, const void *data, uint32_t data_len,
             memcpy(&nvl, p, 4); p += 4;
             uint32_t vlen = ntohl(nvl);
             if (op_type == RAFT_KV_PUT) {
-                kv_put(kv, key, p, vlen);
+                kv_put_seq(kv, key, p, vlen, seq);
                 p += vlen;
             } else if (op_type == RAFT_KV_DELETE) {
                 kv_delete(kv, key);
@@ -279,7 +279,70 @@ static int cb_send_appendentries(raft_server_t *raft, void *udata,
 
 static int cb_send_snapshot(raft_server_t *raft, void *udata,
                             raft_node_t *node) {
-    /* Not implemented yet — return 0 to avoid errors */
+    thread_ctx_t *ctx = udata;
+    raft_node_id_t peer_id = raft_node_get_id(node);
+
+    /* Read the KV database file into memory.
+     * The checkpointed DB is the snapshot — it contains all committed
+     * state up to the snapshot index. */
+    const char *db_path = ctx->handle->config.db_path;
+    FILE *f = fopen(db_path, "rb");
+    if (!f) {
+        fprintf(stderr, "raft: snapshot send failed: can't open %s\n", db_path);
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (fsize <= 0 || fsize > 256 * 1024 * 1024) {
+        fprintf(stderr, "raft: snapshot send failed: db size %ld\n", fsize);
+        fclose(f);
+        return -1;
+    }
+
+    /* Frame: [4 len][1 type=SNAPSHOT][8 last_term][8 last_idx][db bytes] */
+    raft_index_t snap_idx = raft_get_snapshot_last_idx(raft);
+    raft_term_t  snap_term = raft_get_snapshot_last_term(raft);
+
+    uint32_t payload_size = 1 + 8 + 8 + (uint32_t)fsize;
+    uint32_t total = 4 + payload_size;
+    uint8_t *buf = malloc(total);
+    if (!buf) { fclose(f); return -1; }
+
+    /* Length header */
+    uint32_t nlen = htonl(payload_size);
+    memcpy(buf, &nlen, 4);
+
+    /* Type */
+    buf[4] = RAFT_MSG_SNAPSHOT;
+
+    /* Snapshot metadata */
+    uint8_t *p = buf + 5;
+    uint32_t hi, lo;
+    hi = htonl((uint32_t)((uint64_t)snap_term >> 32));
+    lo = htonl((uint32_t)((uint64_t)snap_term & 0xFFFFFFFF));
+    memcpy(p, &hi, 4); p += 4;
+    memcpy(p, &lo, 4); p += 4;
+    hi = htonl((uint32_t)((uint64_t)snap_idx >> 32));
+    lo = htonl((uint32_t)((uint64_t)snap_idx & 0xFFFFFFFF));
+    memcpy(p, &hi, 4); p += 4;
+    memcpy(p, &lo, 4); p += 4;
+
+    /* DB contents */
+    if (fread(p, 1, (size_t)fsize, f) != (size_t)fsize) {
+        fprintf(stderr, "raft: snapshot send failed: read error\n");
+        fclose(f);
+        free(buf);
+        return -1;
+    }
+    fclose(f);
+
+    raft_net_send(ctx->net, (uint32_t)peer_id, buf, total);
+    free(buf);
+
+    fprintf(stderr, "raft: sent snapshot to node %d (idx=%ld, %ld bytes)\n",
+            (int)peer_id, (long)snap_idx, fsize);
     return 0;
 }
 
@@ -294,11 +357,8 @@ static int cb_applylog(raft_server_t *raft, void *udata,
 
     if (raft_is_leader(raft)) {
         /* Leader: workers already applied writes to local SQLite.
-         * Parse max_seq to advance the committed watermark, then
-         * checkpoint the WAL to make committed writes durable.
-         * Uncommitted writes remain in the WAL only. */
+         * Just parse max_seq to advance the committed watermark. */
         if (entry->data.len >= 4) {
-            /* Walk the batch to find max_seq without applying */
             const uint8_t *p = entry->data.buf;
             uint32_t nc;
             memcpy(&nc, p, 4); p += 4;
@@ -309,16 +369,15 @@ static int cb_applylog(raft_server_t *raft, void *udata,
                 memcpy(&slo, p, 4); p += 4;
                 uint64_t seq = ((uint64_t)ntohl(shi) << 32) | (uint64_t)ntohl(slo);
                 if (seq > max_seq) max_seq = seq;
-                /* Skip ops */
                 uint32_t noc;
                 memcpy(&noc, p, 4); p += 4;
                 uint32_t op_count = ntohl(noc);
                 for (uint32_t j = 0; j < op_count; j++) {
-                    p++; /* op type */
+                    p++;
                     uint32_t nkl; memcpy(&nkl, p, 4); p += 4;
-                    p += ntohl(nkl); /* key */
+                    p += ntohl(nkl);
                     uint32_t nvl; memcpy(&nvl, p, 4); p += 4;
-                    p += ntohl(nvl); /* value */
+                    p += ntohl(nvl);
                 }
             }
         }
@@ -332,11 +391,6 @@ static int cb_applylog(raft_server_t *raft, void *udata,
     if (max_seq > 0) {
         atomic_store_explicit(&ctx->handle->committed_seq, max_seq,
                               memory_order_release);
-        /* Checkpoint WAL on leader: moves committed pages from WAL to
-         * main DB. Uncommitted writes stay in the WAL only, acting as
-         * a natural undo log — on leader loss, WAL truncation discards them. */
-        if (raft_is_leader(raft))
-            kv_checkpoint(ctx->kv);
     }
 
     return 0;
@@ -381,7 +435,10 @@ static int cb_log_poll(raft_server_t *raft, void *udata,
     thread_ctx_t *ctx = udata;
     /* Remove oldest entry (compaction) */
     raft_log_truncate_before(ctx->log, (uint64_t)entry_idx);
-    free(entry->data.buf);
+    if (entry->data.buf) {
+        free(entry->data.buf);
+        entry->data.buf = NULL;
+    }
     return 0;
 }
 
@@ -390,7 +447,10 @@ static int cb_log_pop(raft_server_t *raft, void *udata,
     thread_ctx_t *ctx = udata;
     /* Remove newest entry (truncation on conflict) */
     raft_log_truncate_after(ctx->log, (uint64_t)entry_idx - 1);
-    free(entry->data.buf);
+    if (entry->data.buf) {
+        free(entry->data.buf);
+        entry->data.buf = NULL;
+    }
     return 0;
 }
 
@@ -449,6 +509,58 @@ static void on_peer_message(uint32_t from_id, const void *data,
     case RAFT_MSG_APPEND_RESP:
         raft_recv_appendentries_response(r, node, &msg.append_resp);
         break;
+    case RAFT_MSG_SNAPSHOT: {
+        /* Snapshot received from leader: replace KV DB and load into raft. */
+        if (len < 1 + 8 + 8) break;
+        const uint8_t *sp = (const uint8_t *)data + 1; /* skip type byte */
+        uint32_t shi, slo;
+        memcpy(&shi, sp, 4); sp += 4;
+        memcpy(&slo, sp, 4); sp += 4;
+        raft_term_t snap_term = (raft_term_t)(((uint64_t)ntohl(shi) << 32) |
+                                               (uint64_t)ntohl(slo));
+        memcpy(&shi, sp, 4); sp += 4;
+        memcpy(&slo, sp, 4); sp += 4;
+        raft_index_t snap_idx = (raft_index_t)(((uint64_t)ntohl(shi) << 32) |
+                                                (uint64_t)ntohl(slo));
+        uint32_t db_size = len - 1 - 16;
+        const void *db_data = sp;
+
+        fprintf(stderr, "raft: received snapshot from node %u "
+                "(term=%ld, idx=%ld, %u bytes)\n",
+                from_id, (long)snap_term, (long)snap_idx, db_size);
+
+        /* Close existing KV connection, write new DB, reopen */
+        if (ctx->kv) { kv_close(ctx->kv); ctx->kv = NULL; }
+
+        FILE *f = fopen(ctx->handle->config.db_path, "wb");
+        if (f) {
+            fwrite(db_data, 1, db_size, f);
+            fclose(f);
+        }
+
+        if (kv_open(ctx->handle->config.db_path, &ctx->kv) != 0) {
+            fprintf(stderr, "raft: failed to reopen kv after snapshot\n");
+            break;
+        }
+        kv_disable_auto_checkpoint(ctx->kv);
+
+        /* Tell the raft library about the loaded snapshot */
+        if (raft_begin_load_snapshot(r, snap_term, snap_idx) == 0) {
+            /* Re-add all nodes (required by the library) */
+            for (uint32_t i = 0; i < ctx->handle->config.node_count; i++) {
+                raft_node_t *n = raft_get_node(r, (raft_node_id_t)i);
+                if (n) {
+                    raft_node_set_active(n, 1);
+                    raft_node_set_voting_committed(n, 1);
+                    raft_node_set_addition_committed(n, 1);
+                }
+            }
+            raft_end_load_snapshot(r);
+        }
+
+        fprintf(stderr, "raft: snapshot loaded (idx=%ld)\n", (long)snap_idx);
+        break;
+    }
     default:
         break;
     }
@@ -612,6 +724,7 @@ static void *raft_thread_fn(void *arg) {
     uint64_t last_batch_time = now_ms();
 
     uint64_t last_tick = now_ms();
+    uint64_t last_checkpoint = now_ms();
 
     /* ---- Main event loop ---- */
     while (*cfg->running) {
@@ -646,9 +759,12 @@ static void *raft_thread_fn(void *arg) {
             drain_count = 0;
         }
 
-        /* 2. Poll network. Non-blocking when there's pending work. */
-        uint32_t poll_ms = (drain_count > 0) ? 0 : 1;
-        raft_net_poll(net, poll_ms);
+        /* 2. Poll network. */
+        raft_net_poll(net, 1);
+
+        /* 2b. Tick again after poll to immediately apply entries
+         * committed by acks received during the poll. */
+        raft_periodic(r, 0);
 
         /* 3. Drain proposal queue (only if leader) */
         if (atomic_load(&handle->is_leader)) {
@@ -672,12 +788,14 @@ static void *raft_thread_fn(void *arg) {
             }
 
             /* 5. Partition drain_buf: entries with seq <= safe_seq go
-             * into the batch; the rest stay in drain_buf for later. */
+             * into the batch, capped at batch_max_entries. */
             t = now_ms();
             uint32_t batch_count = 0;
             for (uint32_t i = 0; i < drain_count; i++) {
-                if (drain_buf[i].seq <= safe_seq)
+                if (drain_buf[i].seq <= safe_seq) {
                     batch_count++;
+                    if (batch_count >= cfg->batch_max_entries) break;
+                }
             }
 
             bool should_propose = batch_count > 0 &&
@@ -685,12 +803,13 @@ static void *raft_thread_fn(void *arg) {
                  batch_count >= cfg->batch_max_entries);
 
             if (should_propose) {
-                /* Separate safe entries from not-yet-safe ones */
+                /* Separate safe entries from not-yet-safe ones,
+                 * capped at batch_count. */
                 raft_write_set_t *batch = calloc(batch_count, sizeof(raft_write_set_t));
                 uint32_t bi = 0;
                 uint32_t ri = 0; /* remaining */
                 for (uint32_t i = 0; i < drain_count; i++) {
-                    if (drain_buf[i].seq <= safe_seq)
+                    if (drain_buf[i].seq <= safe_seq && bi < batch_count)
                         batch[bi++] = drain_buf[i];
                     else
                         drain_buf[ri++] = drain_buf[i];
@@ -731,6 +850,28 @@ static void *raft_thread_fn(void *arg) {
                     raft_write_set_free(&batch[i]);
                 free(batch);
                 last_batch_time = t;
+            }
+        }
+
+        /* Periodic raft snapshot (all nodes).
+         * Snapshot = WAL checkpoint + raft log compaction.
+         * The checkpointed KV DB IS the snapshot — it reflects all
+         * committed entries up to the commit index.  After checkpoint,
+         * raft log entries up to commit index can be deleted.
+         * Each node snapshots independently to bound its own log. */
+        if (t - last_checkpoint >= 500 &&
+            !raft_snapshot_is_in_progress(r)) {
+            raft_index_t commit_idx = raft_get_commit_idx(r);
+            if (commit_idx > raft_get_snapshot_last_idx(r)) {
+                if (raft_begin_snapshot(r, RAFT_SNAPSHOT_NONBLOCKING_APPLY) == 0) {
+                    /* Compact kv_seq rows up to committed seq */
+                    uint64_t cs = atomic_load(&handle->committed_seq);
+                    if (cs > 0)
+                        kv_seq_truncate(ctx.kv, cs);
+                    kv_checkpoint(ctx.kv);
+                    raft_end_snapshot(r);
+                    last_checkpoint = t;
+                }
             }
         }
     }

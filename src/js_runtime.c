@@ -182,10 +182,19 @@ static JSValue js_kv_put(JSContext *ctx, JSValue this_val,
     const char *val = JS_ToCStringLen(ctx, &vlen, argv[1]);
     if (!val) { JS_FreeCString(ctx, key); return JS_EXCEPTION; }
 
-    int rc = kv_put(kv, actual_key, val, vlen);
+    /* When raft is active, stamp each KV row with the transaction's seq.
+     * Allocate the seq lazily on first write in the transaction. */
+    sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
+    int rc;
+    if (req && req->write_set) {
+        if (req->raft_seq == 0)
+            req->raft_seq = kv_next_seq(kv);
+        rc = kv_put_seq(kv, actual_key, val, vlen, req->raft_seq);
+    } else {
+        rc = kv_put(kv, actual_key, val, vlen);
+    }
 
     /* Track the write for Raft replication */
-    sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
     if (rc == 0 && req && req->write_set)
         raft_write_set_add_put(req->write_set, actual_key, val, (uint32_t)vlen);
 
@@ -1443,6 +1452,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             if (req->write_set) {
                 raft_write_set_free(req->write_set);
                 raft_write_set_init(req->write_set);
+                req->raft_seq = 0;
             }
 
             free(bc->data);
@@ -1627,19 +1637,11 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         /* Session persistence */
         sjs_session_persist(sjs, req, ctx);
 
-        /* Allocate a WAL-ordered sequence number for raft replication.
-         * Must happen inside the transaction so the seq is ordered
-         * consistently with the KV writes. */
-        if (req->write_set && req->write_set->op_count > 0) {
-            uint64_t seq = kv_next_seq(sjs->kv);
-            if (seq == 0) {
-                kv_rollback(sjs->kv);
-                free(body);
-                arena_reset(sjs);
-                continue;
-            }
-            req->write_set->seq = seq;
-        }
+        /* Transfer the seq assigned during kv_put_seq to the write-set.
+         * The seq was allocated inside this transaction via kv_next_seq
+         * on the first kv.put call, so it's WAL-ordered. */
+        if (req->write_set && req->write_set->op_count > 0)
+            req->write_set->seq = req->raft_seq;
 
         /* Commit — retry on conflict */
         if (kv_commit(sjs->kv) == KV_CONFLICT) {

@@ -12,6 +12,7 @@ typedef enum {
     RAFT_MSG_APPEND_REQ  = 3,
     RAFT_MSG_APPEND_RESP = 4,
     RAFT_MSG_IDENT       = 5,
+    RAFT_MSG_SNAPSHOT    = 6,  /* leader sends KV DB snapshot to lagging follower */
 } raft_msg_type_t;
 
 /* ---- Encode (returns malloc'd framed buffer, caller frees) ---- */
