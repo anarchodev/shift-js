@@ -264,6 +264,12 @@ void *sjs_worker_fn(void *arg) {
         return NULL;
     }
 
+    /* When raft is active, the raft thread controls WAL checkpointing.
+     * Disable auto-checkpoint on worker connections so uncommitted writes
+     * stay in the WAL until raft commits and checkpoints explicitly. */
+    if (wcfg->raft)
+        kv_disable_auto_checkpoint(kv);
+
     /* ---- TLS setup (per-worker) ---- */
     sh2_tls_config_t *tls = NULL;
 #ifdef SH2_HAS_TLS

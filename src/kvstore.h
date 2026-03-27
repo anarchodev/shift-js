@@ -54,3 +54,11 @@ uint64_t kv_next_seq(kvstore_t *store);
 
 /* Delete sequence entries up to and including through_seq (compaction). */
 int kv_seq_truncate(kvstore_t *store, uint64_t through_seq);
+
+/* Disable automatic WAL checkpointing on this connection.
+ * Call once after kv_open for connections managed by the raft leader. */
+void kv_disable_auto_checkpoint(kvstore_t *store);
+
+/* Manually checkpoint the WAL (passive — doesn't block readers).
+ * Called by the raft thread after a batch is committed. */
+int kv_checkpoint(kvstore_t *store);

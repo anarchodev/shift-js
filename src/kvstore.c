@@ -259,3 +259,14 @@ int kv_seq_truncate(kvstore_t *store, uint64_t through_seq) {
     sqlite3_reset(st);
     return (rc == SQLITE_DONE) ? 0 : -2;
 }
+
+void kv_disable_auto_checkpoint(kvstore_t *store) {
+    sqlite3_wal_autocheckpoint(store->db, 0);
+}
+
+int kv_checkpoint(kvstore_t *store) {
+    int rc = sqlite3_wal_checkpoint_v2(store->db, NULL,
+                                        SQLITE_CHECKPOINT_PASSIVE,
+                                        NULL, NULL);
+    return (rc == SQLITE_OK) ? 0 : -1;
+}

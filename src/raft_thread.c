@@ -294,7 +294,9 @@ static int cb_applylog(raft_server_t *raft, void *udata,
 
     if (raft_is_leader(raft)) {
         /* Leader: workers already applied writes to local SQLite.
-         * Just parse max_seq to advance the committed watermark. */
+         * Parse max_seq to advance the committed watermark, then
+         * checkpoint the WAL to make committed writes durable.
+         * Uncommitted writes remain in the WAL only. */
         if (entry->data.len >= 4) {
             /* Walk the batch to find max_seq without applying */
             const uint8_t *p = entry->data.buf;
@@ -321,14 +323,7 @@ static int cb_applylog(raft_server_t *raft, void *udata,
             }
         }
     } else {
-        /* Follower: apply KV writes from the committed entry.
-         * Open KV connection lazily on first apply. */
-        if (!ctx->kv) {
-            if (kv_open(ctx->handle->config.db_path, &ctx->kv) != 0) {
-                fprintf(stderr, "raft: failed to open kv for follower apply\n");
-                return -1;
-            }
-        }
+        /* Follower: apply KV writes from the committed entry. */
         kv_begin(ctx->kv);
         apply_batch(ctx->kv, entry->data.buf, entry->data.len, &max_seq);
         kv_commit(ctx->kv);
@@ -337,6 +332,11 @@ static int cb_applylog(raft_server_t *raft, void *udata,
     if (max_seq > 0) {
         atomic_store_explicit(&ctx->handle->committed_seq, max_seq,
                               memory_order_release);
+        /* Checkpoint WAL on leader: moves committed pages from WAL to
+         * main DB. Uncommitted writes stay in the WAL only, acting as
+         * a natural undo log — on leader loss, WAL truncation discards them. */
+        if (raft_is_leader(raft))
+            kv_checkpoint(ctx->kv);
     }
 
     return 0;
@@ -505,9 +505,14 @@ static void *raft_thread_fn(void *arg) {
         fprintf(stderr, "raft: failed to open log at %s\n", raft_db_path);
         return NULL;
     }
-    /* KV connection is only needed on followers for applying committed entries.
-     * We open it lazily when this node first applies as a follower to avoid
-     * an extra SQLite connection that could cause WAL contention on the leader. */
+    /* KV connection: used by followers to apply committed entries,
+     * and by the leader to checkpoint the WAL after raft commit. */
+    if (kv_open(cfg->db_path, &kv) != 0) {
+        fprintf(stderr, "raft: failed to open kv store\n");
+        raft_log_close(log);
+        return NULL;
+    }
+    kv_disable_auto_checkpoint(kv);
 
     /* Create thread context */
     thread_ctx_t ctx = {
