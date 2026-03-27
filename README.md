@@ -127,6 +127,13 @@ Available in all modules:
   -p <port>     Listen port (default: 9000)
   -w <workers>  Worker threads (default: CPU count, max: CPU count)
   -t            Enable TLS
+
+Raft clustering (enables when --raft-id is set):
+  --raft-id <N>          This node's index (0-based)
+  --raft-peers <addrs>   Comma-separated host:port for all nodes
+  --raft-port <port>     Port for Raft peer TCP (default: 9100)
+  --batch-ms <ms>        Proposal batch interval (default: 2)
+  --batch-max <N>        Max proposals per batch (default: 256)
 ```
 
 ## sjsctl
@@ -175,12 +182,31 @@ Tenants are isolated by KV prefix scoping. All KV operations for a tenant are tr
 ./build/sjsctl -d app.db domain-map example.com 42
 ```
 
+## Clustering
+
+shift-js supports multi-node clustering via Raft consensus. When enabled, KV writes are replicated across all nodes.
+
+```bash
+# Start a 3-node cluster
+./build/shift-js -d node0.db -p 9000 --raft-id 0 \
+  --raft-peers "127.0.0.1:9100,127.0.0.1:9101,127.0.0.1:9102" --raft-port 9100
+
+./build/shift-js -d node1.db -p 9001 --raft-id 1 \
+  --raft-peers "127.0.0.1:9100,127.0.0.1:9101,127.0.0.1:9102" --raft-port 9101
+
+./build/shift-js -d node2.db -p 9002 --raft-id 2 \
+  --raft-peers "127.0.0.1:9100,127.0.0.1:9101,127.0.0.1:9102" --raft-port 9102
+```
+
+Workers propose KV write-sets to the Raft leader, which replicates them to followers before committing. New followers catch up via incremental KV snapshots. The Raft thread runs on the last CPU core; worker count is reduced by one when clustering is enabled.
+
 ## Architecture
 
 - **One worker thread per CPU core**, each with its own SQLite connection, QuickJS runtime, and io_uring instance. No shared mutable state.
 - **Snapshot-based runtime isolation**: a frozen JS runtime template is memcpy'd + pointer-relocated per request instead of creating a new runtime. Per-request JS runs on a 10MB bump-allocated arena that is reclaimed wholesale after the request (no GC).
 - **Bytecode caching**: modules are compiled once and cached in the KV store. Subsequent requests load pre-compiled bytecode.
 - **Transactional KV**: each request runs inside a SQLite transaction with automatic retry on conflicts.
+- **Raft replication**: optional clustering where KV mutations are proposed to a leader, batched, replicated via log entries, and committed. Followers receive incremental snapshots for catch-up.
 
 ## Dependencies
 
@@ -191,6 +217,8 @@ All fetched automatically via CMake `FetchContent`:
 - [quickjs-ng](https://github.com/nicbarker/quickjs-ng) -- JavaScript engine
 - [SQLite](https://sqlite.org/) -- database (WAL mode)
 - [dmon](https://github.com/nicbarker/dmon) -- filesystem watcher (sjsctl watch)
+- [raft](https://github.com/willemt/raft) -- Raft consensus
+- [OpenSSL](https://www.openssl.org/) -- crypto primitives (WebCrypto API)
 
 ## MCP server
 
