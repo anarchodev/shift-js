@@ -513,28 +513,13 @@ void *sjs_worker_fn(void *arg) {
                 shift_entity_get_component(sh, e, sjs_comp.route,        (void **)&route);
                 shift_entity_get_component(sh, e, sjs_comp.bytecode,     (void **)&bc);
 
-                /* Back-pressure: reject if raft pipeline is too deep */
+                /* Back-pressure: block until raft pipeline has capacity.
+                 * This slows the client down rather than rejecting,
+                 * matching baseline SQLite busy_timeout behavior. */
                 bool raft_active = (wcfg->raft != NULL);
-                if (raft_active && !raft_has_capacity(wcfg->raft)) {
-                    sh2_status_t *st = NULL;
-                    shift_entity_get_component(sh, e, comp.status, (void **)&st);
-                    st->code = 503;
-
-                    sh2_resp_body_t *rb = NULL;
-                    shift_entity_get_component(sh, e, comp.resp_body, (void **)&rb);
-                    rb->data = strdup("Service Unavailable");
-                    rb->len  = 19;
-
-                    sh2_resp_headers_t *rh = NULL;
-                    shift_entity_get_component(sh, e, comp.resp_headers, (void **)&rh);
-                    rh->fields = NULL;
-                    rh->count  = 0;
-
-                    shift_entity_move_one(sh, e, response_in);
-
-                    free(method_str);
-                    free(path_str);
-                    continue;
+                if (raft_active) {
+                    while (!raft_has_capacity(wcfg->raft) && *wcfg->running)
+                        sched_yield();
                 }
 
                 /* Signal raft we're about to process a request */
