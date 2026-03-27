@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kvstore.h"
+#include "log_db.h"
 #include "preprocessor.h"
 #include "raft_thread.h"
 #include <shift.h>
@@ -152,6 +153,11 @@ typedef struct sjs_request_ctx {
     raft_write_set_t    *write_set;
     raft_handle_t       *raft;
     uint64_t             raft_seq;  /* kv_seq for this request, 0 = not yet assigned */
+
+    /* Logging */
+    log_db_t            *log_db;       /* per-worker log DB handle */
+    log_batch_t         *log_batch;    /* per-request pending entries */
+    uint64_t             request_id;   /* monotonic per-worker counter */
 } sjs_request_ctx_t;
 
 /* Create/destroy the per-worker runtime. */

@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <time.h>
 
 #define MAX_CONNECTIONS 4096
 #define MAX_STREAMS     (MAX_CONNECTIONS * 128)
@@ -250,6 +251,12 @@ static sh2_tls_config_t *setup_tls(kvstore_t *kv, domain_cache_t *dc,
 
 #endif /* SH2_HAS_TLS */
 
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
 void *sjs_worker_fn(void *arg) {
     sjs_worker_config_t *wcfg = arg;
 
@@ -293,6 +300,14 @@ void *sjs_worker_fn(void *arg) {
         kv_close(kv);
         return NULL;
     }
+
+    /* ---- Log DB (per-worker, separate from KV) ---- */
+    log_db_t log_db = {0};
+    if (log_db_open(&log_db, "logs.db") != 0)
+        fprintf(stderr, "Worker %d: log_db_open failed (logging disabled)\n",
+                wcfg->worker_id);
+    uint64_t request_counter = 0;
+    uint64_t last_log_checkpoint = now_ms();
 
     /* ---- Shift context ---- */
     shift_t *sh = NULL;
@@ -531,6 +546,10 @@ void *sjs_worker_fn(void *arg) {
                 if (raft_active)
                     raft_write_set_init(&ws);
 
+                log_batch_t log_batch = {0};
+                uint64_t rid = ((uint64_t)wcfg->worker_id << 48) |
+                               (request_counter++);
+
                 sjs_request_ctx_t req = {
                     .method       = method_str,
                     .path         = path_str,
@@ -545,6 +564,9 @@ void *sjs_worker_fn(void *arg) {
                     .tape         = tape,
                     .write_set    = raft_active ? &ws : NULL,
                     .raft         = wcfg->raft,
+                    .log_db       = log_db.db ? &log_db : NULL,
+                    .log_batch    = &log_batch,
+                    .request_id   = rid,
                 };
 
                 uint32_t body_len = 0;
@@ -688,6 +710,15 @@ void *sjs_worker_fn(void *arg) {
         }
 
         shift_flush(sh);
+
+        /* ---- Periodic log DB WAL checkpoint ---- */
+        {
+            uint64_t t = now_ms();
+            if (t - last_log_checkpoint >= 500 && log_db.db) {
+                log_db_checkpoint(&log_db);
+                last_log_checkpoint = t;
+            }
+        }
     }
 
     /* ---- Shutdown ---- */
@@ -709,6 +740,7 @@ void *sjs_worker_fn(void *arg) {
 
     shift_context_destroy(sh);
     sjs_runtime_free(&sjs);
+    log_db_close(&log_db);
 #ifdef SH2_HAS_TLS
     if (tls) sh2_tls_config_destroy(tls);
 #endif

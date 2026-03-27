@@ -106,6 +106,7 @@ add_executable(shift-js
     src/raft_rpc.c
     src/raft_net.c
     src/raft_thread.c
+    src/log_db.c
 )
 target_include_directories(shift-js PRIVATE src)
 target_link_libraries(shift-js PRIVATE

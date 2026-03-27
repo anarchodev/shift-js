@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <sys/time.h>
+#include <time.h>
+#include <inttypes.h>
 
 /* ======================================================================
  * Fixed-size bump allocator for per-request JS runtimes
@@ -344,6 +346,11 @@ static JSValue js_request_get(JSContext *ctx, JSValue this_val,
         }
         return obj;
     }
+    case 4: {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%" PRIu64, req->request_id);
+        return JS_NewString(ctx, buf);
+    }
     }
     return JS_UNDEFINED;
 }
@@ -353,6 +360,7 @@ static const JSCFunctionListEntry js_request_props[] = {
     JS_CGETSET_MAGIC_DEF("path",    js_request_get, NULL, 1),
     JS_CGETSET_MAGIC_DEF("body",    js_request_get, NULL, 2),
     JS_CGETSET_MAGIC_DEF("headers", js_request_get, NULL, 3),
+    JS_CGETSET_MAGIC_DEF("id",      js_request_get, NULL, 4),
 };
 
 static void js_install_request(JSContext *ctx) {
@@ -512,6 +520,249 @@ static void js_install_session(JSContext *ctx) {
 }
 
 /* ======================================================================
+ * console global (write-only logging to per-worker log DB)
+ * ====================================================================== */
+
+static JSValue js_console_log_impl(JSContext *ctx, JSValue this_val,
+                                    int argc, JSValue *argv, log_level_t level) {
+    sjs_request_ctx_t *req = js_get_req_ctx(ctx);
+    if (!req || !req->log_batch)
+        return JS_UNDEFINED;
+
+    log_batch_t *batch = req->log_batch;
+    if (batch->count >= LOG_BATCH_MAX)
+        return JS_UNDEFINED;  /* silently drop */
+
+    /* Stringify all arguments, space-separated, into stack buffer */
+    char tmp[4096];
+    size_t pos = 0;
+
+    for (int i = 0; i < argc && pos < sizeof(tmp) - 1; i++) {
+        if (i > 0 && pos < sizeof(tmp) - 1)
+            tmp[pos++] = ' ';
+
+        const char *str = JS_ToCString(ctx, argv[i]);
+        if (!str) str = "(null)";
+        size_t slen = strlen(str);
+        size_t avail = sizeof(tmp) - 1 - pos;
+        if (slen > avail) slen = avail;
+        memcpy(tmp + pos, str, slen);
+        pos += slen;
+        JS_FreeCString(ctx, str);
+    }
+    tmp[pos] = '\0';
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    log_pending_t *e = &batch->entries[batch->count++];
+    e->level = level;
+    e->timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    /* strdup so lifetime is independent of the stack buffer and arena */
+    e->msg = strndup(tmp, pos);
+    e->msg_len = (uint32_t)pos;
+
+    return JS_UNDEFINED;
+}
+
+static JSValue js_console_log(JSContext *ctx, JSValue this_val,
+                               int argc, JSValue *argv) {
+    return js_console_log_impl(ctx, this_val, argc, argv, LOG_LEVEL_LOG);
+}
+
+static JSValue js_console_warn(JSContext *ctx, JSValue this_val,
+                                int argc, JSValue *argv) {
+    return js_console_log_impl(ctx, this_val, argc, argv, LOG_LEVEL_WARN);
+}
+
+static JSValue js_console_error(JSContext *ctx, JSValue this_val,
+                                 int argc, JSValue *argv) {
+    return js_console_log_impl(ctx, this_val, argc, argv, LOG_LEVEL_ERROR);
+}
+
+static void js_install_console(JSContext *ctx) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue console = JS_NewObject(ctx);
+
+    JS_SetPropertyStr(ctx, console, "log",
+                      JS_NewCFunction(ctx, js_console_log, "log", 1));
+    JS_SetPropertyStr(ctx, console, "warn",
+                      JS_NewCFunction(ctx, js_console_warn, "warn", 1));
+    JS_SetPropertyStr(ctx, console, "error",
+                      JS_NewCFunction(ctx, js_console_error, "error", 1));
+
+    JS_SetPropertyStr(ctx, global, "console", console);
+    JS_FreeValue(ctx, global);
+}
+
+/* ======================================================================
+ * logs global (read-only query against per-worker log DB)
+ * ====================================================================== */
+
+static const char *level_name(int level) {
+    switch (level) {
+    case LOG_LEVEL_LOG:   return "log";
+    case LOG_LEVEL_WARN:  return "warn";
+    case LOG_LEVEL_ERROR: return "error";
+    default:              return "unknown";
+    }
+}
+
+static int level_from_string(const char *s) {
+    if (!s) return -1;
+    if (strcmp(s, "log") == 0)   return LOG_LEVEL_LOG;
+    if (strcmp(s, "warn") == 0)  return LOG_LEVEL_WARN;
+    if (strcmp(s, "error") == 0) return LOG_LEVEL_ERROR;
+    return -1;
+}
+
+static JSValue js_logs_query(JSContext *ctx, JSValue this_val,
+                              int argc, JSValue *argv) {
+    sjs_request_ctx_t *req = js_get_req_ctx(ctx);
+    if (!req || !req->log_db || !req->log_db->db)
+        return JS_NewArray(ctx);
+
+    /* Parse options: {level, limit, request_id, session_id, before, after} */
+    int filter_level = -1;
+    int64_t limit = 100;
+    int64_t filter_request_id = -1;
+    const char *filter_session_id = NULL;
+    int64_t filter_before = 0;
+    int64_t filter_after = 0;
+
+    if (argc > 0 && JS_IsObject(argv[0])) {
+        JSValue opts = argv[0];
+        JSValue v;
+
+        v = JS_GetPropertyStr(ctx, opts, "level");
+        if (JS_IsString(v)) {
+            const char *s = JS_ToCString(ctx, v);
+            filter_level = level_from_string(s);
+            JS_FreeCString(ctx, s);
+        }
+        JS_FreeValue(ctx, v);
+
+        v = JS_GetPropertyStr(ctx, opts, "limit");
+        if (JS_IsNumber(v))
+            JS_ToInt64(ctx, &limit, v);
+        JS_FreeValue(ctx, v);
+
+        v = JS_GetPropertyStr(ctx, opts, "request_id");
+        if (JS_IsString(v)) {
+            const char *s = JS_ToCString(ctx, v);
+            if (s) filter_request_id = (int64_t)strtoull(s, NULL, 10);
+            JS_FreeCString(ctx, s);
+        }
+        JS_FreeValue(ctx, v);
+
+        v = JS_GetPropertyStr(ctx, opts, "session_id");
+        if (JS_IsString(v))
+            filter_session_id = JS_ToCString(ctx, v);
+        JS_FreeValue(ctx, v);
+
+        v = JS_GetPropertyStr(ctx, opts, "before");
+        if (JS_IsNumber(v))
+            JS_ToInt64(ctx, &filter_before, v);
+        JS_FreeValue(ctx, v);
+
+        v = JS_GetPropertyStr(ctx, opts, "after");
+        if (JS_IsNumber(v))
+            JS_ToInt64(ctx, &filter_after, v);
+        JS_FreeValue(ctx, v);
+    }
+
+    if (limit <= 0) limit = 100;
+    if (limit > 1000) limit = 1000;
+
+    /* Build query dynamically */
+    char sql[512];
+    size_t pos = 0;
+    pos += snprintf(sql + pos, sizeof(sql) - pos,
+                    "SELECT timestamp, worker_id, request_id, session_id, level, message "
+                    "FROM logs WHERE 1=1");
+
+    if (filter_level >= 0)
+        pos += snprintf(sql + pos, sizeof(sql) - pos,
+                        " AND level = %d", filter_level);
+    if (filter_request_id >= 0)
+        pos += snprintf(sql + pos, sizeof(sql) - pos,
+                        " AND request_id = %" PRId64, filter_request_id);
+    if (filter_session_id)
+        pos += snprintf(sql + pos, sizeof(sql) - pos,
+                        " AND session_id = ?");
+    if (filter_before > 0)
+        pos += snprintf(sql + pos, sizeof(sql) - pos,
+                        " AND timestamp < %" PRId64, filter_before);
+    if (filter_after > 0)
+        pos += snprintf(sql + pos, sizeof(sql) - pos,
+                        " AND timestamp > %" PRId64, filter_after);
+
+    pos += snprintf(sql + pos, sizeof(sql) - pos,
+                    " ORDER BY timestamp DESC LIMIT %" PRId64, limit);
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(req->log_db->db, sql, -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        if (filter_session_id) JS_FreeCString(ctx, filter_session_id);
+        return JS_NewArray(ctx);
+    }
+
+    /* Bind session_id if present */
+    if (filter_session_id) {
+        sqlite3_bind_text(stmt, 1, filter_session_id, -1, SQLITE_STATIC);
+    }
+
+    JSValue arr = JS_NewArray(ctx);
+    uint32_t idx = 0;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        JSValue entry = JS_NewObject(ctx);
+
+        char ts_buf[24];
+        snprintf(ts_buf, sizeof(ts_buf), "%" PRId64,
+                 (int64_t)sqlite3_column_int64(stmt, 0));
+        JS_SetPropertyStr(ctx, entry, "timestamp", JS_NewString(ctx, ts_buf));
+
+        JS_SetPropertyStr(ctx, entry, "worker_id",
+                          JS_NewInt32(ctx, sqlite3_column_int(stmt, 1)));
+
+        char rid_buf[24];
+        snprintf(rid_buf, sizeof(rid_buf), "%" PRId64,
+                 (int64_t)sqlite3_column_int64(stmt, 2));
+        JS_SetPropertyStr(ctx, entry, "request_id", JS_NewString(ctx, rid_buf));
+
+        const char *sid = (const char *)sqlite3_column_text(stmt, 3);
+        JS_SetPropertyStr(ctx, entry, "session_id",
+                          sid ? JS_NewString(ctx, sid) : JS_NULL);
+
+        JS_SetPropertyStr(ctx, entry, "level",
+                          JS_NewString(ctx, level_name(sqlite3_column_int(stmt, 4))));
+
+        const char *msg = (const char *)sqlite3_column_text(stmt, 5);
+        JS_SetPropertyStr(ctx, entry, "message",
+                          msg ? JS_NewString(ctx, msg) : JS_NewString(ctx, ""));
+
+        JS_SetPropertyUint32(ctx, arr, idx++, entry);
+    }
+
+    sqlite3_finalize(stmt);
+    if (filter_session_id) JS_FreeCString(ctx, filter_session_id);
+
+    return arr;
+}
+
+static void js_install_logs(JSContext *ctx) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue logs = JS_NewObject(ctx);
+
+    JS_SetPropertyStr(ctx, logs, "query",
+                      JS_NewCFunction(ctx, js_logs_query, "query", 1));
+
+    JS_SetPropertyStr(ctx, global, "logs", logs);
+    JS_FreeValue(ctx, global);
+}
+
+/* ======================================================================
  * Module loader (compile context only)
  * ====================================================================== */
 
@@ -615,6 +866,8 @@ static int snapshot_init_runtime(sjs_arena_t *arena,
     js_install_response(ctx);
     js_install_session(ctx);
     js_install_crypto(ctx);
+    js_install_console(ctx);
+    js_install_logs(ctx);
 
     /* Disable stack checking — zeroes stack_limit (stack_top becomes
      * irrelevant).  Re-enabled after each snapshot restore. */
@@ -1540,6 +1793,13 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             sjs_resp_headers_reset(req->resp_hdrs);
             req->resp_st->code = 200;
 
+            /* Clear accumulated log batch from previous attempt */
+            if (req->log_batch) {
+                for (uint32_t li = 0; li < req->log_batch->count; li++)
+                    free((void *)req->log_batch->entries[li].msg);
+                req->log_batch->count = 0;
+            }
+
             /* Clear accumulated Raft write-set from previous attempt */
             if (req->write_set) {
                 raft_write_set_free(req->write_set);
@@ -1735,12 +1995,32 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         if (req->write_set && req->write_set->op_count > 0)
             req->write_set->seq = req->raft_seq;
 
+        /* Auto-inject x-request-id header */
+        {
+            char rid_buf[24];
+            snprintf(rid_buf, sizeof(rid_buf), "%" PRIu64, req->request_id);
+            resp_add_header(req->resp_hdrs, "x-request-id", rid_buf);
+        }
+
         /* Commit — retry on conflict */
         if (kv_commit(sjs->kv) == KV_CONFLICT) {
             kv_rollback(sjs->kv);
             free(body);
             arena_reset(sjs);
             continue;
+        }
+
+        /* Flush pending log entries to log DB (before arena reset,
+         * though msg strings are strdup'd so arena-independent). */
+        if (req->log_batch && req->log_batch->count > 0 && req->log_db) {
+            log_db_flush(req->log_db, (int)(req->request_id >> 48),
+                         req->request_id,
+                         req->session ? req->session->id : NULL,
+                         req->log_batch);
+            /* Free strdup'd messages */
+            for (uint32_t i = 0; i < req->log_batch->count; i++)
+                free((void *)req->log_batch->entries[i].msg);
+            req->log_batch->count = 0;
         }
 
         arena_reset(sjs);
@@ -1753,6 +2033,12 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 
     txn_fail:
         kv_rollback(sjs->kv);
+        /* Free strdup'd log messages on failure */
+        if (req->log_batch) {
+            for (uint32_t li = 0; li < req->log_batch->count; li++)
+                free((void *)req->log_batch->entries[li].msg);
+            req->log_batch->count = 0;
+        }
         arena_reset(sjs);
         req->resp_st->code = 500;
         {
