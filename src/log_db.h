@@ -30,6 +30,7 @@ typedef struct log_batch {
 typedef struct log_db {
     sqlite3      *db;
     sqlite3_stmt *insert_stmt;
+    sqlite3_stmt *replay_insert_stmt;
 } log_db_t;
 
 int  log_db_open(log_db_t *ldb, const char *path);
@@ -39,6 +40,27 @@ void log_db_close(log_db_t *ldb);
  * Wraps all inserts in a single transaction. */
 int  log_db_flush(log_db_t *ldb, int worker_id, uint64_t request_id,
                   const char *session_id, const log_batch_t *batch);
+
+/* Flush replay capture data for one request. */
+int  log_db_flush_replay(log_db_t *ldb, uint64_t request_id,
+                         const char *request_data,
+                         const char *response_data,
+                         const char *kv_tape,
+                         const uint8_t *random_tape, size_t random_tape_len,
+                         const char *date_tape,
+                         const char *math_random_tape,
+                         const char *module_tree);
+
+/* Query replay capture for a request. Caller frees all returned strings.
+ * Returns 0 on success, -1 on not found. */
+int  log_db_get_replay(log_db_t *ldb, uint64_t request_id,
+                       char **request_data,
+                       char **response_data,
+                       char **kv_tape,
+                       uint8_t **random_tape, size_t *random_tape_len,
+                       char **date_tape,
+                       char **math_random_tape,
+                       char **module_tree);
 
 /* Passive WAL checkpoint — non-blocking. */
 int  log_db_checkpoint(log_db_t *ldb);

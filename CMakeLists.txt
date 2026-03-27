@@ -107,6 +107,7 @@ add_executable(shift-js
     src/raft_net.c
     src/raft_thread.c
     src/log_db.c
+    src/replay_capture.c
 )
 target_include_directories(shift-js PRIVATE src)
 target_link_libraries(shift-js PRIVATE
@@ -129,4 +130,4 @@ add_executable(sjsctl
     src/kvstore.c
 )
 target_include_directories(sjsctl PRIVATE src ${dmon_SOURCE_DIR})
-target_link_libraries(sjsctl PRIVATE sqlite3 pthread)
+target_link_libraries(sjsctl PRIVATE sqlite3 pthread OpenSSL::Crypto)

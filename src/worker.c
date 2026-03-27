@@ -547,6 +547,8 @@ void *sjs_worker_fn(void *arg) {
                     raft_write_set_init(&ws);
 
                 log_batch_t log_batch = {0};
+                sjs_replay_capture_t replay_cap;
+                replay_capture_init(&replay_cap);
                 uint64_t rid = ((uint64_t)wcfg->worker_id << 48) |
                                (request_counter++);
 
@@ -567,10 +569,12 @@ void *sjs_worker_fn(void *arg) {
                     .log_db       = log_db.db ? &log_db : NULL,
                     .log_batch    = &log_batch,
                     .request_id   = rid,
+                    .replay_capture = &replay_cap,
                 };
 
                 uint32_t body_len = 0;
                 char *body = sjs_dispatch(&sjs, &req, route, bc, &body_len);
+                replay_capture_free(&replay_cap);
 
                 /* Submit write-set to Raft if there are writes.
                  * ws.seq was set by kv_next_seq inside the committed txn. */

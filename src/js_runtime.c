@@ -8,6 +8,7 @@
 
 #include <quickjs.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -156,6 +157,16 @@ static JSValue js_kv_get(JSContext *ctx, JSValue this_val,
     void  *value = NULL;
     size_t vlen  = 0;
     int rc = kv_get(kv, actual_key, &value, &vlen);
+
+    /* Capture kv read for replay */
+    {
+        sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
+        if (req && req->replay_capture)
+            replay_capture_kv_get(req->replay_capture, key,
+                                  rc == 0 ? value : NULL,
+                                  rc == 0 ? vlen : 0);
+    }
+
     JS_FreeCString(ctx, key);
 
     if (rc == -1) return JS_NULL;
@@ -266,12 +277,25 @@ static JSValue js_kv_range(JSContext *ctx, JSValue this_val,
 
     kv_range_result_t result;
     int rc = kv_range(kv, actual_start, actual_end, (size_t)count, &result);
-    JS_FreeCString(ctx, start);
-    JS_FreeCString(ctx, end);
 
-    if (rc < 0) return JS_ThrowInternalError(ctx, "kv.range failed (rc=%d)", rc);
+    if (rc < 0) {
+        JS_FreeCString(ctx, start);
+        JS_FreeCString(ctx, end);
+        return JS_ThrowInternalError(ctx, "kv.range failed (rc=%d)", rc);
+    }
 
     size_t prefix_len = (prefix && prefix[0]) ? strlen(prefix) : 0;
+
+    /* Capture kv range read for replay */
+    {
+        sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
+        if (req && req->replay_capture)
+            replay_capture_kv_range(req->replay_capture, start, end,
+                                    &result, prefix_len);
+    }
+
+    JS_FreeCString(ctx, start);
+    JS_FreeCString(ctx, end);
 
     JSValue arr = JS_NewArray(ctx);
     for (size_t i = 0; i < result.count; i++) {
@@ -1043,12 +1067,84 @@ static JSValue js_logs_query(JSContext *ctx, JSValue this_val,
     return arr;
 }
 
+static JSValue js_logs_replay(JSContext *ctx, JSValue this_val,
+                              int argc, JSValue *argv) {
+    sjs_request_ctx_t *req = js_get_req_ctx(ctx);
+    if (!req || !req->log_db || !req->log_db->db)
+        return JS_NULL;
+
+    const char *rid_str = JS_ToCString(ctx, argv[0]);
+    if (!rid_str) return JS_EXCEPTION;
+    uint64_t request_id = (uint64_t)strtoull(rid_str, NULL, 10);
+    JS_FreeCString(ctx, rid_str);
+
+    char *request_data = NULL, *response_data = NULL, *kv_tape = NULL;
+    uint8_t *random_tape = NULL;
+    size_t random_tape_len = 0;
+    char *date_tape = NULL, *math_random_tape = NULL, *module_tree = NULL;
+
+    if (log_db_get_replay(req->log_db, request_id,
+                          &request_data, &response_data, &kv_tape,
+                          &random_tape, &random_tape_len,
+                          &date_tape, &math_random_tape,
+                          &module_tree) != 0)
+        return JS_NULL;
+
+    JSValue obj = JS_NewObject(ctx);
+
+    /* Parse JSON strings into JS objects where appropriate */
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
+    JSValue parse_fn = JS_GetPropertyStr(ctx, json_obj, "parse");
+
+    #define PARSE_JSON_FIELD(field, cstr) do { \
+        if (cstr) { \
+            JSValue s = JS_NewString(ctx, cstr); \
+            JSValue parsed = JS_Call(ctx, parse_fn, json_obj, 1, &s); \
+            JS_SetPropertyStr(ctx, obj, field, parsed); \
+            JS_FreeValue(ctx, s); \
+            free(cstr); \
+        } else { \
+            JS_SetPropertyStr(ctx, obj, field, JS_NULL); \
+        } \
+    } while (0)
+
+    PARSE_JSON_FIELD("request_data", request_data);
+    PARSE_JSON_FIELD("response_data", response_data);
+    PARSE_JSON_FIELD("kv_tape", kv_tape);
+    PARSE_JSON_FIELD("date_tape", date_tape);
+    PARSE_JSON_FIELD("math_random_tape", math_random_tape);
+    PARSE_JSON_FIELD("module_tree", module_tree);
+    #undef PARSE_JSON_FIELD
+
+    /* random_tape as base64 — for now just hex-encode */
+    if (random_tape && random_tape_len > 0) {
+        char *hex = malloc(random_tape_len * 2 + 1);
+        for (size_t i = 0; i < random_tape_len; i++)
+            snprintf(hex + i * 2, 3, "%02x", random_tape[i]);
+        JS_SetPropertyStr(ctx, obj, "random_tape",
+                          JS_NewString(ctx, hex));
+        free(hex);
+        free(random_tape);
+    } else {
+        JS_SetPropertyStr(ctx, obj, "random_tape", JS_NULL);
+    }
+
+    JS_FreeValue(ctx, parse_fn);
+    JS_FreeValue(ctx, json_obj);
+    JS_FreeValue(ctx, global);
+
+    return obj;
+}
+
 static void js_install_logs(JSContext *ctx) {
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue logs = JS_NewObject(ctx);
 
     JS_SetPropertyStr(ctx, logs, "query",
                       JS_NewCFunction(ctx, js_logs_query, "query", 1));
+    JS_SetPropertyStr(ctx, logs, "replay",
+                      JS_NewCFunction(ctx, js_logs_replay, "replay", 1));
 
     JS_SetPropertyStr(ctx, global, "logs", logs);
     JS_FreeValue(ctx, global);
@@ -1123,6 +1219,44 @@ static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
 }
 
 /* ======================================================================
+ * Date.now / Math.random capture overrides
+ *
+ * Replace QuickJS built-in implementations with versions that record
+ * return values to the replay capture tape.
+ * ====================================================================== */
+
+static JSValue js_date_now_capture(JSContext *ctx, JSValue this_val,
+                                    int argc, JSValue *argv) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int64_t ms = (int64_t)tv.tv_sec * 1000 + (int64_t)tv.tv_usec / 1000;
+
+    sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
+    if (req && req->replay_capture)
+        replay_capture_date_now(req->replay_capture, ms);
+
+    return JS_NewInt64(ctx, ms);
+}
+
+static JSValue js_math_random_capture(JSContext *ctx, JSValue this_val,
+                                       int argc, JSValue *argv) {
+    /* Generate a random double in [0, 1) using CSPRNG */
+    uint64_t v;
+    RAND_bytes((uint8_t *)&v, sizeof(v));
+
+    /* Same conversion as QuickJS: map to [1.0, 2.0) then subtract 1 */
+    union { uint64_t u; double d; } u;
+    u.u = ((uint64_t)0x3ff << 52) | (v >> 12);
+    double result = u.d - 1.0;
+
+    sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
+    if (req && req->replay_capture)
+        replay_capture_math_random(req->replay_capture, result);
+
+    return JS_NewFloat64(ctx, result);
+}
+
+/* ======================================================================
  * Arena snapshot: freeze a fully-initialized runtime+context into a
  * relocatable image. Restore per-request via memcpy + pointer fixup.
  * ====================================================================== */
@@ -1161,6 +1295,49 @@ static int snapshot_init_runtime(sjs_arena_t *arena,
     js_install_code(ctx);
     js_install_console(ctx);
     js_install_logs(ctx);
+
+    /* Override Date.now, Date constructor, and Math.random with
+     * capture versions that record to the replay tape. */
+    {
+        JSValue global = JS_GetGlobalObject(ctx);
+
+        /* Override Date.now */
+        JSValue date_obj = JS_GetPropertyStr(ctx, global, "Date");
+        JS_SetPropertyStr(ctx, date_obj, "now",
+                          JS_NewCFunction(ctx, js_date_now_capture, "now", 0));
+        JS_FreeValue(ctx, date_obj);
+
+        /* Wrap Date constructor so new Date() routes through Date.now().
+         * This ensures no-arg Date construction is captured to the tape. */
+        static const char date_wrap[] =
+            "(function() {"
+            "  const _D = Date;"
+            "  const _now = Date.now;"
+            "  function CDate(...args) {"
+            "    if (!new.target) return _D(...args);"
+            "    if (args.length === 0) return new _D(_now());"
+            "    return new _D(...args);"
+            "  }"
+            "  CDate.now = _now;"
+            "  CDate.parse = _D.parse;"
+            "  CDate.UTC = _D.UTC;"
+            "  CDate.prototype = _D.prototype;"
+            "  return CDate;"
+            "})()";
+        JSValue wrapped = JS_Eval(ctx, date_wrap, sizeof(date_wrap) - 1,
+                                   "<date-wrap>", JS_EVAL_TYPE_GLOBAL);
+        if (!JS_IsException(wrapped))
+            JS_SetPropertyStr(ctx, global, "Date", wrapped);
+        else
+            JS_FreeValue(ctx, JS_GetException(ctx));
+
+        /* Override Math.random */
+        JSValue math_obj = JS_GetPropertyStr(ctx, global, "Math");
+        JS_SetPropertyStr(ctx, math_obj, "random",
+                          JS_NewCFunction(ctx, js_math_random_capture, "random", 0));
+        JS_FreeValue(ctx, math_obj);
+        JS_FreeValue(ctx, global);
+    }
 
     /* Disable stack checking — zeroes stack_limit (stack_top becomes
      * irrelevant).  Re-enabled after each snapshot restore. */
@@ -1652,6 +1829,13 @@ static int compile_module(sjs_runtime_t *sjs, const char *kv_prefix,
 
     if (!module_path) return -1;   /* not found */
 
+    /* Record module load for replay capture */
+    if (sjs->current_replay_capture) {
+        const char *hash = sha256_hex(source, source_len);
+        replay_capture_module(sjs->current_replay_capture,
+                              module_path, hash);
+    }
+
     const char *ext = sjs_path_extension(module_path);
     sjs_preprocess_fn transform = ext
         ? sjs_preprocessor_find(sjs->preprocessors, ext) : NULL;
@@ -1803,8 +1987,34 @@ static int sjs_resolve_request_route(sjs_runtime_t *sjs, const char *path,
     }
 
     /* Try cache hit */
-    if (kv_get(sjs->kv, ck, &bc->data, &bc->len) == 0)
+    if (kv_get(sjs->kv, ck, &bc->data, &bc->len) == 0) {
+        /* Record module in replay capture even on cache hit.
+         * Try each extension to find the __code_meta/ entry. */
+        if (sjs->current_replay_capture) {
+            static const char *exts[] = { ".mjs", ".ejs" };
+            for (int ei = 0; ei < 2; ei++) {
+                char mod_name[256];
+                snprintf(mod_name, sizeof(mod_name), "%s%s", base_path, exts[ei]);
+                char meta_raw[256];
+                snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", mod_name);
+                char meta_buf[512];
+                const char *meta_key = sjs_prefixed_key(kv_prefix, meta_raw,
+                                                         meta_buf, sizeof(meta_buf));
+                if (!meta_key) continue;
+                void *hash_val = NULL;
+                size_t hash_len = 0;
+                if (kv_get(sjs->kv, meta_key, &hash_val, &hash_len) == 0 && hash_val) {
+                    char hash_str[65] = {0};
+                    if (hash_len >= 64) memcpy(hash_str, hash_val, 64);
+                    replay_capture_module(sjs->current_replay_capture,
+                                          mod_name, hash_str);
+                    free(hash_val);
+                    break;
+                }
+            }
+        }
         goto found;
+    }
 
     /* Cache miss — compile primary route */
     {
@@ -1822,53 +2032,7 @@ static int sjs_resolve_request_route(sjs_runtime_t *sjs, const char *path,
         }
     }
 
-    /* Primary not found — try fallback route */
-    free(base_path);
-    {
-        sjs_route_t fb;
-        sjs_resolve_route_fallback(path, &fb);
-        base_path = fb.module_path;
-        route->func_name = fb.func_name;
-        fb.module_path = NULL;
-        fb.func_name = NULL;
-        sjs_route_free(&fb);
-    }
-
-    if (!base_path) {
-        *err_body = strdup("Not Found");
-        *err_len = (uint32_t)strlen(*err_body);
-        return 404;
-    }
-
-    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base_path);
-    ck = sjs_prefixed_key(kv_prefix, raw_cache,
-                           cache_key_buf, sizeof(cache_key_buf));
-    if (!ck) {
-        free(base_path);
-        *err_body = strdup("Key Too Long");
-        *err_len = (uint32_t)strlen(*err_body);
-        return 500;
-    }
-
-    if (kv_get(sjs->kv, ck, &bc->data, &bc->len) == 0)
-        goto found;
-
-    /* Compile fallback route */
-    {
-        char *comp_err = NULL;
-        uint32_t comp_err_len = 0;
-        int rc = compile_module(sjs, kv_prefix, base_path, ck,
-                                &bc->data, &bc->len, &route->module_path,
-                                &comp_err, &comp_err_len);
-        if (rc == 0) goto found;
-        if (rc > 0) {
-            free(base_path);
-            *err_body = comp_err;
-            *err_len = comp_err_len;
-            return 500;
-        }
-    }
-
+    /* Module not found */
     free(base_path);
     *err_body = strdup("Not Found");
     *err_len = (uint32_t)strlen(*err_body);
@@ -1917,6 +2081,10 @@ static void sjs_session_load(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             void  *sdata = NULL;
             size_t sdata_len = 0;
             if (kv_get(sjs->kv, actual_key, &sdata, &sdata_len) == 0 && sdata) {
+                /* Capture session data for replay */
+                if (req->replay_capture)
+                    replay_capture_session(req->replay_capture, sdata, sdata_len);
+
                 JSValue global = JS_GetGlobalObject(ctx);
                 JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
                 JSValue parse_fn = JS_GetPropertyStr(ctx, json_obj, "parse");
@@ -2053,6 +2221,9 @@ static void sjs_jsonp_wrap(char **body, uint32_t *body_len,
 char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
                    sjs_route_info_t *route, sjs_bytecode_t *bc,
                    uint32_t *out_len) {
+    /* Set replay capture on runtime for module loader access */
+    sjs->current_replay_capture = req->replay_capture;
+
     /* ---- Phase 1: Route resolution and bytecode loading ---- */
     {
         char *err_body = NULL;
@@ -2133,6 +2304,14 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         /* Load session */
         sjs_session_load(sjs, req, ctx);
 
+        /* Reset random tape — session ID generation consumed bytes that
+         * are not part of the JS-visible random sequence. The tape should
+         * only contain bytes from JS crypto.getRandomValues calls. */
+        if (req->tape) {
+            req->tape->len = 0;
+            req->tape->pos = 0;
+        }
+
         JSValue module_val = JS_ReadObject(ctx, bc->data, bc->len,
                                            JS_READ_OBJ_BYTECODE);
         /* Bytecode was consumed; clear so destructor doesn't double-free
@@ -2199,8 +2378,82 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 
             ret = JS_Call(ctx, render_fn, JS_UNDEFINED, 0, NULL);
         } else {
-            const char *fn_name = (route->func_name && route->func_name[0])
-                                  ? route->func_name : "index";
+            /* MJS dispatch: fn required from query (GET) or body (POST) */
+            const char *fn_name = NULL;
+            JSValue args = JS_UNDEFINED;
+            bool is_get = !strcmp(req->method, "GET") || !strcmp(req->method, "HEAD");
+            bool is_post = !strcmp(req->method, "POST");
+
+            if (!is_get && !is_post) {
+                kv_rollback(sjs->kv);
+                arena_reset(sjs);
+                req->resp_st->code = 405;
+                char *body = strdup("Method Not Allowed");
+                *out_len = (uint32_t)strlen(body);
+                return body;
+            }
+
+            if (is_get) {
+                /* Extract fn from query string, remaining params become args */
+                JSValue qs_obj = parse_query_string(ctx, route->query_string);
+                JSValue fn_val = JS_GetPropertyStr(ctx, qs_obj, "fn");
+                if (JS_IsString(fn_val)) {
+                    fn_name = JS_ToCString(ctx, fn_val);
+                }
+                JS_FreeValue(ctx, fn_val);
+
+                if (!fn_name || !fn_name[0]) {
+                    if (fn_name) JS_FreeCString(ctx, fn_name);
+                    kv_rollback(sjs->kv);
+                    arena_reset(sjs);
+                    req->resp_st->code = 400;
+                    char *body = strdup("\"fn\" query parameter is required");
+                    *out_len = (uint32_t)strlen(body);
+                    return body;
+                }
+
+                /* Remove fn from the args object */
+                JS_DeleteProperty(ctx, qs_obj,
+                    JS_NewAtom(ctx, "fn"), 0);
+                args = qs_obj;
+            } else {
+                /* POST: parse JSON body, extract fn and args */
+                JSValue body_obj = JS_UNDEFINED;
+                if (req->body && req->body_len > 0) {
+                    JSValue global = JS_GetGlobalObject(ctx);
+                    JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
+                    JSValue parse_fn_val = JS_GetPropertyStr(ctx, json_obj, "parse");
+                    JSValue body_str = JS_NewStringLen(ctx, req->body, req->body_len);
+                    body_obj = JS_Call(ctx, parse_fn_val, json_obj, 1, &body_str);
+                    if (JS_IsException(body_obj)) {
+                        JS_GetException(ctx);
+                        body_obj = JS_UNDEFINED;
+                    }
+                }
+
+                if (JS_IsObject(body_obj)) {
+                    JSValue fn_val = JS_GetPropertyStr(ctx, body_obj, "fn");
+                    if (JS_IsString(fn_val))
+                        fn_name = JS_ToCString(ctx, fn_val);
+                    JS_FreeValue(ctx, fn_val);
+
+                    JSValue args_val = JS_GetPropertyStr(ctx, body_obj, "args");
+                    args = JS_IsObject(args_val) ? args_val : JS_NewObject(ctx);
+                } else {
+                    JS_FreeValue(ctx, body_obj);
+                }
+
+                if (!fn_name || !fn_name[0]) {
+                    if (fn_name) JS_FreeCString(ctx, fn_name);
+                    kv_rollback(sjs->kv);
+                    arena_reset(sjs);
+                    req->resp_st->code = 400;
+                    char *body = strdup("\"fn\" field is required in request body");
+                    *out_len = (uint32_t)strlen(body);
+                    return body;
+                }
+            }
+
             called_func = fn_name;
 
             JSValue handler = JS_GetPropertyStr(ctx, ns, fn_name);
@@ -2210,31 +2463,13 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
                 req->resp_st->code = 404;
                 char *body;
                 asprintf(&body, "function \"%s\" not found", fn_name);
+                JS_FreeCString(ctx, fn_name);
                 *out_len = (uint32_t)strlen(body);
                 return body;
             }
 
-            /* Build args object from query string (GET) or JSON body */
-            JSValue args;
-            if (!strcmp(req->method, "GET") || !strcmp(req->method, "HEAD")) {
-                args = parse_query_string(ctx, route->query_string);
-            } else if (req->body && req->body_len > 0) {
-                JSValue global = JS_GetGlobalObject(ctx);
-                JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
-                JSValue parse_fn = JS_GetPropertyStr(ctx, json_obj, "parse");
-                JSValue body_str = JS_NewStringLen(ctx, req->body, req->body_len);
-                args = JS_Call(ctx, parse_fn, json_obj, 1, &body_str);
-                if (JS_IsException(args)) {
-                    JS_GetException(ctx);
-                    args = JS_NewObject(ctx);
-                    JS_SetPropertyStr(ctx, args, "body",
-                                      JS_NewStringLen(ctx, req->body, req->body_len));
-                }
-            } else {
-                args = JS_NewObject(ctx);
-            }
-
             ret = JS_Call(ctx, handler, JS_UNDEFINED, 1, &args);
+            JS_FreeCString(ctx, fn_name);
         }
 
         /* Capture exception immediately */
@@ -2316,6 +2551,58 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             req->log_batch->count = 0;
         }
 
+        /* Flush replay capture to log DB */
+        if (req->replay_capture && req->log_db) {
+            sjs_replay_capture_t *cap = req->replay_capture;
+
+            /* Finalize JSON array buffers */
+            replay_capture_finalize(&cap->kv_tape);
+            replay_capture_finalize(&cap->date_tape);
+            replay_capture_finalize(&cap->math_random_tape);
+            replay_capture_finalize(&cap->module_tree);
+
+            /* Build request data JSON */
+            char *req_json = NULL;
+            {
+                size_t cap_size = 256 + (req->body_len * 2);
+                for (uint32_t h = 0; h < req->header_count; h++)
+                    cap_size += req->headers[h].name_len + req->headers[h].value_len + 20;
+                req_json = malloc(cap_size);
+                size_t pos = 0;
+                pos += snprintf(req_json + pos, cap_size - pos,
+                    "{\"method\":\"%s\",\"path\":\"%s\",\"session\":",
+                    req->method, req->path);
+                if (cap->session_json)
+                    pos += snprintf(req_json + pos, cap_size - pos,
+                        "%s", cap->session_json);
+                else
+                    pos += snprintf(req_json + pos, cap_size - pos, "null");
+                pos += snprintf(req_json + pos, cap_size - pos, "}");
+            }
+
+            /* Build response data JSON */
+            char *resp_json = NULL;
+            {
+                size_t rsize = 128 + (body ? *out_len * 2 : 0);
+                resp_json = malloc(rsize);
+                snprintf(resp_json, rsize,
+                    "{\"status\":%d}", req->resp_st->code);
+            }
+
+            log_db_flush_replay(req->log_db, req->request_id,
+                req_json, resp_json,
+                cap->kv_tape.data,
+                req->tape ? req->tape->data : NULL,
+                req->tape ? req->tape->len : 0,
+                cap->date_tape.data,
+                cap->math_random_tape.data,
+                cap->module_tree.data);
+
+            free(req_json);
+            free(resp_json);
+        }
+
+        sjs->current_replay_capture = NULL;
         arena_reset(sjs);
 
         if (!body) {

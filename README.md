@@ -10,17 +10,17 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)
 
 # Seed a module
 ./build/sjsctl -d app.db put "__code/index.mjs" \
-  'export function index(args) { return { hello: "world", args }; }
+  'export function hello(args) { return { greeting: "world", args }; }
    export function greet(args) { return "Hello, " + args.name + "!"; }'
 
 # Start the server
 ./build/shift-js -d app.db -p 9000 -w 4
 
 # Call it
-curl --http2-prior-knowledge http://localhost:9000/
-# → {"hello":"world","args":{}}
+curl --http2-prior-knowledge 'http://localhost:9000/?fn=hello'
+# → {"greeting":"world","args":{}}
 
-curl --http2-prior-knowledge 'http://localhost:9000/greet?name=World'
+curl --http2-prior-knowledge 'http://localhost:9000/?fn=greet&name=World'
 # → Hello, World!
 ```
 
@@ -30,18 +30,20 @@ Modules are JavaScript ES modules stored in SQLite under `__code/` keys. There a
 
 ### API modules (`.mjs`)
 
-Export named functions. The URL path determines which function to call:
+Export named functions. The `fn` parameter specifies which function to call:
 
 ```
-GET /math/add?a=1&b=2  →  calls add({a: "1", b: "2"}) in __code/math/index.mjs
-POST /math/add          →  calls add(<parsed JSON body>) in __code/math/index.mjs
+GET /math?fn=add&a=1&b=2           →  calls add({a: "1", b: "2"}) in __code/math/index.mjs
+POST /math  {"fn":"add","args":{}}  →  calls add({}) in __code/math/index.mjs
 ```
 
-**Routing**: the last path segment is the function name, everything before it resolves the module. `/foo/bar` tries `__code/foo/bar/index.mjs` first (full path as module), then falls back to `__code/foo/index.mjs` with function `bar`. If no function name is given (e.g. `GET /`), the `index` export is called.
+**Routing**: the URL path maps to a module (`/foo/bar` → `__code/foo/bar/index.mjs`). The function name is always specified explicitly via the `fn` parameter, never derived from the URL.
 
-**GET/HEAD**: arguments come from query string parameters, passed as an object to the function.
+**GET/HEAD**: `fn` query parameter is required. Remaining query params become the args object passed to the function.
 
-**POST/PUT/PATCH/DELETE**: arguments come from the JSON request body, passed as an object to the function.
+**POST**: JSON body with `fn` field (required) and `args` field (object passed to the function).
+
+**Other HTTP verbs**: 405 Method Not Allowed.
 
 **Return values**: strings are sent as-is. Objects/arrays are JSON-stringified with `content-type: application/json`. Null/undefined produce an empty body.
 
@@ -49,7 +51,7 @@ POST /math/add          →  calls add(<parsed JSON body>) in __code/math/index.
 
 ```javascript
 // __code/index.mjs
-export function index(args) {
+export function hello(args) {
     return { status: "ok", args };
 }
 
@@ -101,12 +103,22 @@ Available in all modules:
 | `request.path` | Request path including query string |
 | `request.body` | Request body as string, or null |
 | `request.headers` | Object of lowercase header names to values |
+| `request.id` | Unique request ID (also sent as `x-request-id` response header) |
 | `response.status(code)` | Set HTTP status code (default: 200) |
 | `response.header(name, value)` | Add a response header |
 | `kv.get(key)` | Get value from KV store (returns string or null) |
 | `kv.put(key, value)` | Store a value |
 | `kv.delete(key)` | Delete a key |
 | `kv.range(start, end, count?)` | Range query, returns `[{key, value, value_size}]` |
+| `code.get(path)` | Get module source code |
+| `code.put(path, content)` | Store module source (handles hashing + cache invalidation) |
+| `code.delete(path)` | Delete a module |
+| `code.list()` | List all modules, returns `[{path, size, content_hash}]` |
+| `console.log(...)` | Log a message (level: log) |
+| `console.warn(...)` | Log a warning (level: warn) |
+| `console.error(...)` | Log an error (level: error) |
+| `logs.query({...})` | Query log entries (filters: level, limit, request_id, session_id, before, after) |
+| `logs.replay(request_id)` | Get replay capture data for a request |
 | `session.id` | Read-only session ID (auto-generated if no `_sjs_sid` cookie) |
 | `session.get(key)` | Get a value from the session |
 | `session.set(key, value)` | Set a session value (persisted to KV on request end) |

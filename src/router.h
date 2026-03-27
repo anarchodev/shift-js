@@ -9,21 +9,16 @@ typedef struct {
     char *query_string;  /* query string (after '?'), or NULL */
 } sjs_route_t;
 
-/* Resolve a URL path to routing components.
+/* Resolve a URL path to a module path.
  *
- * First strips the query string. Then produces two resolution candidates
- * for the caller to try in order:
+ * Strips query string, leading/trailing slashes, appends "/index":
+ *   "/"         → module="index"
+ *   "/foo"      → module="foo/index"
+ *   "/foo/bar"  → module="foo/bar/index"
  *
- * 1. Full path as module:  "/foo/bar" → module="foo/bar/index", func=NULL
- * 2. Last segment as func: "/foo/bar" → module="foo/index",     func="bar"
- *
- * The caller (sjs_dispatch) tries candidate 1 first. If no module is found,
- * it uses func_name from candidate 2.
- *
- * sjs_resolve_route fills in module_path for candidate 1.
- * sjs_resolve_route_fallback fills in module_path and func_name for candidate 2.
+ * For .mjs modules, the function name comes from the "fn" query parameter
+ * (GET) or "fn" body field (POST), not from the URL path.
  *
  * All returned strings are malloc'd; caller frees via sjs_route_free(). */
 void sjs_resolve_route(const char *url_path, sjs_route_t *route);
-void sjs_resolve_route_fallback(const char *url_path, sjs_route_t *route);
 void sjs_route_free(sjs_route_t *route);

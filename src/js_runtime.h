@@ -3,6 +3,7 @@
 #include "kvstore.h"
 #include "log_db.h"
 #include "preprocessor.h"
+#include "replay_capture.h"
 #include "raft_thread.h"
 #include <shift.h>
 #include <shift_h2.h>
@@ -58,6 +59,9 @@ typedef struct {
     /* Set during compilation for module loader prefix. */
     const char *current_prefix;
 
+    /* Set during dispatch for replay capture (module tree recording). */
+    sjs_replay_capture_t *current_replay_capture;
+
     /* Preprocessor registry (shared, read-only). */
     const sjs_preprocessor_registry_t *preprocessors;
 } sjs_runtime_t;
@@ -88,7 +92,6 @@ typedef struct {
     size_t   len;
     size_t   cap;
     size_t   pos;
-    bool     replay;
 } sjs_random_tape_t;
 
 /* Route info (destructor frees all strings) */
@@ -158,6 +161,9 @@ typedef struct sjs_request_ctx {
     log_db_t            *log_db;       /* per-worker log DB handle */
     log_batch_t         *log_batch;    /* per-request pending entries */
     uint64_t             request_id;   /* monotonic per-worker counter */
+
+    /* Replay capture */
+    sjs_replay_capture_t *replay_capture;
 } sjs_request_ctx_t;
 
 /* Create/destroy the per-worker runtime. */

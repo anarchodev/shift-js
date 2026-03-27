@@ -55,34 +55,6 @@ void sjs_resolve_route(const char *url_path, sjs_route_t *route) {
     route->func_name = NULL;
 }
 
-void sjs_resolve_route_fallback(const char *url_path, sjs_route_t *route) {
-    memset(route, 0, sizeof(*route));
-    if (!url_path) return;
-
-    size_t len;
-    char *query = NULL;
-    const char *p = clean_path(url_path, &len, &query);
-    free(query);  /* fallback reuses query from primary route */
-
-    /* Find the last '/' to split path from function name */
-    const char *last_slash = NULL;
-    for (size_t i = 0; i < len; i++) {
-        if (p[i] == '/') last_slash = p + i;
-    }
-
-    if (!last_slash) {
-        /* Single segment like "/bar" — module is "index", func is "bar" */
-        route->module_path = strdup("index");
-        route->func_name = strndup(p, len);
-    } else {
-        /* "/foo/bar" — module is "foo/index", func is "bar" */
-        size_t dir_len = (size_t)(last_slash - p);
-        route->module_path = make_module_path(p, dir_len);
-        size_t func_start = (size_t)(last_slash - p) + 1;
-        route->func_name = strndup(p + func_start, len - func_start);
-    }
-}
-
 void sjs_route_free(sjs_route_t *route) {
     free(route->module_path);
     free(route->func_name);

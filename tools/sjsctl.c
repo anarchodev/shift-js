@@ -11,13 +11,17 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <openssl/evp.h>
 
 /* Forward declarations */
 static const char *prefixed_key(const char *prefix, const char *key,
                                 char *buf, size_t bufsize);
 static char *read_file(const char *path, size_t *out_len);
-static void invalidate_cache(kvstore_t *kv, const char *key,
-                             const char *tenant_prefix);
+static void on_code_write(kvstore_t *kv, const char *key,
+                          const char *content, size_t content_len,
+                          const char *tenant_prefix);
+static void on_code_delete(kvstore_t *kv, const char *key,
+                           const char *tenant_prefix);
 
 static int write_file(const char *path, const void *data, size_t len) {
     FILE *f = fopen(path, "wb");
@@ -132,7 +136,7 @@ static void sync_single_file(watch_ctx_t *ctx, const char *relpath) {
     }
 
     if (kv_put(ctx->kv, actual_key, contents, flen) == 0) {
-        invalidate_cache(ctx->kv, actual_key, ctx->tenant_prefix);
+        on_code_write(ctx->kv, actual_key, contents, flen, ctx->tenant_prefix);
         printf("  [watch] %s → %s (%zu bytes)\n", relpath, actual_key, flen);
     } else {
         fprintf(stderr, "  [watch] FAILED: %s\n", actual_key);
@@ -154,7 +158,7 @@ static void delete_single_file(watch_ctx_t *ctx, const char *relpath) {
                                           key, sizeof(key));
 
     if (kv_delete(ctx->kv, actual_key) == 0) {
-        invalidate_cache(ctx->kv, actual_key, ctx->tenant_prefix);
+        on_code_delete(ctx->kv, actual_key, ctx->tenant_prefix);
         printf("  [watch] deleted %s\n", actual_key);
     }
 }
@@ -240,33 +244,97 @@ static const char *prefixed_key(const char *prefix, const char *key,
     return buf;
 }
 
-/* If key is a __code/ entry, delete the corresponding __compiled/ bytecode
- * cache entry so the server recompiles on next request. */
-static void invalidate_cache(kvstore_t *kv, const char *key,
-                             const char *tenant_prefix) {
+/* Compute SHA-256 hex string of content. */
+static void sha256_hex(const void *data, size_t len, char out[65]) {
+    uint8_t digest[32];
+    unsigned int dlen = 0;
+    EVP_Digest(data, len, digest, &dlen, EVP_sha256(), NULL);
+    for (unsigned int i = 0; i < 32; i++)
+        snprintf(out + i * 2, 3, "%02x", digest[i]);
+}
+
+/* For a __code/ key write: invalidate bytecode cache, store content hash
+ * in __code_meta/, and store content-addressed blob in __code_blob/. */
+static void on_code_write(kvstore_t *kv, const char *key,
+                          const char *content, size_t content_len,
+                          const char *tenant_prefix) {
     /* Work on the unprefixed key — strip tenant prefix if present */
     const char *raw = key;
     if (tenant_prefix && strncmp(raw, tenant_prefix, strlen(tenant_prefix)) == 0)
         raw += strlen(tenant_prefix);
 
     if (strncmp(raw, "__code/", 7) != 0) return;
-    const char *rel = raw + 7; /* e.g. "index.ejs" or "_admin/tenants/index.ejs" */
+    const char *rel = raw + 7;
 
-    /* Strip file extension to get the extensionless base path */
+    /* 1. Invalidate __compiled/ cache */
     char base[4096];
     snprintf(base, sizeof(base), "%s", rel);
     char *dot = strrchr(base, '.');
     char *slash = strrchr(base, '/');
     if (dot && (!slash || dot > slash)) *dot = '\0';
 
-    /* Build the prefixed __compiled/ key and delete it */
     char raw_cache[4096];
     snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base);
-
     char cache_key[4096];
     const char *ck = prefixed_key(tenant_prefix, raw_cache,
                                   cache_key, sizeof(cache_key));
     kv_delete(kv, ck);
+
+    /* 2. Compute content hash and store in __code_meta/ */
+    char hash[65];
+    sha256_hex(content, content_len, hash);
+
+    char meta_raw[4096];
+    snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", rel);
+    char meta_buf[4096];
+    const char *meta_key = prefixed_key(tenant_prefix, meta_raw,
+                                         meta_buf, sizeof(meta_buf));
+    kv_put(kv, meta_key, hash, 64);
+
+    /* 3. Store content-addressed blob (only if not already present) */
+    char blob_raw[128];
+    snprintf(blob_raw, sizeof(blob_raw), "__code_blob/%s", hash);
+    char blob_buf[4096];
+    const char *blob_key = prefixed_key(tenant_prefix, blob_raw,
+                                         blob_buf, sizeof(blob_buf));
+    void *existing = NULL;
+    size_t elen = 0;
+    if (kv_get(kv, blob_key, &existing, &elen) != 0)
+        kv_put(kv, blob_key, content, content_len);
+    free(existing);
+}
+
+/* For a __code/ key delete: clean up cache and meta. */
+static void on_code_delete(kvstore_t *kv, const char *key,
+                           const char *tenant_prefix) {
+    const char *raw = key;
+    if (tenant_prefix && strncmp(raw, tenant_prefix, strlen(tenant_prefix)) == 0)
+        raw += strlen(tenant_prefix);
+
+    if (strncmp(raw, "__code/", 7) != 0) return;
+    const char *rel = raw + 7;
+
+    /* Delete __compiled/ cache */
+    char base[4096];
+    snprintf(base, sizeof(base), "%s", rel);
+    char *dot = strrchr(base, '.');
+    char *slash = strrchr(base, '/');
+    if (dot && (!slash || dot > slash)) *dot = '\0';
+
+    char raw_cache[4096];
+    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base);
+    char cache_key[4096];
+    const char *ck = prefixed_key(tenant_prefix, raw_cache,
+                                  cache_key, sizeof(cache_key));
+    kv_delete(kv, ck);
+
+    /* Delete __code_meta/ */
+    char meta_raw[4096];
+    snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", rel);
+    char meta_buf[4096];
+    const char *meta_key = prefixed_key(tenant_prefix, meta_raw,
+                                         meta_buf, sizeof(meta_buf));
+    kv_delete(kv, meta_key);
 }
 
 static int upload_dir(kvstore_t *kv, const char *dir_path,
@@ -326,7 +394,7 @@ static int upload_dir(kvstore_t *kv, const char *dir_path,
         }
 
         if (kv_put(kv, actual_key, contents, flen) == 0) {
-            invalidate_cache(kv, actual_key, tenant_prefix);
+            on_code_write(kv, actual_key, contents, flen, tenant_prefix);
             printf("  %s → %s (%zu bytes)\n", filepath, actual_key, flen);
             count++;
         } else {
@@ -417,7 +485,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Failed to put key\n");
             rc = 1;
         } else {
-            invalidate_cache(kv, key, tenant_prefix_str);
+            on_code_write(kv, key, val, strlen(val), tenant_prefix_str);
         }
 
     } else if (!strcmp(cmd, "putfile")) {
@@ -439,7 +507,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Failed to put key\n");
                 rc = 1;
             } else {
-                invalidate_cache(kv, key, tenant_prefix_str);
+                on_code_write(kv, key, contents, flen, tenant_prefix_str);
             }
             free(contents);
         }

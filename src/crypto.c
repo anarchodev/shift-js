@@ -16,16 +16,7 @@
 int sjs_random_fill(sjs_random_tape_t *tape, uint8_t *buf, size_t n) {
     if (n == 0) return 0;
 
-    if (tape->replay) {
-        /* Replay mode: read from pre-filled tape */
-        if (tape->pos + n > tape->len)
-            return -1;  /* tape exhausted */
-        memcpy(buf, tape->data + tape->pos, n);
-        tape->pos += n;
-        return 0;
-    }
-
-    /* Capture mode: generate fresh random bytes */
+    /* Generate fresh random bytes and capture to tape */
     if (RAND_bytes(buf, (int)n) != 1)
         return -1;
 
