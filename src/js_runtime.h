@@ -2,6 +2,7 @@
 
 #include "kvstore.h"
 #include "preprocessor.h"
+#include "raft_thread.h"
 #include <shift.h>
 #include <shift_h2.h>
 #include <quickjs.h>
@@ -99,6 +100,12 @@ typedef struct {
     uint16_t code;
 } sjs_resp_status_t;
 
+/* Raft sequence number — tags an entity with its proposal seq for
+ * the pending response collection. */
+typedef struct {
+    uint64_t seq;
+} sjs_raft_seq_t;
+
 /* Component IDs for sjs ECS components */
 typedef struct {
     shift_component_id_t resp_headers;
@@ -107,6 +114,7 @@ typedef struct {
     shift_component_id_t route;
     shift_component_id_t bytecode;
     shift_component_id_t resp_status;
+    shift_component_id_t raft_seq;
 } sjs_component_ids_t;
 
 /* Per-request view — thin struct of pointers into ECS components.
@@ -128,6 +136,13 @@ typedef struct sjs_request_ctx {
     sjs_resp_status_t   *resp_st;
     sjs_session_t       *session;
     sjs_random_tape_t   *tape;
+
+    /* Raft write-set tracking (NULL when Raft disabled).
+     * Writes are also applied to local SQLite immediately for
+     * read-your-own-writes; the write-set is sent to the Raft thread
+     * for replication after the handler completes. */
+    raft_write_set_t    *write_set;
+    raft_handle_t       *raft;
 } sjs_request_ctx_t;
 
 /* Create/destroy the per-worker runtime. */

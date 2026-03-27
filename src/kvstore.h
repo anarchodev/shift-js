@@ -46,3 +46,11 @@ const char *kv_prefixed_key(const char *prefix, const char *key,
 int kv_range(kvstore_t *store, const char *start, const char *end,
              size_t count, kv_range_result_t *out);
 void kv_range_free(kv_range_result_t *result);
+
+/* Allocate a monotonic sequence number inside the current transaction.
+ * Must be called between kv_begin() and kv_commit().
+ * Returns the sequence number, or 0 on error. */
+uint64_t kv_next_seq(kvstore_t *store);
+
+/* Delete sequence entries up to and including through_seq (compaction). */
+int kv_seq_truncate(kvstore_t *store, uint64_t through_seq);

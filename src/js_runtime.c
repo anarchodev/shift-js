@@ -183,6 +183,12 @@ static JSValue js_kv_put(JSContext *ctx, JSValue this_val,
     if (!val) { JS_FreeCString(ctx, key); return JS_EXCEPTION; }
 
     int rc = kv_put(kv, actual_key, val, vlen);
+
+    /* Track the write for Raft replication */
+    sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
+    if (rc == 0 && req && req->write_set)
+        raft_write_set_add_put(req->write_set, actual_key, val, (uint32_t)vlen);
+
     JS_FreeCString(ctx, key);
     JS_FreeCString(ctx, val);
 
@@ -207,6 +213,12 @@ static JSValue js_kv_delete(JSContext *ctx, JSValue this_val,
     }
 
     int rc = kv_delete(kv, actual_key);
+
+    /* Track the delete for Raft replication */
+    sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
+    if (rc == 0 && req && req->write_set)
+        raft_write_set_add_delete(req->write_set, actual_key);
+
     JS_FreeCString(ctx, key);
 
     if (rc != 0) return JS_ThrowInternalError(ctx, "kv.delete failed (rc=%d)", rc);
@@ -818,6 +830,9 @@ int sjs_register_components(shift_t *sh, sjs_component_ids_t *out) {
     out->resp_status = shift_component_add_ex(sh, sizeof(sjs_resp_status_t),
                                                sjs_resp_status_ctor, NULL, &r);
     if (r != shift_ok) return -1;
+    out->raft_seq = shift_component_add_ex(sh, sizeof(sjs_raft_seq_t),
+                                            NULL, NULL, &r);
+    if (r != shift_ok) return -1;
     return 0;
 }
 
@@ -896,10 +911,14 @@ void sjs_runtime_free(sjs_runtime_t *sjs) {
 
 static void resp_add_header(sjs_resp_headers_t *h,
                             const char *name, const char *value) {
-    if (h->count == h->cap) {
+    if (!h) return;
+    if (h->count >= h->cap || !h->names || !h->values) {
         uint32_t nc = h->cap ? h->cap * 2 : 8;
-        h->names  = realloc(h->names,  nc * sizeof(char *));
-        h->values = realloc(h->values, nc * sizeof(char *));
+        char **nn = realloc(h->names,  nc * sizeof(char *));
+        char **nv = realloc(h->values, nc * sizeof(char *));
+        if (!nn || !nv) return;
+        h->names  = nn;
+        h->values = nv;
         h->cap = nc;
     }
     h->names[h->count]  = strdup(name);
@@ -1420,6 +1439,12 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             sjs_resp_headers_reset(req->resp_hdrs);
             req->resp_st->code = 200;
 
+            /* Clear accumulated Raft write-set from previous attempt */
+            if (req->write_set) {
+                raft_write_set_free(req->write_set);
+                raft_write_set_init(req->write_set);
+            }
+
             free(bc->data);
             bc->data = NULL;
             if (!ck || kv_get(sjs->kv, ck, &bc->data, &bc->len) != 0) {
@@ -1602,8 +1627,23 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         /* Session persistence */
         sjs_session_persist(sjs, req, ctx);
 
+        /* Allocate a WAL-ordered sequence number for raft replication.
+         * Must happen inside the transaction so the seq is ordered
+         * consistently with the KV writes. */
+        if (req->write_set && req->write_set->op_count > 0) {
+            uint64_t seq = kv_next_seq(sjs->kv);
+            if (seq == 0) {
+                kv_rollback(sjs->kv);
+                free(body);
+                arena_reset(sjs);
+                continue;
+            }
+            req->write_set->seq = seq;
+        }
+
         /* Commit — retry on conflict */
         if (kv_commit(sjs->kv) == KV_CONFLICT) {
+            kv_rollback(sjs->kv);
             free(body);
             arena_reset(sjs);
             continue;

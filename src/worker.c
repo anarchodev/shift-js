@@ -5,6 +5,7 @@
 #include "kvstore.h"
 #include "js_runtime.h"
 #include "router.h"
+#include "raft_thread.h"
 
 #include <shift_h2.h>
 #include <shift.h>
@@ -15,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #define MAX_CONNECTIONS 4096
 #define MAX_STREAMS     (MAX_CONNECTIONS * 128)
@@ -339,6 +341,7 @@ void *sjs_worker_fn(void *arg) {
         /* sjs components */
         sjs_comp.resp_headers, sjs_comp.session, sjs_comp.random_tape,
         sjs_comp.route, sjs_comp.bytecode, sjs_comp.resp_status,
+        sjs_comp.raft_seq,
     };
     size_t ncomps = sizeof(all_comps) / sizeof(all_comps[0]);
 
@@ -403,6 +406,29 @@ void *sjs_worker_fn(void *arg) {
     printf("shift-js worker %d: listening on port %d (%s)\n",
            wcfg->worker_id, wcfg->port, tls ? "h2 TLS" : "h2c");
 
+    /* ---- Raft pending collection ---- */
+    /* Only sh2 response components + raft_seq. Moving here from request_out
+     * causes shift to destruct the sjs components (session, tape, route,
+     * bytecode, resp_headers, resp_status) that are not in this collection. */
+    shift_collection_id_t raft_pending = (shift_collection_id_t)-1;
+    if (wcfg->raft) {
+        shift_component_id_t pending_comps[] = {
+            comp.stream_id, comp.session, comp.req_headers, comp.req_body,
+            comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
+            comp.domain_tag,
+            sjs_comp.raft_seq,
+        };
+        shift_collection_info_t ci_rp = {
+            .name       = "raft_pending",
+            .comp_ids   = pending_comps,
+            .comp_count = sizeof(pending_comps) / sizeof(pending_comps[0]),
+        };
+        if (shift_collection_register(sh, &ci_rp, &raft_pending) != shift_ok) {
+            fprintf(stderr, "Worker %d: raft_pending collection register failed\n",
+                    wcfg->worker_id);
+        }
+    }
+
     /* ---- Event loop ---- */
     while (*wcfg->running) {
         if (sh2_poll(h2, 0) != sh2_ok)
@@ -413,6 +439,11 @@ void *sjs_worker_fn(void *arg) {
             shift_entity_t *entities = NULL;
             size_t          count    = 0;
             shift_collection_get_entities(sh, request_out, &entities, &count);
+
+            /* Mark worker idle when not processing requests so the raft
+             * thread's safe_seq isn't held back by stale watermarks. */
+            if (count == 0 && wcfg->raft)
+                raft_worker_idle(wcfg->raft, wcfg->worker_id);
 
             for (size_t i = 0; i < count; i++) {
                 shift_entity_t e = entities[i];
@@ -476,7 +507,39 @@ void *sjs_worker_fn(void *arg) {
                 shift_entity_get_component(sh, e, sjs_comp.route,        (void **)&route);
                 shift_entity_get_component(sh, e, sjs_comp.bytecode,     (void **)&bc);
 
+                /* Back-pressure: reject if raft pipeline is too deep */
+                bool raft_active = (wcfg->raft != NULL);
+                if (raft_active && !raft_has_capacity(wcfg->raft)) {
+                    sh2_status_t *st = NULL;
+                    shift_entity_get_component(sh, e, comp.status, (void **)&st);
+                    st->code = 503;
+
+                    sh2_resp_body_t *rb = NULL;
+                    shift_entity_get_component(sh, e, comp.resp_body, (void **)&rb);
+                    rb->data = strdup("Service Unavailable");
+                    rb->len  = 19;
+
+                    sh2_resp_headers_t *rh = NULL;
+                    shift_entity_get_component(sh, e, comp.resp_headers, (void **)&rh);
+                    rh->fields = NULL;
+                    rh->count  = 0;
+
+                    shift_entity_move_one(sh, e, response_in);
+
+                    free(method_str);
+                    free(path_str);
+                    continue;
+                }
+
+                /* Signal raft we're about to process a request */
+                if (raft_active)
+                    raft_worker_begin(wcfg->raft, wcfg->worker_id);
+
                 /* Build view struct for JS dispatch */
+                raft_write_set_t ws = {0};
+                if (raft_active)
+                    raft_write_set_init(&ws);
+
                 sjs_request_ctx_t req = {
                     .method       = method_str,
                     .path         = path_str,
@@ -489,10 +552,34 @@ void *sjs_worker_fn(void *arg) {
                     .resp_st      = resp_st,
                     .session      = session,
                     .tape         = tape,
+                    .write_set    = raft_active ? &ws : NULL,
+                    .raft         = wcfg->raft,
                 };
 
                 uint32_t body_len = 0;
                 char *body = sjs_dispatch(&sjs, &req, route, bc, &body_len);
+
+                /* Submit write-set to Raft if there are writes.
+                 * ws.seq was set by kv_next_seq inside the committed txn. */
+                uint64_t raft_seq = 0;
+                bool needs_raft_wait = false;
+                if (raft_active && ws.op_count > 0 && ws.seq > 0) {
+                    if (raft_handle_is_leader(wcfg->raft)) {
+                        raft_seq = ws.seq;
+                        raft_propose_writeset(wcfg->raft, &ws);
+                        raft_worker_committed(wcfg->raft, wcfg->worker_id,
+                                              raft_seq);
+                        needs_raft_wait = true;
+                    } else {
+                        /* Not leader — 307 redirect */
+                        resp_st->code = 307;
+                        raft_write_set_free(&ws);
+                    }
+                } else if (raft_active) {
+                    raft_write_set_free(&ws);
+                    /* Read-only request — mark worker idle */
+                    raft_worker_idle(wcfg->raft, wcfg->worker_id);
+                }
 
                 /* Build sh2 response */
                 sh2_status_t *st = NULL;
@@ -529,12 +616,62 @@ void *sjs_worker_fn(void *arg) {
                 rb->data = body;
                 rb->len  = body_len;
 
-                shift_entity_move_one(sh, e, response_in);
+                if (needs_raft_wait && raft_pending != (shift_collection_id_t)-1) {
+                    /* Park entity in raft_pending until committed.
+                     * raft_pending only has sh2 response components + raft_seq,
+                     * so shift will call destructors on the dropped sjs
+                     * components (session, tape, route, bytecode, etc). */
+                    sjs_raft_seq_t *rseq = NULL;
+                    shift_entity_get_component(sh, e, sjs_comp.raft_seq,
+                                                (void **)&rseq);
+                    rseq->seq = raft_seq;
+                    shift_entity_move_one(sh, e, raft_pending);
+                } else {
+                    shift_entity_move_one(sh, e, response_in);
+                }
 
                 free(method_str);
                 free(path_str);
                 /* No manual cleanup needed — sjs component destructors
                  * handle route, session, tape, bytecode on entity destroy. */
+            }
+        }
+
+        /* ---- Release Raft-committed pending responses ---- */
+        if (wcfg->raft && raft_pending != (shift_collection_id_t)-1) {
+            uint64_t committed = raft_committed_seq(wcfg->raft);
+            uint64_t faulted   = raft_faulted_seq(wcfg->raft);
+
+            shift_entity_t *pents = NULL;
+            size_t pcount = 0;
+            shift_collection_get_entities(sh, raft_pending, &pents, &pcount);
+
+            for (size_t p = 0; p < pcount; p++) {
+                shift_entity_t pe = pents[p];
+                sjs_raft_seq_t *rseq = NULL;
+                shift_entity_get_component(sh, pe, sjs_comp.raft_seq,
+                                            (void **)&rseq);
+                if (!rseq) continue;
+
+                if (rseq->seq <= committed) {
+                    /* Committed — send response */
+                    shift_entity_move_one(sh, pe, response_in);
+                } else if (faulted > 0 && rseq->seq <= faulted) {
+                    /* Leader lost — 503 */
+                    sh2_status_t *pst = NULL;
+                    shift_entity_get_component(sh, pe, comp.status,
+                                                (void **)&pst);
+                    pst->code = 503;
+
+                    sh2_resp_body_t *prb = NULL;
+                    shift_entity_get_component(sh, pe, comp.resp_body,
+                                                (void **)&prb);
+                    free(prb->data);
+                    prb->data = strdup("Service Unavailable (leader lost)");
+                    prb->len  = 32;
+
+                    shift_entity_move_one(sh, pe, response_in);
+                }
             }
         }
 
@@ -567,8 +704,10 @@ void *sjs_worker_fn(void *arg) {
     shift_flush(sh);
 
     /* Drain remaining entities — destructors handle cleanup */
-    shift_collection_id_t drain[] = { request_out, response_in, response_result_out };
-    for (int c = 0; c < 3; c++) {
+    shift_collection_id_t drain[] = { request_out, response_in, response_result_out,
+                                       raft_pending };
+    int drain_count = (raft_pending != (shift_collection_id_t)-1) ? 4 : 3;
+    for (int c = 0; c < drain_count; c++) {
         shift_entity_t *ents = NULL;
         size_t cnt = 0;
         shift_collection_get_entities(sh, drain[c], &ents, &cnt);

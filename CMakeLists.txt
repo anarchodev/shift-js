@@ -35,6 +35,11 @@ FetchContent_Declare(dmon
     GIT_TAG        master
 )
 
+FetchContent_Declare(raft
+    GIT_REPOSITORY https://github.com/willemt/raft.git
+    GIT_TAG        master
+)
+
 # -- shift and shift-h2 have their own CMakeLists ---
 set(ENABLE_TLS ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(shift shift_h2)
@@ -65,6 +70,21 @@ if(NOT dmon_POPULATED)
     FetchContent_Populate(dmon)
 endif()
 
+# -- raft: Raft consensus library (willemt/raft) -------------------------
+FetchContent_GetProperties(raft)
+if(NOT raft_POPULATED)
+    FetchContent_Populate(raft)
+endif()
+
+add_library(raft STATIC
+    ${raft_SOURCE_DIR}/src/raft_server.c
+    ${raft_SOURCE_DIR}/src/raft_server_properties.c
+    ${raft_SOURCE_DIR}/src/raft_node.c
+    ${raft_SOURCE_DIR}/src/raft_log.c
+)
+target_include_directories(raft PUBLIC ${raft_SOURCE_DIR}/include)
+target_compile_options(raft PRIVATE -w)
+
 # -- OpenSSL: crypto primitives for Web Crypto API ---------------------
 find_package(OpenSSL REQUIRED)
 
@@ -81,14 +101,20 @@ add_executable(shift-js
     src/ejs.c
     src/session.c
     src/crypto.c
+    src/raft_log.c
+    src/raft_rpc.c
+    src/raft_net.c
+    src/raft_thread.c
 )
 target_include_directories(shift-js PRIVATE src)
 target_link_libraries(shift-js PRIVATE
     shift_h2
     qjs
     sqlite3
+    raft
     OpenSSL::Crypto
     pthread
+    uring
     m
     dl
 )

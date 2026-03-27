@@ -14,6 +14,8 @@ struct kvstore {
     sqlite3_stmt *stmt_begin;
     sqlite3_stmt *stmt_commit;
     sqlite3_stmt *stmt_rollback;
+    sqlite3_stmt *stmt_next_seq;
+    sqlite3_stmt *stmt_seq_trunc;
 };
 
 static const char SQL_CREATE[] =
@@ -29,6 +31,11 @@ static const char SQL_RANGE[]    = "SELECT key, value FROM kv WHERE key >= ? AND
 static const char SQL_BEGIN[]    = "BEGIN;";
 static const char SQL_COMMIT[]   = "COMMIT;";
 static const char SQL_ROLLBACK[] = "ROLLBACK;";
+
+static const char SQL_CREATE_SEQ[] =
+    "CREATE TABLE IF NOT EXISTS kv_seq (id INTEGER PRIMARY KEY AUTOINCREMENT);";
+static const char SQL_NEXT_SEQ[]   = "INSERT INTO kv_seq DEFAULT VALUES;";
+static const char SQL_SEQ_TRUNC[]  = "DELETE FROM kv_seq WHERE id <= ?;";
 
 int kv_open(const char *path, kvstore_t **out) {
     kvstore_t *s = calloc(1, sizeof(*s));
@@ -46,6 +53,9 @@ int kv_open(const char *path, kvstore_t **out) {
     rc = sqlite3_exec(s->db, SQL_CREATE, NULL, NULL, NULL);
     if (rc != SQLITE_OK) goto fail;
 
+    rc = sqlite3_exec(s->db, SQL_CREATE_SEQ, NULL, NULL, NULL);
+    if (rc != SQLITE_OK) goto fail;
+
     if (sqlite3_prepare_v2(s->db, SQL_GET, -1, &s->stmt_get, NULL) != SQLITE_OK)
         goto fail;
     if (sqlite3_prepare_v2(s->db, SQL_PUT, -1, &s->stmt_put, NULL) != SQLITE_OK)
@@ -59,6 +69,10 @@ int kv_open(const char *path, kvstore_t **out) {
     if (sqlite3_prepare_v2(s->db, SQL_COMMIT, -1, &s->stmt_commit, NULL) != SQLITE_OK)
         goto fail;
     if (sqlite3_prepare_v2(s->db, SQL_ROLLBACK, -1, &s->stmt_rollback, NULL) != SQLITE_OK)
+        goto fail;
+    if (sqlite3_prepare_v2(s->db, SQL_NEXT_SEQ, -1, &s->stmt_next_seq, NULL) != SQLITE_OK)
+        goto fail;
+    if (sqlite3_prepare_v2(s->db, SQL_SEQ_TRUNC, -1, &s->stmt_seq_trunc, NULL) != SQLITE_OK)
         goto fail;
 
     *out = s;
@@ -79,6 +93,8 @@ void kv_close(kvstore_t *store) {
     sqlite3_finalize(store->stmt_begin);
     sqlite3_finalize(store->stmt_commit);
     sqlite3_finalize(store->stmt_rollback);
+    sqlite3_finalize(store->stmt_next_seq);
+    sqlite3_finalize(store->stmt_seq_trunc);
     sqlite3_close(store->db);
     free(store);
 }
@@ -221,4 +237,25 @@ void kv_range_free(kv_range_result_t *result) {
     free(result->entries);
     result->entries = NULL;
     result->count = 0;
+}
+
+uint64_t kv_next_seq(kvstore_t *store) {
+    sqlite3_stmt *st = store->stmt_next_seq;
+    sqlite3_reset(st);
+
+    int rc = sqlite3_step(st);
+    sqlite3_reset(st);
+    if (rc != SQLITE_DONE) return 0;
+
+    return (uint64_t)sqlite3_last_insert_rowid(store->db);
+}
+
+int kv_seq_truncate(kvstore_t *store, uint64_t through_seq) {
+    sqlite3_stmt *st = store->stmt_seq_trunc;
+    sqlite3_reset(st);
+    sqlite3_bind_int64(st, 1, (int64_t)through_seq);
+
+    int rc = sqlite3_step(st);
+    sqlite3_reset(st);
+    return (rc == SQLITE_DONE) ? 0 : -2;
 }
