@@ -203,7 +203,7 @@ Workers propose KV write-sets to the Raft leader, which replicates them to follo
 ## Architecture
 
 - **One worker thread per CPU core**, each with its own SQLite connection, QuickJS runtime, and io_uring instance. No shared mutable state.
-- **Snapshot-based runtime isolation**: a frozen JS runtime template is memcpy'd + pointer-relocated per request instead of creating a new runtime. Per-request JS runs on a 10MB bump-allocated arena that is reclaimed wholesale after the request (no GC).
+- **Snapshot-based runtime isolation**: a frozen JS runtime template is created via a two-address diff algorithm (init in two arenas, diff to find pointers vs data). Per-request restore is a memcpy + bitmap-driven pointer relocation. Per-request JS runs on a 10MB bump-allocated arena that is reset wholesale after the request (no GC).
 - **Bytecode caching**: modules are compiled once and cached in the KV store. Subsequent requests load pre-compiled bytecode.
 - **Transactional KV**: each request runs inside a SQLite transaction with automatic retry on conflicts.
 - **Raft replication**: optional clustering where KV mutations are proposed to a leader, batched, replicated via log entries, and committed. Followers receive incremental snapshots for catch-up.
@@ -214,7 +214,7 @@ All fetched automatically via CMake `FetchContent`:
 
 - [shift](https://github.com/) -- ECS framework
 - [shift-h2](https://github.com/) -- HTTP/2 server (io_uring)
-- [quickjs-ng](https://github.com/nicbarker/quickjs-ng) -- JavaScript engine
+- [quickjs-ng](https://github.com/nicbarker/quickjs-ng) -- JavaScript engine (patched for deterministic shape hashing)
 - [SQLite](https://sqlite.org/) -- database (WAL mode)
 - [dmon](https://github.com/nicbarker/dmon) -- filesystem watcher (sjsctl watch)
 - [raft](https://github.com/willemt/raft) -- Raft consensus
