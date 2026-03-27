@@ -4,18 +4,13 @@
     let body = JSON.parse(request.body);
 
     if (body.action === "list") {
-      let files = [];
-      let raw = kv.range("__code/", "__code/\x7f", 10000);
-      if (raw) {
-        for (let entry of raw) {
-          files.push(entry.key.slice(7)); // strip "__code/"
-        }
-      }
+      let entries = code.list();
+      let files = entries.map(e => e.path);
       return { files };
     }
 
     if (body.action === "load") {
-      let content = kv.get("__code/" + body.path);
+      let content = code.get(body.path);
       if (content === undefined || content === null) {
         response.status(404);
         return { error: "not found" };
@@ -24,23 +19,12 @@
     }
 
     if (body.action === "save") {
-      kv.put("__code/" + body.path, body.content);
-      // Invalidate compiled bytecode cache
-      let base = body.path;
-      let dot = base.lastIndexOf(".");
-      let slash = base.lastIndexOf("/");
-      if (dot > slash) base = base.substring(0, dot);
-      kv.delete("__compiled/" + base);
+      code.put(body.path, body.content);
       return { ok: true };
     }
 
     if (body.action === "delete") {
-      kv.delete("__code/" + body.path);
-      let base = body.path;
-      let dot = base.lastIndexOf(".");
-      let slash = base.lastIndexOf("/");
-      if (dot > slash) base = base.substring(0, dot);
-      kv.delete("__compiled/" + base);
+      code.delete(body.path);
       return { ok: true };
     }
 
@@ -49,13 +33,8 @@
   }
 
   // GET: collect file list for initial render
-  let files = [];
-  let raw = kv.range("__code/", "__code/\x7f", 10000);
-  if (raw) {
-    for (let entry of raw) {
-      files.push(entry.key.slice(7));
-    }
-  }
+  let entries = code.list();
+  let files = entries.map(e => e.path);
 %>
 <!DOCTYPE html>
 <html>

@@ -7,6 +7,7 @@
 #include "session.h"
 
 #include <quickjs.h>
+#include <openssl/evp.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -308,6 +309,297 @@ static void js_install_kv(JSContext *ctx) {
                       JS_NewCFunction(ctx, js_kv_range, "range", 3));
 
     JS_SetPropertyStr(ctx, global, "kv", kv_obj);
+    JS_FreeValue(ctx, global);
+}
+
+/* ======================================================================
+ * code global (module source management with content hashing)
+ * ====================================================================== */
+
+/* Compute SHA-256 hex string of content. Returns static thread-local buffer. */
+static const char *sha256_hex(const void *data, size_t len) {
+    static _Thread_local char hex[65];
+    uint8_t digest[32];
+    unsigned int dlen = 0;
+    EVP_Digest(data, len, digest, &dlen, EVP_sha256(), NULL);
+    for (unsigned int i = 0; i < 32; i++)
+        snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    return hex;
+}
+
+static JSValue js_code_get(JSContext *ctx, JSValue this_val,
+                            int argc, JSValue *argv) {
+    kvstore_t *kv = js_get_kv(ctx);
+    if (!kv) return JS_ThrowInternalError(ctx, "kv store not available");
+
+    const char *path = JS_ToCString(ctx, argv[0]);
+    if (!path) return JS_EXCEPTION;
+
+    char raw_key[256];
+    snprintf(raw_key, sizeof(raw_key), "__code/%s", path);
+    JS_FreeCString(ctx, path);
+
+    char pfx_buf[512];
+    const char *actual_key = sjs_prefixed_key(js_get_prefix(ctx), raw_key,
+                                               pfx_buf, sizeof(pfx_buf));
+    if (!actual_key) return JS_ThrowRangeError(ctx, "code path too long");
+
+    void  *value = NULL;
+    size_t vlen  = 0;
+    int rc = kv_get(kv, actual_key, &value, &vlen);
+
+    if (rc == -1) return JS_NULL;
+    if (rc < 0) return JS_ThrowInternalError(ctx, "code.get failed");
+
+    JSValue result = JS_NewStringLen(ctx, value, vlen);
+    free(value);
+    return result;
+}
+
+static JSValue js_code_put(JSContext *ctx, JSValue this_val,
+                            int argc, JSValue *argv) {
+    kvstore_t *kv = js_get_kv(ctx);
+    if (!kv) return JS_ThrowInternalError(ctx, "kv store not available");
+    sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
+
+    const char *path = JS_ToCString(ctx, argv[0]);
+    if (!path) return JS_EXCEPTION;
+    size_t content_len;
+    const char *content = JS_ToCStringLen(ctx, &content_len, argv[1]);
+    if (!content) { JS_FreeCString(ctx, path); return JS_EXCEPTION; }
+
+    const char *prefix = js_get_prefix(ctx);
+
+    /* 1. Write source to __code/<path> */
+    char raw_key[256];
+    snprintf(raw_key, sizeof(raw_key), "__code/%s", path);
+    char pfx_buf[512];
+    const char *code_key = sjs_prefixed_key(prefix, raw_key,
+                                             pfx_buf, sizeof(pfx_buf));
+    if (!code_key) {
+        JS_FreeCString(ctx, path);
+        JS_FreeCString(ctx, content);
+        return JS_ThrowRangeError(ctx, "code path too long");
+    }
+
+    int rc;
+    if (req && req->write_set) {
+        if (req->raft_seq == 0)
+            req->raft_seq = kv_next_seq(kv);
+        rc = kv_put_seq(kv, code_key, content, content_len, req->raft_seq);
+    } else {
+        rc = kv_put(kv, code_key, content, content_len);
+    }
+    if (rc == 0 && req && req->write_set)
+        raft_write_set_add_put(req->write_set, code_key, content,
+                               (uint32_t)content_len);
+
+    /* 2. Compute content hash, store meta and content-addressed blob */
+    if (rc == 0) {
+        const char *hash = sha256_hex(content, content_len);
+
+        /* __code_meta/<path> = hash (latest version pointer) */
+        char meta_raw[256];
+        snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", path);
+        char meta_buf[512];
+        const char *meta_key = sjs_prefixed_key(prefix, meta_raw,
+                                                 meta_buf, sizeof(meta_buf));
+        if (meta_key) {
+            if (req && req->write_set)
+                kv_put_seq(kv, meta_key, hash, 64, req->raft_seq);
+            else
+                kv_put(kv, meta_key, hash, 64);
+            if (req && req->write_set)
+                raft_write_set_add_put(req->write_set, meta_key, hash, 64);
+        }
+
+        /* __code_blob/<hash> = content (immutable, deduplicated) */
+        char blob_raw[128];
+        snprintf(blob_raw, sizeof(blob_raw), "__code_blob/%s", hash);
+        char blob_buf[512];
+        const char *blob_key = sjs_prefixed_key(prefix, blob_raw,
+                                                  blob_buf, sizeof(blob_buf));
+        if (blob_key) {
+            /* Only write if not already present (content-addressed = immutable) */
+            void *existing = NULL;
+            size_t elen = 0;
+            if (kv_get(kv, blob_key, &existing, &elen) != 0) {
+                if (req && req->write_set)
+                    kv_put_seq(kv, blob_key, content, content_len, req->raft_seq);
+                else
+                    kv_put(kv, blob_key, content, content_len);
+                if (req && req->write_set)
+                    raft_write_set_add_put(req->write_set, blob_key, content,
+                                           (uint32_t)content_len);
+            }
+            free(existing);
+        }
+    }
+
+    /* 3. Invalidate bytecode cache: delete __compiled/<base> */
+    if (rc == 0) {
+        char base[256];
+        snprintf(base, sizeof(base), "%s", path);
+        char *dot = strrchr(base, '.');
+        char *slash = strrchr(base, '/');
+        if (dot && (!slash || dot > slash)) *dot = '\0';
+
+        char cache_raw[256];
+        snprintf(cache_raw, sizeof(cache_raw), "__compiled/%s", base);
+        char cache_buf[512];
+        const char *cache_key = sjs_prefixed_key(prefix, cache_raw,
+                                                   cache_buf, sizeof(cache_buf));
+        if (cache_key) {
+            kv_delete(kv, cache_key);
+            if (req && req->write_set)
+                raft_write_set_add_delete(req->write_set, cache_key);
+        }
+    }
+
+    JS_FreeCString(ctx, path);
+    JS_FreeCString(ctx, content);
+
+    if (rc != 0) return JS_ThrowInternalError(ctx, "code.put failed");
+    return JS_TRUE;
+}
+
+static JSValue js_code_delete(JSContext *ctx, JSValue this_val,
+                               int argc, JSValue *argv) {
+    kvstore_t *kv = js_get_kv(ctx);
+    if (!kv) return JS_ThrowInternalError(ctx, "kv store not available");
+    sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
+
+    const char *path = JS_ToCString(ctx, argv[0]);
+    if (!path) return JS_EXCEPTION;
+
+    const char *prefix = js_get_prefix(ctx);
+
+    /* Delete __code/<path> */
+    char raw_key[256];
+    snprintf(raw_key, sizeof(raw_key), "__code/%s", path);
+    char pfx_buf[512];
+    const char *code_key = sjs_prefixed_key(prefix, raw_key,
+                                             pfx_buf, sizeof(pfx_buf));
+    if (!code_key) {
+        JS_FreeCString(ctx, path);
+        return JS_ThrowRangeError(ctx, "code path too long");
+    }
+
+    int rc = kv_delete(kv, code_key);
+    if (rc == 0 && req && req->write_set)
+        raft_write_set_add_delete(req->write_set, code_key);
+
+    /* Delete __code_meta/<path> */
+    char meta_raw[256];
+    snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", path);
+    char meta_buf[512];
+    const char *meta_key = sjs_prefixed_key(prefix, meta_raw,
+                                             meta_buf, sizeof(meta_buf));
+    if (meta_key) {
+        kv_delete(kv, meta_key);
+        if (req && req->write_set)
+            raft_write_set_add_delete(req->write_set, meta_key);
+    }
+
+    /* Delete __compiled/<base> */
+    char base[256];
+    snprintf(base, sizeof(base), "%s", path);
+    char *dot = strrchr(base, '.');
+    char *slash = strrchr(base, '/');
+    if (dot && (!slash || dot > slash)) *dot = '\0';
+
+    char cache_raw[256];
+    snprintf(cache_raw, sizeof(cache_raw), "__compiled/%s", base);
+    char cache_buf[512];
+    const char *cache_key = sjs_prefixed_key(prefix, cache_raw,
+                                               cache_buf, sizeof(cache_buf));
+    if (cache_key) {
+        kv_delete(kv, cache_key);
+        if (req && req->write_set)
+            raft_write_set_add_delete(req->write_set, cache_key);
+    }
+
+    JS_FreeCString(ctx, path);
+
+    if (rc != 0) return JS_ThrowInternalError(ctx, "code.delete failed");
+    return JS_TRUE;
+}
+
+static JSValue js_code_list(JSContext *ctx, JSValue this_val,
+                             int argc, JSValue *argv) {
+    kvstore_t *kv = js_get_kv(ctx);
+    if (!kv) return JS_ThrowInternalError(ctx, "kv store not available");
+
+    const char *prefix = js_get_prefix(ctx);
+
+    char start_raw[] = "__code/";
+    char end_raw[]   = "__code/\x7f";
+    char start_buf[512], end_buf[512];
+    const char *start = sjs_prefixed_key(prefix, start_raw,
+                                          start_buf, sizeof(start_buf));
+    const char *end = sjs_prefixed_key(prefix, end_raw,
+                                        end_buf, sizeof(end_buf));
+    if (!start || !end) return JS_NewArray(ctx);
+
+    kv_range_result_t result;
+    int rc = kv_range(kv, start, end, 10000, &result);
+    if (rc < 0) return JS_NewArray(ctx);
+
+    size_t prefix_len = (prefix && prefix[0]) ? strlen(prefix) : 0;
+
+    JSValue arr = JS_NewArray(ctx);
+    for (size_t i = 0; i < result.count; i++) {
+        JSValue entry = JS_NewObject(ctx);
+        if (JS_IsException(entry)) {
+            kv_range_free(&result);
+            return JS_ThrowInternalError(ctx, "code.list: arena exhausted");
+        }
+        /* Strip prefix + "__code/" (7 chars) to get the module path */
+        const char *full_key = result.entries[i].key + prefix_len + 7;
+        JS_SetPropertyStr(ctx, entry, "path",
+                          JS_NewString(ctx, full_key));
+        JS_SetPropertyStr(ctx, entry, "size",
+                          JS_NewInt64(ctx, (int64_t)result.entries[i].value_len));
+
+        /* Look up content hash from __code_meta/ */
+        char meta_raw[256];
+        snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", full_key);
+        char meta_buf[512];
+        const char *meta_key = sjs_prefixed_key(prefix, meta_raw,
+                                                 meta_buf, sizeof(meta_buf));
+        if (meta_key) {
+            void *hash_val = NULL;
+            size_t hash_len = 0;
+            if (kv_get(kv, meta_key, &hash_val, &hash_len) == 0 && hash_val) {
+                JS_SetPropertyStr(ctx, entry, "content_hash",
+                                  JS_NewStringLen(ctx, hash_val, hash_len));
+                free(hash_val);
+            } else {
+                JS_SetPropertyStr(ctx, entry, "content_hash", JS_NULL);
+            }
+        }
+
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, entry);
+    }
+
+    kv_range_free(&result);
+    return arr;
+}
+
+static void js_install_code(JSContext *ctx) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue code = JS_NewObject(ctx);
+
+    JS_SetPropertyStr(ctx, code, "get",
+                      JS_NewCFunction(ctx, js_code_get, "get", 1));
+    JS_SetPropertyStr(ctx, code, "put",
+                      JS_NewCFunction(ctx, js_code_put, "put", 2));
+    JS_SetPropertyStr(ctx, code, "delete",
+                      JS_NewCFunction(ctx, js_code_delete, "delete", 1));
+    JS_SetPropertyStr(ctx, code, "list",
+                      JS_NewCFunction(ctx, js_code_list, "list", 0));
+
+    JS_SetPropertyStr(ctx, global, "code", code);
     JS_FreeValue(ctx, global);
 }
 
@@ -866,6 +1158,7 @@ static int snapshot_init_runtime(sjs_arena_t *arena,
     js_install_response(ctx);
     js_install_session(ctx);
     js_install_crypto(ctx);
+    js_install_code(ctx);
     js_install_console(ctx);
     js_install_logs(ctx);
 

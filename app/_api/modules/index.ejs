@@ -9,7 +9,7 @@
     }
 
     if (params.path) {
-      let content = kv.get("__code/" + params.path);
+      let content = code.get(params.path);
       if (content === undefined || content === null) {
         response.status(404);
         return { error: "not found" };
@@ -17,14 +17,7 @@
       return { path: params.path, content };
     }
 
-    let files = [];
-    let raw = kv.range("__code/", "__code/\x7f", 10000);
-    if (raw) {
-      for (let entry of raw) {
-        files.push({ path: entry.key.slice(7), size: entry.value.length });
-      }
-    }
-    return { files };
+    return { files: code.list() };
   }
 
   if (request.method === "POST") {
@@ -41,15 +34,7 @@
       return { error: "content is required" };
     }
 
-    kv.put("__code/" + path, content);
-
-    // Invalidate compiled bytecode cache
-    let base = path;
-    let dot = base.lastIndexOf(".");
-    let slash = base.lastIndexOf("/");
-    if (dot > slash) base = base.substring(0, dot);
-    kv.delete("__compiled/" + base);
-
+    code.put(path, content);
     return { ok: true };
   }
 
@@ -61,14 +46,7 @@
       return { error: "path is required" };
     }
 
-    kv.delete("__code/" + path);
-
-    let base = path;
-    let dot = base.lastIndexOf(".");
-    let slash = base.lastIndexOf("/");
-    if (dot > slash) base = base.substring(0, dot);
-    kv.delete("__compiled/" + base);
-
+    code.delete(path);
     return { ok: true };
   }
 
