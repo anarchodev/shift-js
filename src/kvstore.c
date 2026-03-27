@@ -32,7 +32,7 @@ static const char SQL_PUT[]      = "INSERT OR REPLACE INTO kv (key, value) VALUE
 static const char SQL_PUT_SEQ[]  = "INSERT OR REPLACE INTO kv (key, value, seq) VALUES (?, ?, ?);";
 static const char SQL_DEL[]      = "DELETE FROM kv WHERE key = ?;";
 static const char SQL_RANGE[]    = "SELECT key, value FROM kv WHERE key >= ? AND key < ? ORDER BY key LIMIT ?;";
-static const char SQL_DELTA[]    = "SELECT key, value FROM kv WHERE seq > ? ORDER BY seq;";
+static const char SQL_DELTA[]    = "SELECT key, value, seq FROM kv WHERE seq > ? AND seq <= ? ORDER BY seq;";
 static const char SQL_BEGIN[]    = "BEGIN;";
 static const char SQL_COMMIT[]   = "COMMIT;";
 static const char SQL_ROLLBACK[] = "ROLLBACK;";
@@ -284,16 +284,28 @@ int kv_seq_truncate(kvstore_t *store, uint64_t through_seq) {
     return (rc == SQLITE_DONE) ? 0 : -2;
 }
 
-int kv_delta(kvstore_t *store, uint64_t after_seq, kv_range_result_t *out) {
+uint64_t kv_max_seq(kvstore_t *store) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_prepare_v2(store->db, "SELECT MAX(seq) FROM kv;", -1, &st, NULL);
+    uint64_t result = 0;
+    if (sqlite3_step(st) == SQLITE_ROW)
+        result = (uint64_t)sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return result;
+}
+
+int kv_delta(kvstore_t *store, uint64_t after_seq, uint64_t through_seq,
+             kv_delta_result_t *out) {
     out->entries = NULL;
     out->count = 0;
 
     sqlite3_stmt *st = store->stmt_delta;
     sqlite3_reset(st);
     sqlite3_bind_int64(st, 1, (int64_t)after_seq);
+    sqlite3_bind_int64(st, 2, (int64_t)through_seq);
 
     size_t cap = 64;
-    kv_entry_t *entries = malloc(cap * sizeof(kv_entry_t));
+    kv_delta_entry_t *entries = malloc(cap * sizeof(kv_delta_entry_t));
     if (!entries) { sqlite3_reset(st); return -2; }
 
     size_t n = 0;
@@ -301,7 +313,7 @@ int kv_delta(kvstore_t *store, uint64_t after_seq, kv_range_result_t *out) {
     while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
         if (n == cap) {
             cap *= 2;
-            kv_entry_t *tmp = realloc(entries, cap * sizeof(kv_entry_t));
+            kv_delta_entry_t *tmp = realloc(entries, cap * sizeof(kv_delta_entry_t));
             if (!tmp) goto oom;
             entries = tmp;
         }
@@ -315,6 +327,7 @@ int kv_delta(kvstore_t *store, uint64_t after_seq, kv_range_result_t *out) {
         if (!entries[n].key || !entries[n].value) goto oom;
         memcpy(entries[n].value, v, (size_t)vlen);
         entries[n].value_len = (size_t)vlen;
+        entries[n].seq = (uint64_t)sqlite3_column_int64(st, 2);
         n++;
     }
 
@@ -331,6 +344,17 @@ oom:
     free(entries);
     sqlite3_reset(st);
     return -2;
+}
+
+void kv_delta_free(kv_delta_result_t *result) {
+    if (!result) return;
+    for (size_t i = 0; i < result->count; i++) {
+        free(result->entries[i].key);
+        free(result->entries[i].value);
+    }
+    free(result->entries);
+    result->entries = NULL;
+    result->count = 0;
 }
 
 void kv_disable_auto_checkpoint(kvstore_t *store) {

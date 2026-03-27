@@ -84,6 +84,13 @@ struct raft_handle {
     /* willemt/raft server (owned by raft thread, accessed in callbacks) */
     raft_server_t   *_raft;
 
+    /* The committed_seq at the time of the last snapshot. */
+    uint64_t         snapshot_seq;
+
+    /* Per-peer last known KV seq (reported by follower via SNAPSHOT_ACK).
+     * Used to narrow delta snapshots. 0 = unknown, send everything. */
+    uint64_t         peer_kv_seq[MAX_WORKERS]; /* reuse MAX_WORKERS as max peers */
+
     /* Config (owned copies) */
     raft_config_t    config;
 };
@@ -277,47 +284,37 @@ static int cb_send_appendentries(raft_server_t *raft, void *udata,
     return 0;
 }
 
-static int cb_send_snapshot(raft_server_t *raft, void *udata,
-                            raft_node_t *node) {
-    thread_ctx_t *ctx = udata;
-    raft_node_id_t peer_id = raft_node_get_id(node);
+static void send_snap_data(thread_ctx_t *ctx, raft_server_t *raft,
+                           uint32_t peer_id, uint64_t after_seq) {
+    uint64_t through_seq = ctx->handle->snapshot_seq;
+    if (through_seq == 0) through_seq = UINT64_MAX;
 
-    /* Read the KV database file into memory.
-     * The checkpointed DB is the snapshot — it contains all committed
-     * state up to the snapshot index. */
-    const char *db_path = ctx->handle->config.db_path;
-    FILE *f = fopen(db_path, "rb");
-    if (!f) {
-        fprintf(stderr, "raft: snapshot send failed: can't open %s\n", db_path);
-        return -1;
-    }
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (fsize <= 0 || fsize > 256 * 1024 * 1024) {
-        fprintf(stderr, "raft: snapshot send failed: db size %ld\n", fsize);
-        fclose(f);
-        return -1;
+    kv_delta_result_t delta;
+    if (kv_delta(ctx->kv, after_seq, through_seq, &delta) != 0 ||
+        delta.count == 0) {
+        kv_delta_free(&delta);
+        return;
     }
 
-    /* Frame: [4 len][1 type=SNAPSHOT][8 last_term][8 last_idx][db bytes] */
     raft_index_t snap_idx = raft_get_snapshot_last_idx(raft);
     raft_term_t  snap_term = raft_get_snapshot_last_term(raft);
 
-    uint32_t payload_size = 1 + 8 + 8 + (uint32_t)fsize;
+    /* Wire: [4 len][1 SNAP_DATA][8 term][8 idx][4 count]
+     * Per entry: [4 key_len][key][4 value_len][value][8 seq] */
+    uint32_t entries_size = 0;
+    for (size_t i = 0; i < delta.count; i++)
+        entries_size += 4 + (uint32_t)strlen(delta.entries[i].key) +
+                        4 + (uint32_t)delta.entries[i].value_len + 8;
+
+    uint32_t payload_size = 1 + 8 + 8 + 4 + entries_size;
     uint32_t total = 4 + payload_size;
     uint8_t *buf = malloc(total);
-    if (!buf) { fclose(f); return -1; }
+    if (!buf) { kv_delta_free(&delta); return; }
 
-    /* Length header */
     uint32_t nlen = htonl(payload_size);
     memcpy(buf, &nlen, 4);
+    buf[4] = RAFT_MSG_SNAP_DATA;
 
-    /* Type */
-    buf[4] = RAFT_MSG_SNAPSHOT;
-
-    /* Snapshot metadata */
     uint8_t *p = buf + 5;
     uint32_t hi, lo;
     hi = htonl((uint32_t)((uint64_t)snap_term >> 32));
@@ -329,20 +326,72 @@ static int cb_send_snapshot(raft_server_t *raft, void *udata,
     memcpy(p, &hi, 4); p += 4;
     memcpy(p, &lo, 4); p += 4;
 
-    /* DB contents */
-    if (fread(p, 1, (size_t)fsize, f) != (size_t)fsize) {
-        fprintf(stderr, "raft: snapshot send failed: read error\n");
-        fclose(f);
-        free(buf);
-        return -1;
-    }
-    fclose(f);
+    uint32_t ncount = htonl((uint32_t)delta.count);
+    memcpy(p, &ncount, 4); p += 4;
 
-    raft_net_send(ctx->net, (uint32_t)peer_id, buf, total);
+    for (size_t i = 0; i < delta.count; i++) {
+        uint32_t klen = (uint32_t)strlen(delta.entries[i].key);
+        uint32_t nkl = htonl(klen);
+        memcpy(p, &nkl, 4); p += 4;
+        memcpy(p, delta.entries[i].key, klen); p += klen;
+
+        uint32_t vlen = (uint32_t)delta.entries[i].value_len;
+        uint32_t nvl = htonl(vlen);
+        memcpy(p, &nvl, 4); p += 4;
+        memcpy(p, delta.entries[i].value, vlen); p += vlen;
+
+        hi = htonl((uint32_t)(delta.entries[i].seq >> 32));
+        lo = htonl((uint32_t)(delta.entries[i].seq & 0xFFFFFFFF));
+        memcpy(p, &hi, 4); p += 4;
+        memcpy(p, &lo, 4); p += 4;
+    }
+
+    size_t delta_count = delta.count;
+    kv_delta_free(&delta);
+
+    raft_net_send(ctx->net, peer_id, buf, total);
     free(buf);
 
-    fprintf(stderr, "raft: sent snapshot to node %d (idx=%ld, %ld bytes)\n",
-            (int)peer_id, (long)snap_idx, fsize);
+    fprintf(stderr, "raft: sent snap data to node %u "
+            "(idx=%ld, %zu entries, %u bytes)\n",
+            peer_id, (long)snap_idx, delta_count, total);
+}
+
+static int cb_send_snapshot(raft_server_t *raft, void *udata,
+                            raft_node_t *node) {
+    thread_ctx_t *ctx = udata;
+    raft_node_id_t peer_id = raft_node_get_id(node);
+
+    /* Lightweight offer: just metadata, no KV data.
+     * The follower will request the actual delta via SNAP_REQ.
+     * Frame: [4 len][1 SNAP_OFFER][8 term][8 idx][8 snapshot_seq] */
+    raft_index_t snap_idx = raft_get_snapshot_last_idx(raft);
+    raft_term_t  snap_term = raft_get_snapshot_last_term(raft);
+
+    uint32_t payload = 1 + 8 + 8 + 8;
+    uint32_t total = 4 + payload;
+    uint8_t buf[4 + 1 + 8 + 8 + 8];
+
+    uint32_t nlen = htonl(payload);
+    memcpy(buf, &nlen, 4);
+    buf[4] = RAFT_MSG_SNAP_OFFER;
+
+    uint8_t *p = buf + 5;
+    uint32_t hi, lo;
+    hi = htonl((uint32_t)((uint64_t)snap_term >> 32));
+    lo = htonl((uint32_t)((uint64_t)snap_term & 0xFFFFFFFF));
+    memcpy(p, &hi, 4); p += 4;
+    memcpy(p, &lo, 4); p += 4;
+    hi = htonl((uint32_t)((uint64_t)snap_idx >> 32));
+    lo = htonl((uint32_t)((uint64_t)snap_idx & 0xFFFFFFFF));
+    memcpy(p, &hi, 4); p += 4;
+    memcpy(p, &lo, 4); p += 4;
+    hi = htonl((uint32_t)(ctx->handle->snapshot_seq >> 32));
+    lo = htonl((uint32_t)(ctx->handle->snapshot_seq & 0xFFFFFFFF));
+    memcpy(p, &hi, 4); p += 4;
+    memcpy(p, &lo, 4); p += 4;
+
+    raft_net_send(ctx->net, (uint32_t)peer_id, buf, total);
     return 0;
 }
 
@@ -469,6 +518,122 @@ static void on_peer_message(uint32_t from_id, const void *data,
     thread_ctx_t *ctx = user_ctx;
     raft_server_t *r = ctx->handle->_raft;
 
+    /* Custom snapshot protocol — handle before raft RPC decode. */
+    if (len >= 1) {
+        uint8_t msg_type = *(const uint8_t *)data;
+
+        /* SNAP_OFFER from leader: respond with SNAP_REQ carrying our max seq. */
+        if (msg_type == RAFT_MSG_SNAP_OFFER && len >= 1 + 8 + 8 + 8) {
+            const uint8_t *sp = (const uint8_t *)data + 1;
+            /* Parse term, idx, snapshot_seq from offer (for logging) */
+            uint32_t shi, slo;
+            memcpy(&shi, sp, 4); sp += 4;
+            memcpy(&slo, sp, 4); sp += 4;
+            /* raft_term_t snap_term (unused for now) */
+            memcpy(&shi, sp, 4); sp += 4;
+            memcpy(&slo, sp, 4); sp += 4;
+            raft_index_t snap_idx = (raft_index_t)(((uint64_t)ntohl(shi) << 32) |
+                                                    (uint64_t)ntohl(slo));
+            /* skip snapshot_seq */
+
+            uint64_t my_seq = kv_max_seq(ctx->kv);
+            fprintf(stderr, "raft: snap offer from node %u (idx=%ld), "
+                    "requesting delta from seq %lu\n",
+                    from_id, (long)snap_idx, (unsigned long)my_seq);
+
+            /* Send SNAP_REQ: [4 len][1 SNAP_REQ][8 my_max_seq] */
+            uint8_t req_buf[4 + 1 + 8];
+            uint32_t rpl = htonl(1 + 8);
+            memcpy(req_buf, &rpl, 4);
+            req_buf[4] = RAFT_MSG_SNAP_REQ;
+            uint32_t rhi = htonl((uint32_t)(my_seq >> 32));
+            uint32_t rlo = htonl((uint32_t)(my_seq & 0xFFFFFFFF));
+            memcpy(req_buf + 5, &rhi, 4);
+            memcpy(req_buf + 9, &rlo, 4);
+            raft_net_send(ctx->net, from_id, req_buf, sizeof(req_buf));
+            return;
+        }
+
+        /* SNAP_REQ from follower: send the actual delta data. */
+        if (msg_type == RAFT_MSG_SNAP_REQ && len >= 1 + 8) {
+            const uint8_t *sp = (const uint8_t *)data + 1;
+            uint32_t shi, slo;
+            memcpy(&shi, sp, 4); sp += 4;
+            memcpy(&slo, sp, 4);
+            uint64_t after_seq = ((uint64_t)ntohl(shi) << 32) |
+                                  (uint64_t)ntohl(slo);
+            /* Update per-peer seq for future reference */
+            if (from_id < MAX_WORKERS)
+                ctx->handle->peer_kv_seq[from_id] = after_seq;
+            send_snap_data(ctx, r, from_id, after_seq);
+            return;
+        }
+
+        /* SNAP_DATA from leader: apply the delta and load snapshot. */
+        if (msg_type == RAFT_MSG_SNAP_DATA && len >= 1 + 8 + 8 + 4) {
+            const uint8_t *sp = (const uint8_t *)data + 1;
+            uint32_t shi, slo;
+            memcpy(&shi, sp, 4); sp += 4;
+            memcpy(&slo, sp, 4); sp += 4;
+            raft_term_t snap_term = (raft_term_t)(((uint64_t)ntohl(shi) << 32) |
+                                                   (uint64_t)ntohl(slo));
+            memcpy(&shi, sp, 4); sp += 4;
+            memcpy(&slo, sp, 4); sp += 4;
+            raft_index_t snap_idx = (raft_index_t)(((uint64_t)ntohl(shi) << 32) |
+                                                    (uint64_t)ntohl(slo));
+            uint32_t ncount;
+            memcpy(&ncount, sp, 4); sp += 4;
+            uint32_t entry_count = ntohl(ncount);
+
+            fprintf(stderr, "raft: snap data from node %u "
+                    "(term=%ld, idx=%ld, %u entries)\n",
+                    from_id, (long)snap_term, (long)snap_idx, entry_count);
+
+            kv_begin(ctx->kv);
+            for (uint32_t i = 0; i < entry_count; i++) {
+                uint32_t nkl;
+                memcpy(&nkl, sp, 4); sp += 4;
+                uint32_t klen = ntohl(nkl);
+                char *key = malloc(klen + 1);
+                if (!key) break;
+                memcpy(key, sp, klen);
+                key[klen] = '\0';
+                sp += klen;
+
+                uint32_t nvl;
+                memcpy(&nvl, sp, 4); sp += 4;
+                uint32_t vlen = ntohl(nvl);
+                const void *val = sp;
+                sp += vlen;
+
+                uint32_t shi2, slo2;
+                memcpy(&shi2, sp, 4); sp += 4;
+                memcpy(&slo2, sp, 4); sp += 4;
+                uint64_t entry_seq = ((uint64_t)ntohl(shi2) << 32) |
+                                      (uint64_t)ntohl(slo2);
+
+                kv_put_seq(ctx->kv, key, val, vlen, entry_seq);
+                free(key);
+            }
+            kv_commit(ctx->kv);
+
+            if (raft_begin_load_snapshot(r, snap_term, snap_idx) == 0) {
+                for (uint32_t i = 0; i < ctx->handle->config.node_count; i++) {
+                    raft_node_t *n = raft_get_node(r, (raft_node_id_t)i);
+                    if (n) {
+                        raft_node_set_active(n, 1);
+                        raft_node_set_voting_committed(n, 1);
+                        raft_node_set_addition_committed(n, 1);
+                    }
+                }
+                raft_end_load_snapshot(r);
+            }
+
+            fprintf(stderr, "raft: snap applied (%u entries)\n", entry_count);
+            return;
+        }
+    }
+
     raft_wire_msg_t msg;
     if (raft_rpc_decode(data, len, &msg) != 0)
         return;
@@ -494,7 +659,6 @@ static void on_peer_message(uint32_t from_id, const void *data,
     case RAFT_MSG_APPEND_REQ: {
         msg_appendentries_response_t resp;
         raft_recv_appendentries(r, node, &msg.append_req, &resp);
-        /* Free decoded entries */
         for (int i = 0; i < msg.append_req.n_entries; i++)
             free(msg.append_req.entries[i].data.buf);
         free(msg.append_req.entries);
@@ -509,58 +673,6 @@ static void on_peer_message(uint32_t from_id, const void *data,
     case RAFT_MSG_APPEND_RESP:
         raft_recv_appendentries_response(r, node, &msg.append_resp);
         break;
-    case RAFT_MSG_SNAPSHOT: {
-        /* Snapshot received from leader: replace KV DB and load into raft. */
-        if (len < 1 + 8 + 8) break;
-        const uint8_t *sp = (const uint8_t *)data + 1; /* skip type byte */
-        uint32_t shi, slo;
-        memcpy(&shi, sp, 4); sp += 4;
-        memcpy(&slo, sp, 4); sp += 4;
-        raft_term_t snap_term = (raft_term_t)(((uint64_t)ntohl(shi) << 32) |
-                                               (uint64_t)ntohl(slo));
-        memcpy(&shi, sp, 4); sp += 4;
-        memcpy(&slo, sp, 4); sp += 4;
-        raft_index_t snap_idx = (raft_index_t)(((uint64_t)ntohl(shi) << 32) |
-                                                (uint64_t)ntohl(slo));
-        uint32_t db_size = len - 1 - 16;
-        const void *db_data = sp;
-
-        fprintf(stderr, "raft: received snapshot from node %u "
-                "(term=%ld, idx=%ld, %u bytes)\n",
-                from_id, (long)snap_term, (long)snap_idx, db_size);
-
-        /* Close existing KV connection, write new DB, reopen */
-        if (ctx->kv) { kv_close(ctx->kv); ctx->kv = NULL; }
-
-        FILE *f = fopen(ctx->handle->config.db_path, "wb");
-        if (f) {
-            fwrite(db_data, 1, db_size, f);
-            fclose(f);
-        }
-
-        if (kv_open(ctx->handle->config.db_path, &ctx->kv) != 0) {
-            fprintf(stderr, "raft: failed to reopen kv after snapshot\n");
-            break;
-        }
-        kv_disable_auto_checkpoint(ctx->kv);
-
-        /* Tell the raft library about the loaded snapshot */
-        if (raft_begin_load_snapshot(r, snap_term, snap_idx) == 0) {
-            /* Re-add all nodes (required by the library) */
-            for (uint32_t i = 0; i < ctx->handle->config.node_count; i++) {
-                raft_node_t *n = raft_get_node(r, (raft_node_id_t)i);
-                if (n) {
-                    raft_node_set_active(n, 1);
-                    raft_node_set_voting_committed(n, 1);
-                    raft_node_set_addition_committed(n, 1);
-                }
-            }
-            raft_end_load_snapshot(r);
-        }
-
-        fprintf(stderr, "raft: snapshot loaded (idx=%ld)\n", (long)snap_idx);
-        break;
-    }
     default:
         break;
     }
@@ -864,10 +976,15 @@ static void *raft_thread_fn(void *arg) {
             raft_index_t commit_idx = raft_get_commit_idx(r);
             if (commit_idx > raft_get_snapshot_last_idx(r)) {
                 if (raft_begin_snapshot(r, RAFT_SNAPSHOT_NONBLOCKING_APPLY) == 0) {
-                    /* Compact kv_seq rows up to committed seq */
                     uint64_t cs = atomic_load(&handle->committed_seq);
+                    /* Record the seq boundary for delta snapshots.
+                     * Don't truncate kv_seq rows below this — we need
+                     * the seq column on kv rows for delta queries.
+                     * Only truncate the kv_seq table itself (the
+                     * autoincrement generator rows, not the kv.seq column). */
                     if (cs > 0)
                         kv_seq_truncate(ctx.kv, cs);
+                    handle->snapshot_seq = cs;
                     kv_checkpoint(ctx.kv);
                     raft_end_snapshot(r);
                     last_checkpoint = t;
