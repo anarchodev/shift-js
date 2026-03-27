@@ -2561,23 +2561,56 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             replay_capture_finalize(&cap->math_random_tape);
             replay_capture_finalize(&cap->module_tree);
 
-            /* Build request data JSON */
+            /* Build request data JSON via QuickJS JSON.stringify */
             char *req_json = NULL;
             {
-                size_t cap_size = 256 + (req->body_len * 2);
-                for (uint32_t h = 0; h < req->header_count; h++)
-                    cap_size += req->headers[h].name_len + req->headers[h].value_len + 20;
-                req_json = malloc(cap_size);
-                size_t pos = 0;
-                pos += snprintf(req_json + pos, cap_size - pos,
-                    "{\"method\":\"%s\",\"path\":\"%s\",\"session\":",
-                    req->method, req->path);
-                if (cap->session_json)
-                    pos += snprintf(req_json + pos, cap_size - pos,
-                        "%s", cap->session_json);
+                JSValue obj = JS_NewObject(ctx);
+                JS_SetPropertyStr(ctx, obj, "method",
+                    JS_NewString(ctx, req->method));
+                JS_SetPropertyStr(ctx, obj, "path",
+                    JS_NewString(ctx, req->path));
+                if (req->body && req->body_len > 0)
+                    JS_SetPropertyStr(ctx, obj, "body",
+                        JS_NewStringLen(ctx, req->body, req->body_len));
                 else
-                    pos += snprintf(req_json + pos, cap_size - pos, "null");
-                pos += snprintf(req_json + pos, cap_size - pos, "}");
+                    JS_SetPropertyStr(ctx, obj, "body", JS_NULL);
+
+                /* Headers */
+                JSValue hdrs = JS_NewObject(ctx);
+                for (uint32_t h = 0; h < req->header_count; h++) {
+                    char name[256];
+                    size_t nlen = req->headers[h].name_len;
+                    if (nlen >= sizeof(name)) nlen = sizeof(name) - 1;
+                    memcpy(name, req->headers[h].name, nlen);
+                    name[nlen] = '\0';
+                    JS_SetPropertyStr(ctx, hdrs, name,
+                        JS_NewStringLen(ctx, req->headers[h].value,
+                                        req->headers[h].value_len));
+                }
+                JS_SetPropertyStr(ctx, obj, "headers", hdrs);
+
+                /* Session */
+                if (cap->session_json) {
+                    JSValue global2 = JS_GetGlobalObject(ctx);
+                    JSValue json2 = JS_GetPropertyStr(ctx, global2, "JSON");
+                    JSValue parse2 = JS_GetPropertyStr(ctx, json2, "parse");
+                    JSValue sjs2 = JS_NewString(ctx, cap->session_json);
+                    JSValue parsed = JS_Call(ctx, parse2, json2, 1, &sjs2);
+                    JS_SetPropertyStr(ctx, obj, "session",
+                        JS_IsException(parsed) ? JS_NULL : parsed);
+                } else {
+                    JS_SetPropertyStr(ctx, obj, "session", JS_NULL);
+                }
+
+                JSValue global2 = JS_GetGlobalObject(ctx);
+                JSValue json2 = JS_GetPropertyStr(ctx, global2, "JSON");
+                JSValue stringify2 = JS_GetPropertyStr(ctx, json2, "stringify");
+                JSValue result = JS_Call(ctx, stringify2, json2, 1, &obj);
+                if (JS_IsString(result)) {
+                    const char *s = JS_ToCString(ctx, result);
+                    req_json = strdup(s);
+                    JS_FreeCString(ctx, s);
+                }
             }
 
             /* Build response data JSON */
