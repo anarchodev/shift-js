@@ -1,9 +1,6 @@
 #define _GNU_SOURCE
 
 #include "worker.h"
-#include "preprocessor.h"
-#include "ejs.h"
-#include "typescript.h"
 #include "raft_thread.h"
 
 #include <getopt.h>
@@ -30,6 +27,10 @@ static void usage(const char *prog) {
             "  -t           Enable TLS (certs loaded from KV)\n"
             "  -h           Show this help\n"
             "\n"
+            "Auth options:\n"
+            "  --auth-secret <key>    HMAC secret for auth cookies\n"
+            "  --mgmt-secret <key>    Secret for /_mgmt/ endpoints (defaults to auth-secret)\n"
+            "\n"
             "Raft options (enables clustering when --raft-id is set):\n"
             "  --raft-id <N>          This node's index (0-based)\n"
             "  --raft-peers <addrs>   Comma-separated host:port for all nodes\n"
@@ -41,7 +42,6 @@ static void usage(const char *prog) {
  * Returns node count, or 0 on error. */
 static uint32_t parse_peers(const char *str,
                             const char ***out_hosts, uint16_t **out_ports) {
-    /* Count commas to determine node count */
     uint32_t count = 1;
     for (const char *p = str; *p; p++)
         if (*p == ',') count++;
@@ -67,43 +67,54 @@ static uint32_t parse_peers(const char *str,
 }
 
 int main(int argc, char **argv) {
-    const char *db_path = "shift-js.db";
-    uint16_t    port    = 9000;
-    int         nworkers = 0;
-    bool        tls      = false;
+    const char *db_path     = "shift-js.db";
+    uint16_t    port        = 9000;
+    int         nworkers    = 0;
+    bool        tls         = false;
+    const char *auth_secret = NULL;
+    const char *mgmt_secret = NULL;
+    const char *log_server  = NULL;
 
     /* Raft options */
-    int         raft_id    = -1;  /* -1 = disabled */
+    int         raft_id    = -1;
     const char *raft_peers = NULL;
     uint16_t    raft_port  = 9100;
     int         batch_ms   = 2;
     int         batch_max  = 256;
 
     static struct option long_opts[] = {
-        { "raft-id",    required_argument, NULL, 'R' },
-        { "raft-peers", required_argument, NULL, 'P' },
-        { "raft-port",  required_argument, NULL, 'Q' },
-        { "batch-ms",   required_argument, NULL, 'B' },
-        { "batch-max",  required_argument, NULL, 'M' },
+        { "auth-secret", required_argument, NULL, 'S' },
+        { "mgmt-secret", required_argument, NULL, 'G' },
+        { "log-server",  required_argument, NULL, 'L' },
+        { "raft-id",     required_argument, NULL, 'R' },
+        { "raft-peers",  required_argument, NULL, 'P' },
+        { "raft-port",   required_argument, NULL, 'Q' },
+        { "batch-ms",    required_argument, NULL, 'B' },
+        { "batch-max",   required_argument, NULL, 'M' },
         { NULL, 0, NULL, 0 },
     };
 
     int opt;
     while ((opt = getopt_long(argc, argv, "d:p:w:th", long_opts, NULL)) != -1) {
         switch (opt) {
-        case 'd': db_path    = optarg; break;
-        case 'p': port       = (uint16_t)atoi(optarg); break;
-        case 'w': nworkers   = atoi(optarg); break;
-        case 't': tls        = true; break;
+        case 'd': db_path     = optarg; break;
+        case 'p': port        = (uint16_t)atoi(optarg); break;
+        case 'w': nworkers    = atoi(optarg); break;
+        case 't': tls         = true; break;
         case 'h': usage(argv[0]); return 0;
-        case 'R': raft_id    = atoi(optarg); break;
-        case 'P': raft_peers = optarg; break;
-        case 'Q': raft_port  = (uint16_t)atoi(optarg); break;
-        case 'B': batch_ms   = atoi(optarg); break;
-        case 'M': batch_max  = atoi(optarg); break;
+        case 'S': auth_secret = optarg; break;
+        case 'G': mgmt_secret = optarg; break;
+        case 'L': log_server  = optarg; break;
+        case 'R': raft_id     = atoi(optarg); break;
+        case 'P': raft_peers  = optarg; break;
+        case 'Q': raft_port   = (uint16_t)atoi(optarg); break;
+        case 'B': batch_ms    = atoi(optarg); break;
+        case 'M': batch_max   = atoi(optarg); break;
         default:  usage(argv[0]); return 1;
         }
     }
+
+    if (!mgmt_secret) mgmt_secret = auth_secret;
 
     long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
     int max_workers = (raft_id >= 0) ? (int)ncpus - 1 : (int)ncpus;
@@ -113,13 +124,6 @@ int main(int argc, char **argv) {
 
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
-
-    /* Preprocessor registry — populated before workers start, read-only after. */
-    sjs_preprocessor_registry_t preprocessors;
-    sjs_preprocessor_init(&preprocessors);
-    sjs_preprocessor_register(&preprocessors, ".ejs", sjs_ejs_transform, NULL);
-    sjs_preprocessor_register(&preprocessors, ".ts",  sjs_typescript_transform, NULL);
-    sjs_preprocessor_register(&preprocessors, ".tsx", sjs_typescript_transform, NULL);
 
     /* ---- Raft setup ---- */
     raft_handle_t *raft = NULL;
@@ -151,7 +155,7 @@ int main(int argc, char **argv) {
             .batch_interval_ms    = (uint64_t)batch_ms,
             .batch_max_entries    = (uint32_t)batch_max,
             .worker_count         = (uint32_t)nworkers,
-            .raft_core            = (uint32_t)ncpus - 1, /* last core */
+            .raft_core            = (uint32_t)ncpus - 1,
             .running              = &g_running,
         };
 
@@ -163,7 +167,6 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* peer_hosts/ports are copied by raft_handle_create */
         for (uint32_t i = 0; i < node_count; i++) free((char *)peer_hosts[i]);
         free(peer_hosts);
         free(peer_ports);
@@ -186,7 +189,9 @@ int main(int argc, char **argv) {
             .port        = port,
             .running     = &g_running,
             .tls         = tls,
-            .preprocessors = &preprocessors,
+            .auth_secret = auth_secret,
+            .mgmt_secret = mgmt_secret,
+            .log_server  = log_server,
             .raft        = raft,
         };
         pthread_create(&threads[i], NULL, sjs_worker_fn, &configs[i]);
@@ -195,7 +200,6 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nworkers; i++)
         pthread_join(threads[i], NULL);
 
-    /* Destroy Raft after workers have stopped */
     if (raft)
         raft_handle_destroy(raft);
 

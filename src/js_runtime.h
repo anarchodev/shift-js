@@ -2,10 +2,10 @@
 
 #include "kvstore.h"
 #include "log_db.h"
-#include "preprocessor.h"
+#include "log_forward.h"
 #include "replay_capture.h"
 #include "raft_thread.h"
-#include "typescript.h"
+#include "auth.h"
 #include <shift.h>
 #include <shift_h2.h>
 #include <quickjs.h>
@@ -43,12 +43,11 @@ typedef struct {
     size_t    volatile_count;
 } sjs_snapshot_t;
 
+#define SJS_TREE_HASH_LEN 64
+#define SJS_MAX_TREES 3
+
 /* Per-worker JS state — one per thread, long-lived. */
 typedef struct {
-    /* Long-lived compiler runtime (standard allocator). */
-    JSRuntime *compile_rt;
-    JSContext *compile_ctx;
-
     /* Frozen snapshot for fast per-request context creation. */
     sjs_snapshot_t snapshot;
 
@@ -57,18 +56,21 @@ typedef struct {
 
     kvstore_t *kv;
 
-    /* Set during compilation for module loader prefix. */
-    const char *current_prefix;
-
     /* Set during dispatch for replay capture (module tree recording). */
     sjs_replay_capture_t *current_replay_capture;
 
-    /* Per-worker copy of the preprocessor registry (owns user_data pointers). */
-    sjs_preprocessor_registry_t preprocessors_local;
-    const sjs_preprocessor_registry_t *preprocessors;
+    /* Current active tree hash (updated on /_mgmt/tree/<hash>/activate).
+     * Read once per request for consistent module resolution. */
+    char current_tree_hash[SJS_TREE_HASH_LEN + 1];
 
-    /* TypeScript/Sucrase context (one per worker). */
-    sjs_ts_ctx_t ts_ctx;
+    /* Circular buffer of recent tree hashes for GC. */
+    char tree_history[SJS_MAX_TREES][SJS_TREE_HASH_LEN + 1];
+    int  tree_history_count;
+    int  tree_history_head;
+
+    /* Auth secret for auth.sign()/auth.verify() JS globals. */
+    const char *auth_secret;
+    size_t      auth_secret_len;
 } sjs_runtime_t;
 
 /* ======================================================================
@@ -163,9 +165,11 @@ typedef struct sjs_request_ctx {
     uint64_t             raft_seq;  /* kv_seq for this request, 0 = not yet assigned */
 
     /* Logging */
-    log_db_t            *log_db;       /* per-worker log DB handle */
+    log_db_t            *log_db;       /* per-worker log DB handle (legacy, may be NULL) */
+    log_forwarder_t     *log_fwd;      /* per-worker log forwarder (NULL if no log server) */
     log_batch_t         *log_batch;    /* per-request pending entries */
     uint64_t             request_id;   /* monotonic per-worker counter */
+    int64_t              tenant_id;    /* tenant for log forwarding */
 
     /* Replay capture */
     sjs_replay_capture_t *replay_capture;
@@ -173,8 +177,11 @@ typedef struct sjs_request_ctx {
 
 /* Create/destroy the per-worker runtime. */
 int  sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
-                      const sjs_preprocessor_registry_t *preprocessors);
+                      const char *auth_secret, size_t auth_secret_len);
 void sjs_runtime_free(sjs_runtime_t *sjs);
+
+/* Update the active tree hash. Called from management endpoint handler. */
+void sjs_runtime_activate_tree(sjs_runtime_t *sjs, const char *tree_hash);
 
 /* Register sjs ECS components with the shift context.
  * Call after sh2_register_components(). */

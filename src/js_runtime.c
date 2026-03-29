@@ -1,8 +1,8 @@
 #define _GNU_SOURCE
 #include "js_runtime.h"
+#include "auth.h"
 #include "crypto.h"
 #include "kvstore.h"
-#include "preprocessor.h"
 #include "router.h"
 #include "session.h"
 
@@ -351,279 +351,119 @@ static const char *sha256_hex(const void *data, size_t len) {
     return hex;
 }
 
-static JSValue js_code_get(JSContext *ctx, JSValue this_val,
-                            int argc, JSValue *argv) {
-    kvstore_t *kv = js_get_kv(ctx);
-    if (!kv) return JS_ThrowInternalError(ctx, "kv store not available");
+/* code.* JS API removed — code management handled by shift-code server. */
 
-    const char *path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+/* ======================================================================
+ * auth global (sign/verify tokens)
+ * ====================================================================== */
 
-    char raw_key[256];
-    snprintf(raw_key, sizeof(raw_key), "__code/%s", path);
-    JS_FreeCString(ctx, path);
+static JSValue js_auth_sign(JSContext *ctx, JSValue this_val,
+                             int argc, JSValue *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "auth.sign requires an object");
 
-    char pfx_buf[512];
-    const char *actual_key = sjs_prefixed_key(js_get_prefix(ctx), raw_key,
-                                               pfx_buf, sizeof(pfx_buf));
-    if (!actual_key) return JS_ThrowRangeError(ctx, "code path too long");
+    sjs_runtime_t *sjs = JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
+    if (!sjs || !sjs->auth_secret)
+        return JS_ThrowInternalError(ctx, "auth secret not configured");
 
-    void  *value = NULL;
-    size_t vlen  = 0;
-    int rc = kv_get(kv, actual_key, &value, &vlen);
+    JSValue obj = argv[0];
 
-    if (rc == -1) return JS_NULL;
-    if (rc < 0) return JS_ThrowInternalError(ctx, "code.get failed");
+    /* Extract fields */
+    JSValue tid_val = JS_GetPropertyStr(ctx, obj, "tid");
+    JSValue uid_val = JS_GetPropertyStr(ctx, obj, "uid");
+    JSValue roles_val = JS_GetPropertyStr(ctx, obj, "roles");
+    JSValue exp_val = JS_GetPropertyStr(ctx, obj, "exp");
 
-    JSValue result = JS_NewStringLen(ctx, value, vlen);
-    free(value);
+    int64_t tid = 0;
+    JS_ToInt64(ctx, &tid, tid_val);
+    JS_FreeValue(ctx, tid_val);
+
+    const char *uid = JS_ToCString(ctx, uid_val);
+    JS_FreeValue(ctx, uid_val);
+    if (!uid) return JS_EXCEPTION;
+
+    int64_t exp = 0;
+    JS_ToInt64(ctx, &exp, exp_val);
+    JS_FreeValue(ctx, exp_val);
+
+    /* Extract roles array */
+    size_t role_count = 0;
+    char **roles = NULL;
+    if (JS_IsArray(roles_val)) {
+        JSValue len_val = JS_GetPropertyStr(ctx, roles_val, "length");
+        int64_t len = 0;
+        JS_ToInt64(ctx, &len, len_val);
+        JS_FreeValue(ctx, len_val);
+        role_count = (size_t)len;
+        roles = calloc(role_count, sizeof(char *));
+        for (size_t i = 0; i < role_count; i++) {
+            JSValue rv = JS_GetPropertyUint32(ctx, roles_val, (uint32_t)i);
+            const char *rs = JS_ToCString(ctx, rv);
+            roles[i] = rs ? strdup(rs) : strdup("");
+            JS_FreeCString(ctx, rs);
+            JS_FreeValue(ctx, rv);
+        }
+    }
+    JS_FreeValue(ctx, roles_val);
+
+    sjs_auth_claims_t claims = {
+        .tid = tid, .uid = (char *)uid, .roles = roles,
+        .role_count = role_count, .exp = exp,
+    };
+
+    char *cookie = sjs_auth_sign(&claims, sjs->auth_secret, sjs->auth_secret_len);
+    JS_FreeCString(ctx, uid);
+    for (size_t i = 0; i < role_count; i++) free(roles[i]);
+    free(roles);
+
+    if (!cookie) return JS_ThrowInternalError(ctx, "auth.sign failed");
+
+    JSValue result = JS_NewString(ctx, cookie);
+    free(cookie);
     return result;
 }
 
-static JSValue js_code_put(JSContext *ctx, JSValue this_val,
-                            int argc, JSValue *argv) {
-    kvstore_t *kv = js_get_kv(ctx);
-    if (!kv) return JS_ThrowInternalError(ctx, "kv store not available");
-    sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
-
-    const char *path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
-    size_t content_len;
-    const char *content = JS_ToCStringLen(ctx, &content_len, argv[1]);
-    if (!content) { JS_FreeCString(ctx, path); return JS_EXCEPTION; }
-
-    const char *prefix = js_get_prefix(ctx);
-
-    /* 1. Write source to __code/<path> */
-    char raw_key[256];
-    snprintf(raw_key, sizeof(raw_key), "__code/%s", path);
-    char pfx_buf[512];
-    const char *code_key = sjs_prefixed_key(prefix, raw_key,
-                                             pfx_buf, sizeof(pfx_buf));
-    if (!code_key) {
-        JS_FreeCString(ctx, path);
-        JS_FreeCString(ctx, content);
-        return JS_ThrowRangeError(ctx, "code path too long");
-    }
-
-    int rc;
-    if (req && req->write_set) {
-        if (req->raft_seq == 0)
-            req->raft_seq = kv_next_seq(kv);
-        rc = kv_put_seq(kv, code_key, content, content_len, req->raft_seq);
-    } else {
-        rc = kv_put(kv, code_key, content, content_len);
-    }
-    if (rc == 0 && req && req->write_set)
-        raft_write_set_add_put(req->write_set, code_key, content,
-                               (uint32_t)content_len);
-
-    /* 2. Compute content hash, store meta and content-addressed blob */
-    if (rc == 0) {
-        const char *hash = sha256_hex(content, content_len);
-
-        /* __code_meta/<path> = hash (latest version pointer) */
-        char meta_raw[256];
-        snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", path);
-        char meta_buf[512];
-        const char *meta_key = sjs_prefixed_key(prefix, meta_raw,
-                                                 meta_buf, sizeof(meta_buf));
-        if (meta_key) {
-            if (req && req->write_set)
-                kv_put_seq(kv, meta_key, hash, 64, req->raft_seq);
-            else
-                kv_put(kv, meta_key, hash, 64);
-            if (req && req->write_set)
-                raft_write_set_add_put(req->write_set, meta_key, hash, 64);
-        }
-
-        /* __code_blob/<hash> = content (immutable, deduplicated) */
-        char blob_raw[128];
-        snprintf(blob_raw, sizeof(blob_raw), "__code_blob/%s", hash);
-        char blob_buf[512];
-        const char *blob_key = sjs_prefixed_key(prefix, blob_raw,
-                                                  blob_buf, sizeof(blob_buf));
-        if (blob_key) {
-            /* Only write if not already present (content-addressed = immutable) */
-            void *existing = NULL;
-            size_t elen = 0;
-            if (kv_get(kv, blob_key, &existing, &elen) != 0) {
-                if (req && req->write_set)
-                    kv_put_seq(kv, blob_key, content, content_len, req->raft_seq);
-                else
-                    kv_put(kv, blob_key, content, content_len);
-                if (req && req->write_set)
-                    raft_write_set_add_put(req->write_set, blob_key, content,
-                                           (uint32_t)content_len);
-            }
-            free(existing);
-        }
-    }
-
-    /* 3. Invalidate bytecode cache: delete __compiled/<base> */
-    if (rc == 0) {
-        char base[256];
-        snprintf(base, sizeof(base), "%s", path);
-        char *dot = strrchr(base, '.');
-        char *slash = strrchr(base, '/');
-        if (dot && (!slash || dot > slash)) *dot = '\0';
-
-        char cache_raw[256];
-        snprintf(cache_raw, sizeof(cache_raw), "__compiled/%s", base);
-        char cache_buf[512];
-        const char *cache_key = sjs_prefixed_key(prefix, cache_raw,
-                                                   cache_buf, sizeof(cache_buf));
-        if (cache_key) {
-            kv_delete(kv, cache_key);
-            if (req && req->write_set)
-                raft_write_set_add_delete(req->write_set, cache_key);
-        }
-    }
-
-    JS_FreeCString(ctx, path);
-    JS_FreeCString(ctx, content);
-
-    if (rc != 0) return JS_ThrowInternalError(ctx, "code.put failed");
-    return JS_TRUE;
-}
-
-static JSValue js_code_delete(JSContext *ctx, JSValue this_val,
+static JSValue js_auth_verify(JSContext *ctx, JSValue this_val,
                                int argc, JSValue *argv) {
-    kvstore_t *kv = js_get_kv(ctx);
-    if (!kv) return JS_ThrowInternalError(ctx, "kv store not available");
-    sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
+    if (argc < 1) return JS_ThrowTypeError(ctx, "auth.verify requires a string");
 
-    const char *path = JS_ToCString(ctx, argv[0]);
-    if (!path) return JS_EXCEPTION;
+    sjs_runtime_t *sjs = JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
+    if (!sjs || !sjs->auth_secret)
+        return JS_ThrowInternalError(ctx, "auth secret not configured");
 
-    const char *prefix = js_get_prefix(ctx);
+    const char *cookie = JS_ToCString(ctx, argv[0]);
+    if (!cookie) return JS_EXCEPTION;
 
-    /* Delete __code/<path> */
-    char raw_key[256];
-    snprintf(raw_key, sizeof(raw_key), "__code/%s", path);
-    char pfx_buf[512];
-    const char *code_key = sjs_prefixed_key(prefix, raw_key,
-                                             pfx_buf, sizeof(pfx_buf));
-    if (!code_key) {
-        JS_FreeCString(ctx, path);
-        return JS_ThrowRangeError(ctx, "code path too long");
-    }
+    sjs_auth_claims_t claims;
+    int rc = sjs_auth_verify(cookie, strlen(cookie),
+                              sjs->auth_secret, sjs->auth_secret_len, &claims);
+    JS_FreeCString(ctx, cookie);
 
-    int rc = kv_delete(kv, code_key);
-    if (rc == 0 && req && req->write_set)
-        raft_write_set_add_delete(req->write_set, code_key);
+    if (rc != 0) return JS_NULL;
 
-    /* Delete __code_meta/<path> */
-    char meta_raw[256];
-    snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", path);
-    char meta_buf[512];
-    const char *meta_key = sjs_prefixed_key(prefix, meta_raw,
-                                             meta_buf, sizeof(meta_buf));
-    if (meta_key) {
-        kv_delete(kv, meta_key);
-        if (req && req->write_set)
-            raft_write_set_add_delete(req->write_set, meta_key);
-    }
+    /* Build result object */
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "tid", JS_NewInt64(ctx, claims.tid));
+    JS_SetPropertyStr(ctx, obj, "uid", JS_NewString(ctx, claims.uid));
+    JS_SetPropertyStr(ctx, obj, "exp", JS_NewInt64(ctx, claims.exp));
 
-    /* Delete __compiled/<base> */
-    char base[256];
-    snprintf(base, sizeof(base), "%s", path);
-    char *dot = strrchr(base, '.');
-    char *slash = strrchr(base, '/');
-    if (dot && (!slash || dot > slash)) *dot = '\0';
+    JSValue roles_arr = JS_NewArray(ctx);
+    for (size_t i = 0; i < claims.role_count; i++)
+        JS_SetPropertyUint32(ctx, roles_arr, (uint32_t)i,
+                              JS_NewString(ctx, claims.roles[i]));
+    JS_SetPropertyStr(ctx, obj, "roles", roles_arr);
 
-    char cache_raw[256];
-    snprintf(cache_raw, sizeof(cache_raw), "__compiled/%s", base);
-    char cache_buf[512];
-    const char *cache_key = sjs_prefixed_key(prefix, cache_raw,
-                                               cache_buf, sizeof(cache_buf));
-    if (cache_key) {
-        kv_delete(kv, cache_key);
-        if (req && req->write_set)
-            raft_write_set_add_delete(req->write_set, cache_key);
-    }
-
-    JS_FreeCString(ctx, path);
-
-    if (rc != 0) return JS_ThrowInternalError(ctx, "code.delete failed");
-    return JS_TRUE;
+    sjs_auth_claims_free(&claims);
+    return obj;
 }
 
-static JSValue js_code_list(JSContext *ctx, JSValue this_val,
-                             int argc, JSValue *argv) {
-    kvstore_t *kv = js_get_kv(ctx);
-    if (!kv) return JS_ThrowInternalError(ctx, "kv store not available");
-
-    const char *prefix = js_get_prefix(ctx);
-
-    char start_raw[] = "__code/";
-    char end_raw[]   = "__code/\x7f";
-    char start_buf[512], end_buf[512];
-    const char *start = sjs_prefixed_key(prefix, start_raw,
-                                          start_buf, sizeof(start_buf));
-    const char *end = sjs_prefixed_key(prefix, end_raw,
-                                        end_buf, sizeof(end_buf));
-    if (!start || !end) return JS_NewArray(ctx);
-
-    kv_range_result_t result;
-    int rc = kv_range(kv, start, end, 10000, &result);
-    if (rc < 0) return JS_NewArray(ctx);
-
-    size_t prefix_len = (prefix && prefix[0]) ? strlen(prefix) : 0;
-
-    JSValue arr = JS_NewArray(ctx);
-    for (size_t i = 0; i < result.count; i++) {
-        JSValue entry = JS_NewObject(ctx);
-        if (JS_IsException(entry)) {
-            kv_range_free(&result);
-            return JS_ThrowInternalError(ctx, "code.list: arena exhausted");
-        }
-        /* Strip prefix + "__code/" (7 chars) to get the module path */
-        const char *full_key = result.entries[i].key + prefix_len + 7;
-        JS_SetPropertyStr(ctx, entry, "path",
-                          JS_NewString(ctx, full_key));
-        JS_SetPropertyStr(ctx, entry, "size",
-                          JS_NewInt64(ctx, (int64_t)result.entries[i].value_len));
-
-        /* Look up content hash from __code_meta/ */
-        char meta_raw[256];
-        snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", full_key);
-        char meta_buf[512];
-        const char *meta_key = sjs_prefixed_key(prefix, meta_raw,
-                                                 meta_buf, sizeof(meta_buf));
-        if (meta_key) {
-            void *hash_val = NULL;
-            size_t hash_len = 0;
-            if (kv_get(kv, meta_key, &hash_val, &hash_len) == 0 && hash_val) {
-                JS_SetPropertyStr(ctx, entry, "content_hash",
-                                  JS_NewStringLen(ctx, hash_val, hash_len));
-                free(hash_val);
-            } else {
-                JS_SetPropertyStr(ctx, entry, "content_hash", JS_NULL);
-            }
-        }
-
-        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, entry);
-    }
-
-    kv_range_free(&result);
-    return arr;
-}
-
-static void js_install_code(JSContext *ctx) {
+static void js_install_auth(JSContext *ctx) {
     JSValue global = JS_GetGlobalObject(ctx);
-    JSValue code = JS_NewObject(ctx);
-
-    JS_SetPropertyStr(ctx, code, "get",
-                      JS_NewCFunction(ctx, js_code_get, "get", 1));
-    JS_SetPropertyStr(ctx, code, "put",
-                      JS_NewCFunction(ctx, js_code_put, "put", 2));
-    JS_SetPropertyStr(ctx, code, "delete",
-                      JS_NewCFunction(ctx, js_code_delete, "delete", 1));
-    JS_SetPropertyStr(ctx, code, "list",
-                      JS_NewCFunction(ctx, js_code_list, "list", 0));
-
-    JS_SetPropertyStr(ctx, global, "code", code);
+    JSValue auth = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, auth, "sign",
+                      JS_NewCFunction(ctx, js_auth_sign, "sign", 1));
+    JS_SetPropertyStr(ctx, auth, "verify",
+                      JS_NewCFunction(ctx, js_auth_verify, "verify", 1));
+    JS_SetPropertyStr(ctx, global, "auth", auth);
     JS_FreeValue(ctx, global);
 }
 
@@ -1152,78 +992,7 @@ static void js_install_logs(JSContext *ctx) {
     JS_FreeValue(ctx, global);
 }
 
-/* ======================================================================
- * Module loader (compile context only)
- * ====================================================================== */
-
-static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
-                                      void *opaque) {
-    sjs_runtime_t *sjs = JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
-    kvstore_t *kv = sjs ? sjs->kv : NULL;
-    if (!kv) return NULL;
-
-    void  *source = NULL;
-    size_t source_len = 0;
-    const char *resolved_name = module_name;
-    char *resolved_alloc = NULL;
-
-    /* Check if the module name has a known extension */
-    const char *ext = sjs_path_extension(module_name);
-
-    if (ext) {
-        /* Explicit extension — fetch directly */
-        char raw_key[256];
-        snprintf(raw_key, sizeof(raw_key), "__code/%s", module_name);
-
-        char key_buf[512];
-        const char *key = sjs_prefixed_key(sjs->current_prefix, raw_key,
-                                            key_buf, sizeof(key_buf));
-        if (!key) return NULL;
-
-        if (kv_get(kv, key, &source, &source_len) != 0) return NULL;
-    } else {
-        /* No extension — probe with each registered extension */
-        resolved_alloc = sjs_resolve_with_extensions(
-            sjs->preprocessors, kv, module_name,
-            sjs->current_prefix, &source, &source_len);
-        if (!resolved_alloc) return NULL;
-        resolved_name = resolved_alloc;
-        ext = sjs_path_extension(resolved_name);
-    }
-
-    /* Apply preprocessor if extension has one registered */
-    char  *compile_source = source;
-    size_t compile_len    = source_len;
-
-    const sjs_preprocessor_entry_t *pp = ext
-        ? sjs_preprocessor_find(sjs->preprocessors, ext)
-        : NULL;
-
-    if (pp) {
-        if (pp->transform == sjs_typescript_transform) {
-            sjs_ts_binding_t *binding = pp->user_data;
-            if (binding && binding->ts_ctx)
-                binding->ts_ctx->current_module_path = resolved_name;
-        }
-        size_t js_len;
-        char *js = pp->transform(source, source_len, &js_len, pp->user_data);
-        free(source);
-        if (!js) { free(resolved_alloc); return NULL; }
-        compile_source = js;
-        compile_len    = js_len;
-    }
-
-    JSValue func = JS_Eval(ctx, compile_source, compile_len, resolved_name,
-                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    free(compile_source);
-    free(resolved_alloc);
-
-    if (JS_IsException(func)) return NULL;
-
-    JSModuleDef *mod = JS_VALUE_GET_PTR(func);
-    JS_FreeValue(ctx, func);
-    return mod;
-}
+/* Module loader removed — compilation now handled by shift-code server. */
 
 /* ======================================================================
  * Date.now / Math.random capture overrides
@@ -1299,7 +1068,7 @@ static int snapshot_init_runtime(sjs_arena_t *arena,
     js_install_response(ctx);
     js_install_session(ctx);
     js_install_crypto(ctx);
-    js_install_code(ctx);
+    js_install_auth(ctx);
     js_install_console(ctx);
     js_install_logs(ctx);
 
@@ -1680,51 +1449,25 @@ void sjs_resp_headers_reset(sjs_resp_headers_t *h) {
  * ====================================================================== */
 
 int sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
-                     const sjs_preprocessor_registry_t *preprocessors) {
+                     const char *auth_secret, size_t auth_secret_len) {
     memset(sjs, 0, sizeof(*sjs));
     sjs->kv = kv;
+    sjs->auth_secret = auth_secret;
+    sjs->auth_secret_len = auth_secret_len;
 
-    /* Copy the shared registry so we can patch per-worker user_data. */
-    sjs->preprocessors_local = *preprocessors;
-    sjs->preprocessors = &sjs->preprocessors_local;
-
-    /* Long-lived compiler runtime (standard malloc). */
-    sjs->compile_rt = JS_NewRuntime();
-    if (!sjs->compile_rt) return -1;
-
-    JS_SetRuntimeOpaque(sjs->compile_rt, sjs);
-    JS_SetModuleLoaderFunc(sjs->compile_rt, NULL, sjs_module_loader, NULL);
-
-    sjs->compile_ctx = JS_NewContext(sjs->compile_rt);
-    if (!sjs->compile_ctx) {
-        JS_FreeRuntime(sjs->compile_rt);
-        return -1;
-    }
-
-    /* Initialize Sucrase TypeScript transpiler in the compile context and
-     * patch the per-worker registry entries with the live context pointer. */
-    if (sjs_typescript_init(sjs->compile_ctx, &sjs->ts_ctx) != 0) {
-        fprintf(stderr, "shift-js: failed to initialize Sucrase\n");
-        JS_FreeContext(sjs->compile_ctx);
-        JS_FreeRuntime(sjs->compile_rt);
-        return -1;
-    }
-    for (size_t i = 0; i < sjs->preprocessors_local.count; i++) {
-        sjs_preprocessor_entry_t *e = &sjs->preprocessors_local.entries[i];
-        if (e->transform != sjs_typescript_transform) continue;
-        if (strcmp(e->extension, ".tsx") == 0)
-            e->user_data = &sjs->ts_ctx.tsx_binding;
-        else
-            e->user_data = &sjs->ts_ctx.ts_binding;
+    /* Try to load current tree hash from KV */
+    void *hash_val = NULL;
+    size_t hash_len = 0;
+    if (kv_get(kv, "__tree_current", &hash_val, &hash_len) == 0 && hash_val) {
+        size_t copy_len = hash_len < SJS_TREE_HASH_LEN ? hash_len : SJS_TREE_HASH_LEN;
+        memcpy(sjs->current_tree_hash, hash_val, copy_len);
+        sjs->current_tree_hash[copy_len] = '\0';
+        free(hash_val);
     }
 
     /* Allocate single arena per worker — reset between requests. */
     sjs->arena = malloc(sizeof(sjs_arena_t) + SJS_ARENA_SIZE);
-    if (!sjs->arena) {
-        JS_FreeContext(sjs->compile_ctx);
-        JS_FreeRuntime(sjs->compile_rt);
-        return -1;
-    }
+    if (!sjs->arena) return -1;
     sjs->arena->used = 0;
 
     /* Create the frozen snapshot of a fully-initialized runtime+context.
@@ -1732,8 +1475,6 @@ int sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
     if (snapshot_create(sjs, &sjs->snapshot) != 0) {
         fprintf(stderr, "shift-js: snapshot_create failed\n");
         free(sjs->arena);
-        JS_FreeContext(sjs->compile_ctx);
-        JS_FreeRuntime(sjs->compile_rt);
         return -1;
     }
 
@@ -1742,17 +1483,40 @@ int sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
 
 void sjs_runtime_free(sjs_runtime_t *sjs) {
     snapshot_destroy(&sjs->snapshot);
-    sjs_typescript_free(&sjs->ts_ctx);
-    if (sjs->compile_ctx) {
-        JS_FreeContext(sjs->compile_ctx);
-        sjs->compile_ctx = NULL;
-    }
-    if (sjs->compile_rt) {
-        JS_FreeRuntime(sjs->compile_rt);
-        sjs->compile_rt = NULL;
-    }
     free(sjs->arena);
     sjs->arena = NULL;
+}
+
+void sjs_runtime_activate_tree(sjs_runtime_t *sjs, const char *tree_hash) {
+    /* Store in KV for persistence across restarts */
+    kv_put(sjs->kv, "__tree_current", tree_hash, strlen(tree_hash));
+
+    /* Update in-memory cache */
+    strncpy(sjs->current_tree_hash, tree_hash, SJS_TREE_HASH_LEN);
+    sjs->current_tree_hash[SJS_TREE_HASH_LEN] = '\0';
+
+    /* Add to tree history for GC */
+    int idx = sjs->tree_history_head;
+    char *old_hash = sjs->tree_history[idx];
+
+    /* GC: if slot has an old tree hash, delete its entries */
+    if (old_hash[0] && strcmp(old_hash, tree_hash) != 0) {
+        char start_key[128], end_key[128];
+        snprintf(start_key, sizeof(start_key), "__tree/%s/", old_hash);
+        snprintf(end_key, sizeof(end_key), "__tree/%s/\x7f", old_hash);
+        kv_range_result_t rr = {0};
+        if (kv_range(sjs->kv, start_key, end_key, 10000, &rr) == 0) {
+            for (size_t gi = 0; gi < rr.count; gi++)
+                kv_delete(sjs->kv, rr.entries[gi].key);
+            kv_range_free(&rr);
+        }
+    }
+
+    strncpy(sjs->tree_history[idx], tree_hash, SJS_TREE_HASH_LEN);
+    sjs->tree_history[idx][SJS_TREE_HASH_LEN] = '\0';
+    sjs->tree_history_head = (idx + 1) % SJS_MAX_TREES;
+    if (sjs->tree_history_count < SJS_MAX_TREES)
+        sjs->tree_history_count++;
 }
 
 /* ======================================================================
@@ -1839,124 +1603,7 @@ static JSValue parse_query_string(JSContext *ctx, const char *qs) {
     return obj;
 }
 
-/* ---- helpers: compile and cache a module ---- */
-
-/* Try to resolve, preprocess, compile, and cache a module at base_path.
- * Returns 0 on success (bytecode/bc_len filled), -1 on not found,
- * positive on error (err_body filled, caller sets status). */
-static int compile_module(sjs_runtime_t *sjs, const char *kv_prefix,
-                          const char *base_path, const char *cache_key,
-                          void **bytecode, size_t *bc_len,
-                          char **out_module_path,
-                          char **err_body, uint32_t *err_len) {
-    void  *source = NULL;
-    size_t source_len = 0;
-    char *module_path = sjs_resolve_with_extensions(
-        sjs->preprocessors, sjs->kv, base_path,
-        kv_prefix, &source, &source_len);
-
-    if (!module_path) return -1;   /* not found */
-
-    /* Record module load for replay capture */
-    if (sjs->current_replay_capture) {
-        const char *hash = sha256_hex(source, source_len);
-        replay_capture_module(sjs->current_replay_capture,
-                              module_path, hash);
-    }
-
-    const char *ext = sjs_path_extension(module_path);
-    const sjs_preprocessor_entry_t *pp = ext
-        ? sjs_preprocessor_find(sjs->preprocessors, ext) : NULL;
-
-    char  *compile_source = source;
-    size_t compile_len    = source_len;
-
-    if (pp) {
-        /* Set module path for source map generation */
-        if (pp->transform == sjs_typescript_transform) {
-            sjs_ts_binding_t *binding = pp->user_data;
-            if (binding && binding->ts_ctx)
-                binding->ts_ctx->current_module_path = module_path;
-        }
-
-        size_t js_len;
-        char *js = pp->transform(source, source_len, &js_len, pp->user_data);
-        free(source);
-        if (!js) {
-            free(module_path);
-            *err_body = strdup("Preprocessor Error");
-            *err_len = (uint32_t)strlen(*err_body);
-            return 1;
-        }
-        compile_source = js;
-        compile_len    = js_len;
-
-        /* Store source map in KV if the TypeScript preprocessor produced one */
-        if (pp->transform == sjs_typescript_transform) {
-            sjs_ts_binding_t *binding = pp->user_data;
-            if (binding && binding->last_source_map) {
-                char sm_key[512];
-                snprintf(sm_key, sizeof(sm_key),
-                         "__code_sourcemap/%s", module_path);
-                char pk[512];
-                const char *key = kv_prefixed_key(kv_prefix, sm_key,
-                                                   pk, sizeof(pk));
-                if (key)
-                    kv_put(sjs->kv, key, binding->last_source_map,
-                           binding->last_source_map_len);
-
-                if (sjs->current_replay_capture)
-                    replay_capture_sourcemap(sjs->current_replay_capture,
-                                             module_path,
-                                             binding->last_source_map);
-
-                free(binding->last_source_map);
-                binding->last_source_map = NULL;
-                binding->last_source_map_len = 0;
-            }
-        }
-    }
-
-    sjs->current_prefix = kv_prefix;
-    JSContext *cc = sjs->compile_ctx;
-    JSValue module_val = JS_Eval(cc, compile_source, compile_len,
-                                 module_path,
-                                 JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    free(compile_source);
-    sjs->current_prefix = NULL;
-
-    if (JS_IsException(module_val)) {
-        JSValue exc = JS_GetException(cc);
-        const char *err = JS_ToCString(cc, exc);
-        fprintf(stderr, "shift-js: compile error in %s: %s\n",
-                module_path, err ? err : "(unknown)");
-        asprintf(err_body, "compile error in %s: %s",
-                 module_path, err ? err : "(unknown)");
-        JS_FreeCString(cc, err);
-        JS_FreeValue(cc, exc);
-        free(module_path);
-        *err_len = (uint32_t)strlen(*err_body);
-        return 1;
-    }
-
-    size_t out_bc_len;
-    uint8_t *bc = JS_WriteObject(cc, &out_bc_len, module_val,
-                                 JS_WRITE_OBJ_BYTECODE);
-    JS_FreeValue(cc, module_val);
-
-    if (!bc) {
-        free(module_path);
-        *err_body = strdup("Bytecode Serialization Error");
-        *err_len = (uint32_t)strlen(*err_body);
-        return 1;
-    }
-
-    kv_put(sjs->kv, cache_key, bc, out_bc_len);
-    *bytecode = bc;
-    *bc_len = out_bc_len;
-    *out_module_path = module_path;
-    return 0;
-}
+/* compile_module removed — compilation now handled by shift-code server. */
 
 /* ---- helpers: body extraction (return value → libc heap string) ---- */
 
@@ -2012,7 +1659,7 @@ static char *extract_body_string(JSContext *ctx, sjs_arena_t *arena,
 
 /* ---- route resolution ---- */
 
-/* Resolve route and load/compile bytecode. Populates route and bc components.
+/* Resolve route and load bytecode from the active tree.
  * Returns 0 on success, or an HTTP status code on error (with err_body set). */
 static int sjs_resolve_request_route(sjs_runtime_t *sjs, const char *path,
                               const char *kv_prefix,
@@ -2033,73 +1680,33 @@ static int sjs_resolve_request_route(sjs_runtime_t *sjs, const char *path,
         return 500;
     }
 
-    /* Build cache key */
-    char raw_cache[256];
-    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base_path);
-    char cache_key_buf[512];
-    const char *ck = sjs_prefixed_key(kv_prefix, raw_cache,
-                                       cache_key_buf, sizeof(cache_key_buf));
-    if (!ck) {
+    /* Check if a tree is active */
+    if (!sjs->current_tree_hash[0]) {
+        free(base_path);
+        *err_body = strdup("No active tree");
+        *err_len = (uint32_t)strlen(*err_body);
+        return 503;
+    }
+
+    /* Look up bytecode from __tree/<hash>/<base_path> */
+    char tree_key[512];
+    int n = snprintf(tree_key, sizeof(tree_key), "__tree/%s/%s",
+                     sjs->current_tree_hash, base_path);
+    if (n < 0 || (size_t)n >= sizeof(tree_key)) {
         free(base_path);
         *err_body = strdup("Key Too Long");
         *err_len = (uint32_t)strlen(*err_body);
         return 500;
     }
 
-    /* Try cache hit */
-    if (kv_get(sjs->kv, ck, &bc->data, &bc->len) == 0) {
-        /* Record module in replay capture even on cache hit.
-         * Try each extension to find the __code_meta/ entry. */
-        if (sjs->current_replay_capture) {
-            static const char *exts[] = { ".mjs", ".ejs" };
-            for (int ei = 0; ei < 2; ei++) {
-                char mod_name[256];
-                snprintf(mod_name, sizeof(mod_name), "%s%s", base_path, exts[ei]);
-                char meta_raw[256];
-                snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", mod_name);
-                char meta_buf[512];
-                const char *meta_key = sjs_prefixed_key(kv_prefix, meta_raw,
-                                                         meta_buf, sizeof(meta_buf));
-                if (!meta_key) continue;
-                void *hash_val = NULL;
-                size_t hash_len = 0;
-                if (kv_get(sjs->kv, meta_key, &hash_val, &hash_len) == 0 && hash_val) {
-                    char hash_str[65] = {0};
-                    if (hash_len >= 64) memcpy(hash_str, hash_val, 64);
-                    replay_capture_module(sjs->current_replay_capture,
-                                          mod_name, hash_str);
-                    free(hash_val);
-                    break;
-                }
-            }
-        }
-        goto found;
+    if (kv_get(sjs->kv, tree_key, &bc->data, &bc->len) != 0) {
+        free(base_path);
+        *err_body = strdup("Not Found");
+        *err_len = (uint32_t)strlen(*err_body);
+        return 404;
     }
 
-    /* Cache miss — compile primary route */
-    {
-        char *comp_err = NULL;
-        uint32_t comp_err_len = 0;
-        int rc = compile_module(sjs, kv_prefix, base_path, ck,
-                                &bc->data, &bc->len, &route->module_path,
-                                &comp_err, &comp_err_len);
-        if (rc == 0) goto found;
-        if (rc > 0) {
-            free(base_path);
-            *err_body = comp_err;
-            *err_len = comp_err_len;
-            return 500;
-        }
-    }
-
-    /* Module not found */
-    free(base_path);
-    *err_body = strdup("Not Found");
-    *err_len = (uint32_t)strlen(*err_body);
-    return 404;
-
-found:
-    if (!route->module_path) route->module_path = strdup(base_path);
+    route->module_path = strdup(base_path);
     free(base_path);
     return 0;
 }
@@ -2613,21 +2220,26 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             continue;
         }
 
-        /* Flush pending log entries to log DB (before arena reset,
-         * though msg strings are strdup'd so arena-independent). */
-        if (req->log_batch && req->log_batch->count > 0 && req->log_db) {
-            log_db_flush(req->log_db, (int)(req->request_id >> 48),
-                         req->request_id,
-                         req->session ? req->session->id : NULL,
-                         req->log_batch);
-            /* Free strdup'd messages */
+        /* Flush pending log entries */
+        if (req->log_batch && req->log_batch->count > 0) {
+            if (req->log_fwd) {
+                log_forwarder_send_logs(req->log_fwd, req->tenant_id,
+                    (int)(req->request_id >> 48), req->request_id,
+                    req->session ? req->session->id : NULL,
+                    req->log_batch);
+            } else if (req->log_db) {
+                log_db_flush(req->log_db, (int)(req->request_id >> 48),
+                             req->request_id,
+                             req->session ? req->session->id : NULL,
+                             req->log_batch);
+            }
             for (uint32_t i = 0; i < req->log_batch->count; i++)
                 free((void *)req->log_batch->entries[i].msg);
             req->log_batch->count = 0;
         }
 
-        /* Flush replay capture to log DB */
-        if (req->replay_capture && req->log_db) {
+        /* Flush replay capture */
+        if (req->replay_capture && (req->log_fwd || req->log_db)) {
             sjs_replay_capture_t *cap = req->replay_capture;
 
             /* Finalize JSON array buffers */
@@ -2698,15 +2310,22 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
                     "{\"status\":%d}", req->resp_st->code);
             }
 
-            log_db_flush_replay(req->log_db, req->request_id,
-                req_json, resp_json,
-                cap->kv_tape.data,
-                req->tape ? req->tape->data : NULL,
-                req->tape ? req->tape->len : 0,
-                cap->date_tape.data,
-                cap->math_random_tape.data,
-                cap->module_tree.data,
-                cap->source_maps.data);
+            if (req->log_fwd) {
+                log_forwarder_send_replay(req->log_fwd, req->tenant_id,
+                    req->request_id, req_json, resp_json, cap,
+                    req->tape ? req->tape->data : NULL,
+                    req->tape ? req->tape->len : 0);
+            } else if (req->log_db) {
+                log_db_flush_replay(req->log_db, req->request_id,
+                    req_json, resp_json,
+                    cap->kv_tape.data,
+                    req->tape ? req->tape->data : NULL,
+                    req->tape ? req->tape->len : 0,
+                    cap->date_tape.data,
+                    cap->math_random_tape.data,
+                    cap->module_tree.data,
+                    cap->source_maps.data);
+            }
 
             free(req_json);
             free(resp_json);

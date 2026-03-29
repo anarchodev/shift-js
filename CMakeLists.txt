@@ -114,11 +114,10 @@ add_executable(shift-js
     src/kvstore.c
     src/js_runtime.c
     src/router.c
-    src/preprocessor.c
-    src/ejs.c
-    src/typescript.c
     src/session.c
     src/crypto.c
+    src/auth.c
+    src/log_forward.c
     src/raft_log.c
     src/raft_rpc.c
     src/raft_net.c
@@ -126,13 +125,61 @@ add_executable(shift-js
     src/log_db.c
     src/replay_capture.c
 )
-add_dependencies(shift-js sucrase_bundle)
-target_include_directories(shift-js PRIVATE src ${CMAKE_BINARY_DIR}/generated)
+target_include_directories(shift-js PRIVATE src)
 target_link_libraries(shift-js PRIVATE
     shift_h2
     qjs
     sqlite3
     raft
+    OpenSSL::Crypto
+    pthread
+    uring
+    m
+    dl
+)
+
+# ----------------------------------------------------------------------
+# Code server
+# ----------------------------------------------------------------------
+add_executable(shift-code
+    src/code_server/main.c
+    src/code_server/code_db.c
+    src/code_server/compile.c
+    src/code_server/http_api.c
+    src/code_server/push.c
+    src/preprocessor.c
+    src/ejs.c
+    src/typescript.c
+    src/kvstore.c
+    src/auth.c
+)
+add_dependencies(shift-code sucrase_bundle)
+target_include_directories(shift-code PRIVATE
+    src src/code_server ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(shift-code PRIVATE
+    shift_h2
+    qjs
+    sqlite3
+    OpenSSL::Crypto
+    pthread
+    uring
+    m
+    dl
+)
+
+# ----------------------------------------------------------------------
+# Log server
+# ----------------------------------------------------------------------
+add_executable(shift-log
+    src/log_server/main.c
+    src/log_server/log_store.c
+    src/log_server/http_api.c
+    src/auth.c
+)
+target_include_directories(shift-log PRIVATE src src/log_server)
+target_link_libraries(shift-log PRIVATE
+    shift_h2
+    sqlite3
     OpenSSL::Crypto
     pthread
     uring

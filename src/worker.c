@@ -292,7 +292,8 @@ void *sjs_worker_fn(void *arg) {
 
     /* ---- QuickJS runtime (per-worker) ---- */
     sjs_runtime_t sjs = {0};
-    if (sjs_runtime_init(&sjs, kv, wcfg->preprocessors) != 0) {
+    if (sjs_runtime_init(&sjs, kv, wcfg->auth_secret,
+                         wcfg->auth_secret ? strlen(wcfg->auth_secret) : 0) != 0) {
         fprintf(stderr, "Worker %d: sjs_runtime_init failed\n", wcfg->worker_id);
 #ifdef SH2_HAS_TLS
         if (tls) sh2_tls_config_destroy(tls);
@@ -301,11 +302,24 @@ void *sjs_worker_fn(void *arg) {
         return NULL;
     }
 
-    /* ---- Log DB (per-worker, separate from KV) ---- */
+    /* ---- Log forwarding / local log DB ---- */
+    log_forwarder_t log_fwd = {0};
+    log_fwd.fd = -1;
+    bool has_log_fwd = false;
     log_db_t log_db = {0};
-    if (log_db_open(&log_db, "logs.db") != 0)
-        fprintf(stderr, "Worker %d: log_db_open failed (logging disabled)\n",
-                wcfg->worker_id);
+
+    if (wcfg->log_server) {
+        if (log_forwarder_init(&log_fwd, wcfg->log_server) == 0)
+            has_log_fwd = true;
+        else
+            fprintf(stderr, "Worker %d: log_forwarder_init failed\n",
+                    wcfg->worker_id);
+    }
+    if (!has_log_fwd) {
+        if (log_db_open(&log_db, "logs.db") != 0)
+            fprintf(stderr, "Worker %d: log_db_open failed (logging disabled)\n",
+                    wcfg->worker_id);
+    }
     uint64_t request_counter = 0;
     uint64_t last_log_checkpoint = now_ms();
 
@@ -514,6 +528,80 @@ void *sjs_worker_fn(void *arg) {
                 char *method_str = header_to_str(method_val, method_len);
                 char *path_str   = header_to_str(path_val, path_len);
 
+                /* ---- Management endpoints (/_mgmt/) ---- */
+                if (strncmp(path_str, "/_mgmt/", 7) == 0) {
+                    sh2_status_t *mst = NULL;
+                    sh2_resp_body_t *mrb = NULL;
+                    sh2_resp_headers_t *mrh = NULL;
+                    shift_entity_get_component(sh, e, comp.status, (void **)&mst);
+                    shift_entity_get_component(sh, e, comp.resp_body, (void **)&mrb);
+                    shift_entity_get_component(sh, e, comp.resp_headers, (void **)&mrh);
+                    mrh->fields = NULL;
+                    mrh->count = 0;
+
+                    /* TODO: verify mgmt_secret auth here */
+
+                    const char *mgmt_path = path_str + 7; /* after /_mgmt/ */
+
+                    if (strncmp(mgmt_path, "tree/", 5) == 0) {
+                        const char *tree_rest = mgmt_path + 5;
+
+                        if (strcmp(tree_rest, "current") == 0 &&
+                            strcmp(method_str, "GET") == 0) {
+                            /* GET /_mgmt/tree/current */
+                            mst->code = 200;
+                            mrb->data = strdup(sjs.current_tree_hash);
+                            mrb->len = (uint32_t)strlen(sjs.current_tree_hash);
+
+                        } else if (strlen(tree_rest) > 65 &&
+                                   tree_rest[64] == '/') {
+                            /* /_mgmt/tree/<64-char-hash>/... */
+                            char hash[65];
+                            memcpy(hash, tree_rest, 64);
+                            hash[64] = '\0';
+                            const char *after_hash = tree_rest + 65;
+
+                            if (strcmp(after_hash, "activate") == 0 &&
+                                strcmp(method_str, "POST") == 0) {
+                                /* POST /_mgmt/tree/<hash>/activate */
+                                sjs_runtime_activate_tree(&sjs, hash);
+                                mst->code = 200;
+                                mrb->data = strdup("{\"activated\":true}");
+                                mrb->len = 18;
+
+                            } else if (strcmp(method_str, "POST") == 0 &&
+                                       rqb->data && rqb->len > 0) {
+                                /* POST /_mgmt/tree/<hash>/<module_path> */
+                                char tree_key[512];
+                                snprintf(tree_key, sizeof(tree_key),
+                                         "__tree/%s/%s", hash, after_hash);
+                                kv_put(kv, tree_key, rqb->data, rqb->len);
+                                mst->code = 200;
+                                mrb->data = strdup("{\"stored\":true}");
+                                mrb->len = 15;
+
+                            } else {
+                                mst->code = 404;
+                                mrb->data = strdup("Not Found");
+                                mrb->len = 9;
+                            }
+                        } else {
+                            mst->code = 404;
+                            mrb->data = strdup("Not Found");
+                            mrb->len = 9;
+                        }
+                    } else {
+                        mst->code = 404;
+                        mrb->data = strdup("Not Found");
+                        mrb->len = 9;
+                    }
+
+                    free(method_str);
+                    free(path_str);
+                    shift_entity_move_one(sh, e, response_in);
+                    continue;
+                }
+
                 /* Get sjs component pointers (initialized by constructors) */
                 sjs_resp_headers_t *resp_hdrs = NULL;
                 sjs_resp_status_t  *resp_st   = NULL;
@@ -567,8 +655,10 @@ void *sjs_worker_fn(void *arg) {
                     .write_set    = raft_active ? &ws : NULL,
                     .raft         = wcfg->raft,
                     .log_db       = log_db.db ? &log_db : NULL,
+                    .log_fwd      = has_log_fwd ? &log_fwd : NULL,
                     .log_batch    = &log_batch,
                     .request_id   = rid,
+                    .tenant_id    = (int64_t)tenant_id,
                     .replay_capture = &replay_cap,
                 };
 
@@ -744,6 +834,7 @@ void *sjs_worker_fn(void *arg) {
 
     shift_context_destroy(sh);
     sjs_runtime_free(&sjs);
+    if (has_log_fwd) log_forwarder_close(&log_fwd);
     log_db_close(&log_db);
 #ifdef SH2_HAS_TLS
     if (tls) sh2_tls_config_destroy(tls);
