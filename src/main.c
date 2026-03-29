@@ -3,6 +3,7 @@
 #include "worker.h"
 #include "preprocessor.h"
 #include "ejs.h"
+#include "typescript.h"
 #include "raft_thread.h"
 
 #include <getopt.h>
@@ -116,7 +117,9 @@ int main(int argc, char **argv) {
     /* Preprocessor registry — populated before workers start, read-only after. */
     sjs_preprocessor_registry_t preprocessors;
     sjs_preprocessor_init(&preprocessors);
-    sjs_preprocessor_register(&preprocessors, ".ejs", sjs_ejs_transform);
+    sjs_preprocessor_register(&preprocessors, ".ejs", sjs_ejs_transform, NULL);
+    sjs_preprocessor_register(&preprocessors, ".ts",  sjs_typescript_transform, NULL);
+    sjs_preprocessor_register(&preprocessors, ".tsx", sjs_typescript_transform, NULL);
 
     /* ---- Raft setup ---- */
     raft_handle_t *raft = NULL;

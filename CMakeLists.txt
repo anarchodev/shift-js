@@ -86,6 +86,22 @@ add_library(raft STATIC
 target_include_directories(raft PUBLIC ${raft_SOURCE_DIR}/include)
 target_compile_options(raft PRIVATE -w)
 
+# -- Sucrase: TypeScript transpiler (JS bundle embedded via QuickJS) ---
+set(SUCRASE_JS "${CMAKE_SOURCE_DIR}/vendor/sucrase-bundle.js")
+set(SUCRASE_HEADER "${CMAKE_BINARY_DIR}/generated/sucrase_bundle.h")
+
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
+
+add_custom_command(
+    OUTPUT "${SUCRASE_HEADER}"
+    COMMAND xxd -i sucrase-bundle.js "${SUCRASE_HEADER}"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/vendor"
+    DEPENDS "${SUCRASE_JS}"
+    COMMENT "Generating embedded Sucrase bundle header"
+)
+
+add_custom_target(sucrase_bundle DEPENDS "${SUCRASE_HEADER}")
+
 # -- OpenSSL: crypto primitives for Web Crypto API ---------------------
 find_package(OpenSSL REQUIRED)
 
@@ -100,6 +116,7 @@ add_executable(shift-js
     src/router.c
     src/preprocessor.c
     src/ejs.c
+    src/typescript.c
     src/session.c
     src/crypto.c
     src/raft_log.c
@@ -109,7 +126,8 @@ add_executable(shift-js
     src/log_db.c
     src/replay_capture.c
 )
-target_include_directories(shift-js PRIVATE src)
+add_dependencies(shift-js sucrase_bundle)
+target_include_directories(shift-js PRIVATE src ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(shift-js PRIVATE
     shift_h2
     qjs

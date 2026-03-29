@@ -18,6 +18,7 @@ typedef struct sjs_replay_capture {
     replay_buf_t date_tape;
     replay_buf_t math_random_tape;
     replay_buf_t module_tree;
+    replay_buf_t source_maps;
 
     char        *session_json;     /* session data at request start (malloc'd) */
     size_t       session_json_len;
@@ -49,6 +50,10 @@ void replay_capture_math_random(sjs_replay_capture_t *cap, double value);
 /* Record a module load (path + content hash) */
 void replay_capture_module(sjs_replay_capture_t *cap,
                            const char *path, const char *content_hash);
+
+/* Record a source map (path + JSON source map) */
+void replay_capture_sourcemap(sjs_replay_capture_t *cap,
+                              const char *path, const char *sourcemap_json);
 
 /* Record session state at request start */
 void replay_capture_session(sjs_replay_capture_t *cap,

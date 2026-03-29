@@ -10,20 +10,22 @@ void sjs_preprocessor_init(sjs_preprocessor_registry_t *reg) {
 
 int sjs_preprocessor_register(sjs_preprocessor_registry_t *reg,
                                const char *extension,
-                               sjs_preprocess_fn fn) {
+                               sjs_preprocess_fn fn,
+                               void *user_data) {
     if (reg->count >= SJS_MAX_PREPROCESSORS) return -1;
-    reg->entries[reg->count].extension = extension;
-    reg->entries[reg->count].transform = fn;
+    reg->entries[reg->count].extension  = extension;
+    reg->entries[reg->count].transform  = fn;
+    reg->entries[reg->count].user_data  = user_data;
     reg->count++;
     return 0;
 }
 
-sjs_preprocess_fn sjs_preprocessor_find(const sjs_preprocessor_registry_t *reg,
-                                         const char *extension) {
+const sjs_preprocessor_entry_t *sjs_preprocessor_find(
+    const sjs_preprocessor_registry_t *reg, const char *extension) {
     if (!reg || !extension) return NULL;
     for (size_t i = 0; i < reg->count; i++) {
         if (strcmp(reg->entries[i].extension, extension) == 0)
-            return reg->entries[i].transform;
+            return &reg->entries[i];
     }
     return NULL;
 }

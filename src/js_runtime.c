@@ -1082,12 +1082,13 @@ static JSValue js_logs_replay(JSContext *ctx, JSValue this_val,
     uint8_t *random_tape = NULL;
     size_t random_tape_len = 0;
     char *date_tape = NULL, *math_random_tape = NULL, *module_tree = NULL;
+    char *source_maps = NULL;
 
     if (log_db_get_replay(req->log_db, request_id,
                           &request_data, &response_data, &kv_tape,
                           &random_tape, &random_tape_len,
                           &date_tape, &math_random_tape,
-                          &module_tree) != 0)
+                          &module_tree, &source_maps) != 0)
         return JS_NULL;
 
     JSValue obj = JS_NewObject(ctx);
@@ -1115,6 +1116,7 @@ static JSValue js_logs_replay(JSContext *ctx, JSValue this_val,
     PARSE_JSON_FIELD("date_tape", date_tape);
     PARSE_JSON_FIELD("math_random_tape", math_random_tape);
     PARSE_JSON_FIELD("module_tree", module_tree);
+    PARSE_JSON_FIELD("source_maps", source_maps);
     #undef PARSE_JSON_FIELD
 
     /* random_tape as base64 — for now just hex-encode */
@@ -1193,13 +1195,18 @@ static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
     char  *compile_source = source;
     size_t compile_len    = source_len;
 
-    sjs_preprocess_fn transform = ext
+    const sjs_preprocessor_entry_t *pp = ext
         ? sjs_preprocessor_find(sjs->preprocessors, ext)
         : NULL;
 
-    if (transform) {
+    if (pp) {
+        if (pp->transform == sjs_typescript_transform) {
+            sjs_ts_binding_t *binding = pp->user_data;
+            if (binding && binding->ts_ctx)
+                binding->ts_ctx->current_module_path = resolved_name;
+        }
         size_t js_len;
-        char *js = transform(source, source_len, &js_len);
+        char *js = pp->transform(source, source_len, &js_len, pp->user_data);
         free(source);
         if (!js) { free(resolved_alloc); return NULL; }
         compile_source = js;
@@ -1676,7 +1683,10 @@ int sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
                      const sjs_preprocessor_registry_t *preprocessors) {
     memset(sjs, 0, sizeof(*sjs));
     sjs->kv = kv;
-    sjs->preprocessors = preprocessors;
+
+    /* Copy the shared registry so we can patch per-worker user_data. */
+    sjs->preprocessors_local = *preprocessors;
+    sjs->preprocessors = &sjs->preprocessors_local;
 
     /* Long-lived compiler runtime (standard malloc). */
     sjs->compile_rt = JS_NewRuntime();
@@ -1689,6 +1699,23 @@ int sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
     if (!sjs->compile_ctx) {
         JS_FreeRuntime(sjs->compile_rt);
         return -1;
+    }
+
+    /* Initialize Sucrase TypeScript transpiler in the compile context and
+     * patch the per-worker registry entries with the live context pointer. */
+    if (sjs_typescript_init(sjs->compile_ctx, &sjs->ts_ctx) != 0) {
+        fprintf(stderr, "shift-js: failed to initialize Sucrase\n");
+        JS_FreeContext(sjs->compile_ctx);
+        JS_FreeRuntime(sjs->compile_rt);
+        return -1;
+    }
+    for (size_t i = 0; i < sjs->preprocessors_local.count; i++) {
+        sjs_preprocessor_entry_t *e = &sjs->preprocessors_local.entries[i];
+        if (e->transform != sjs_typescript_transform) continue;
+        if (strcmp(e->extension, ".tsx") == 0)
+            e->user_data = &sjs->ts_ctx.tsx_binding;
+        else
+            e->user_data = &sjs->ts_ctx.ts_binding;
     }
 
     /* Allocate single arena per worker — reset between requests. */
@@ -1715,6 +1742,7 @@ int sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
 
 void sjs_runtime_free(sjs_runtime_t *sjs) {
     snapshot_destroy(&sjs->snapshot);
+    sjs_typescript_free(&sjs->ts_ctx);
     if (sjs->compile_ctx) {
         JS_FreeContext(sjs->compile_ctx);
         sjs->compile_ctx = NULL;
@@ -1837,15 +1865,22 @@ static int compile_module(sjs_runtime_t *sjs, const char *kv_prefix,
     }
 
     const char *ext = sjs_path_extension(module_path);
-    sjs_preprocess_fn transform = ext
+    const sjs_preprocessor_entry_t *pp = ext
         ? sjs_preprocessor_find(sjs->preprocessors, ext) : NULL;
 
     char  *compile_source = source;
     size_t compile_len    = source_len;
 
-    if (transform) {
+    if (pp) {
+        /* Set module path for source map generation */
+        if (pp->transform == sjs_typescript_transform) {
+            sjs_ts_binding_t *binding = pp->user_data;
+            if (binding && binding->ts_ctx)
+                binding->ts_ctx->current_module_path = module_path;
+        }
+
         size_t js_len;
-        char *js = transform(source, source_len, &js_len);
+        char *js = pp->transform(source, source_len, &js_len, pp->user_data);
         free(source);
         if (!js) {
             free(module_path);
@@ -1855,6 +1890,31 @@ static int compile_module(sjs_runtime_t *sjs, const char *kv_prefix,
         }
         compile_source = js;
         compile_len    = js_len;
+
+        /* Store source map in KV if the TypeScript preprocessor produced one */
+        if (pp->transform == sjs_typescript_transform) {
+            sjs_ts_binding_t *binding = pp->user_data;
+            if (binding && binding->last_source_map) {
+                char sm_key[512];
+                snprintf(sm_key, sizeof(sm_key),
+                         "__code_sourcemap/%s", module_path);
+                char pk[512];
+                const char *key = kv_prefixed_key(kv_prefix, sm_key,
+                                                   pk, sizeof(pk));
+                if (key)
+                    kv_put(sjs->kv, key, binding->last_source_map,
+                           binding->last_source_map_len);
+
+                if (sjs->current_replay_capture)
+                    replay_capture_sourcemap(sjs->current_replay_capture,
+                                             module_path,
+                                             binding->last_source_map);
+
+                free(binding->last_source_map);
+                binding->last_source_map = NULL;
+                binding->last_source_map_len = 0;
+            }
+        }
     }
 
     sjs->current_prefix = kv_prefix;
@@ -2363,20 +2423,20 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             goto txn_fail;
         }
 
-        /* ---- Dispatch: check for __render to choose mode ---- */
+        /* ---- Dispatch: check for default export function ---- */
         JSValue ns = JS_GetModuleNamespace(ctx, mod_def);
-        JSValue render_fn = JS_GetPropertyStr(ctx, ns, "__render");
-        bool is_render = JS_IsFunction(ctx, render_fn);
+        JSValue default_fn = JS_GetPropertyStr(ctx, ns, "default");
+        bool is_default_fn = JS_IsFunction(ctx, default_fn);
 
         JSValue ret;
         const char *called_func = NULL;
 
-        if (is_render) {
-            called_func = "__render";
+        if (is_default_fn) {
+            called_func = "default";
             if (!resp_has_header(req->resp_hdrs, "content-type"))
                 resp_add_header(req->resp_hdrs, "content-type", "text/html");
 
-            ret = JS_Call(ctx, render_fn, JS_UNDEFINED, 0, NULL);
+            ret = JS_Call(ctx, default_fn, JS_UNDEFINED, 0, NULL);
         } else {
             /* MJS dispatch: fn required from query (GET) or body (POST) */
             const char *fn_name = NULL;
@@ -2509,8 +2569,23 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
                                          out_len, &err_msg);
         if (err_msg) goto txn_fail;
 
+        /* Auto-prepend <!DOCTYPE html> when default export returns <html>... */
+        if (is_default_fn && body && *out_len >= 5 &&
+            strncasecmp(body, "<html", 5) == 0) {
+            static const char DOCTYPE[] = "<!DOCTYPE html>\n";
+            size_t dt_len = sizeof(DOCTYPE) - 1;
+            char *new_body = malloc(dt_len + *out_len);
+            if (new_body) {
+                memcpy(new_body, DOCTYPE, dt_len);
+                memcpy(new_body + dt_len, body, *out_len);
+                free(body);
+                body = new_body;
+                *out_len += (uint32_t)dt_len;
+            }
+        }
+
         /* JSONP wrapping for API mode GET requests */
-        if (!is_render)
+        if (!is_default_fn)
             sjs_jsonp_wrap(&body, out_len, route->query_string,
                            req->method, req->resp_hdrs);
 
@@ -2560,6 +2635,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             replay_capture_finalize(&cap->date_tape);
             replay_capture_finalize(&cap->math_random_tape);
             replay_capture_finalize(&cap->module_tree);
+            replay_capture_finalize(&cap->source_maps);
 
             /* Build request data JSON via QuickJS JSON.stringify */
             char *req_json = NULL;
@@ -2629,7 +2705,8 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
                 req->tape ? req->tape->len : 0,
                 cap->date_tape.data,
                 cap->math_random_tape.data,
-                cap->module_tree.data);
+                cap->module_tree.data,
+                cap->source_maps.data);
 
             free(req_json);
             free(resp_json);

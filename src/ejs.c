@@ -69,10 +69,12 @@ static const char PREAMBLE[] =
     "function __esc(s){return String(s).replace(/&/g,'&amp;')"
     ".replace(/</g,'&lt;').replace(/>/g,'&gt;')"
     ".replace(/\"/g,'&quot;').replace(/'/g,'&#39;');}\n"
-    "export function __render(){\n"
+    "export default function(){\n"
     "let __out=\"\";\n";
 
-char *sjs_ejs_transform(const char *source, size_t len, size_t *out_len) {
+char *sjs_ejs_transform(const char *source, size_t len, size_t *out_len,
+                         void *user_data) {
+    (void)user_data;
     ejs_buf_t buf;
     buf_init(&buf);
 

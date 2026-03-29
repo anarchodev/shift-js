@@ -11,6 +11,6 @@
  *   <% code  %>   — execute code
  *   <%# comment %> — ignored
  *
- * Generated module exports all HTTP method handlers (get, post, put, patch,
- * destroy, head, options) that each call a shared __render() function. */
-char *sjs_ejs_transform(const char *source, size_t len, size_t *out_len);
+ * Generated module has a default export function that renders the template. */
+char *sjs_ejs_transform(const char *source, size_t len, size_t *out_len,
+                         void *user_data);

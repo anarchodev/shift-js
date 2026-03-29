@@ -5,6 +5,7 @@
 #include "preprocessor.h"
 #include "replay_capture.h"
 #include "raft_thread.h"
+#include "typescript.h"
 #include <shift.h>
 #include <shift_h2.h>
 #include <quickjs.h>
@@ -62,8 +63,12 @@ typedef struct {
     /* Set during dispatch for replay capture (module tree recording). */
     sjs_replay_capture_t *current_replay_capture;
 
-    /* Preprocessor registry (shared, read-only). */
+    /* Per-worker copy of the preprocessor registry (owns user_data pointers). */
+    sjs_preprocessor_registry_t preprocessors_local;
     const sjs_preprocessor_registry_t *preprocessors;
+
+    /* TypeScript/Sucrase context (one per worker). */
+    sjs_ts_ctx_t ts_ctx;
 } sjs_runtime_t;
 
 /* ======================================================================

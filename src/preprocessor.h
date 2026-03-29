@@ -6,13 +6,14 @@
 /* Transform function: takes source bytes, returns malloc'd JS string.
  * Returns NULL on error. Caller frees the result. */
 typedef char *(*sjs_preprocess_fn)(const char *source, size_t len,
-                                    size_t *out_len);
+                                    size_t *out_len, void *user_data);
 
 #define SJS_MAX_PREPROCESSORS 16
 
 typedef struct {
     const char       *extension;   /* e.g. ".ejs" — static string, not owned */
     sjs_preprocess_fn transform;
+    void             *user_data;   /* opaque pointer passed to transform */
 } sjs_preprocessor_entry_t;
 
 typedef struct {
@@ -24,10 +25,11 @@ void sjs_preprocessor_init(sjs_preprocessor_registry_t *reg);
 
 int sjs_preprocessor_register(sjs_preprocessor_registry_t *reg,
                                const char *extension,
-                               sjs_preprocess_fn fn);
+                               sjs_preprocess_fn fn,
+                               void *user_data);
 
-sjs_preprocess_fn sjs_preprocessor_find(const sjs_preprocessor_registry_t *reg,
-                                         const char *extension);
+const sjs_preprocessor_entry_t *sjs_preprocessor_find(
+    const sjs_preprocessor_registry_t *reg, const char *extension);
 
 /* Return pointer to the extension within path (e.g. ".ejs"), or NULL. */
 const char *sjs_path_extension(const char *path);

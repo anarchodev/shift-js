@@ -75,11 +75,13 @@ void replay_capture_init(sjs_replay_capture_t *cap) {
     buf_init(&cap->date_tape);
     buf_init(&cap->math_random_tape);
     buf_init(&cap->module_tree);
+    buf_init(&cap->source_maps);
 
     buf_start_array(&cap->kv_tape);
     buf_start_array(&cap->date_tape);
     buf_start_array(&cap->math_random_tape);
     buf_start_array(&cap->module_tree);
+    buf_start_array(&cap->source_maps);
 }
 
 void replay_capture_free(sjs_replay_capture_t *cap) {
@@ -87,6 +89,7 @@ void replay_capture_free(sjs_replay_capture_t *cap) {
     free(cap->date_tape.data);
     free(cap->math_random_tape.data);
     free(cap->module_tree.data);
+    free(cap->source_maps.data);
     free(cap->session_json);
     memset(cap, 0, sizeof(*cap));
 }
@@ -168,6 +171,19 @@ void replay_capture_module(sjs_replay_capture_t *cap,
         buf_append_json_string(b, content_hash, strlen(content_hash));
     else
         buf_append_str(b, "null");
+    buf_append(b, "}", 1);
+}
+
+void replay_capture_sourcemap(sjs_replay_capture_t *cap,
+                              const char *path, const char *sourcemap_json) {
+    if (!cap) return;
+    replay_buf_t *b = &cap->source_maps;
+    buf_comma(b);
+    buf_append_str(b, "{\"path\":");
+    buf_append_json_string(b, path, strlen(path));
+    /* sourcemap_json is already valid JSON, embed raw */
+    buf_append_str(b, ",\"sourceMap\":");
+    buf_append(b, sourcemap_json, strlen(sourcemap_json));
     buf_append(b, "}", 1);
 }
 

@@ -22,7 +22,8 @@ static const char *SCHEMA_SQL =
     "  random_tape      BLOB,"
     "  date_tape        TEXT NOT NULL,"
     "  math_random_tape TEXT NOT NULL,"
-    "  module_tree      TEXT NOT NULL"
+    "  module_tree      TEXT NOT NULL,"
+    "  source_maps      TEXT"
     ");";
 
 static const char *INSERT_SQL =
@@ -32,8 +33,8 @@ static const char *INSERT_SQL =
 static const char *REPLAY_INSERT_SQL =
     "INSERT OR REPLACE INTO replay_captures "
     "(request_id, request_data, response_data, kv_tape, random_tape, "
-    "date_tape, math_random_tape, module_tree) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+    "date_tape, math_random_tape, module_tree, source_maps) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 int log_db_open(log_db_t *ldb, const char *path) {
     int rc = sqlite3_open(path, &ldb->db);
@@ -133,7 +134,8 @@ int log_db_flush_replay(log_db_t *ldb, uint64_t request_id,
                         const uint8_t *random_tape, size_t random_tape_len,
                         const char *date_tape,
                         const char *math_random_tape,
-                        const char *module_tree) {
+                        const char *module_tree,
+                        const char *source_maps) {
     if (!ldb->db || !ldb->replay_insert_stmt)
         return -1;
 
@@ -154,6 +156,10 @@ int log_db_flush_replay(log_db_t *ldb, uint64_t request_id,
     sqlite3_bind_text(s, 6, date_tape, -1, SQLITE_STATIC);
     sqlite3_bind_text(s, 7, math_random_tape, -1, SQLITE_STATIC);
     sqlite3_bind_text(s, 8, module_tree, -1, SQLITE_STATIC);
+    if (source_maps)
+        sqlite3_bind_text(s, 9, source_maps, -1, SQLITE_STATIC);
+    else
+        sqlite3_bind_null(s, 9);
 
     sqlite3_step(s);
     sqlite3_reset(s);
@@ -169,13 +175,14 @@ int log_db_get_replay(log_db_t *ldb, uint64_t request_id,
                       uint8_t **random_tape, size_t *random_tape_len,
                       char **date_tape,
                       char **math_random_tape,
-                      char **module_tree) {
+                      char **module_tree,
+                      char **source_maps) {
     if (!ldb->db) return -1;
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(ldb->db,
         "SELECT request_data, response_data, kv_tape, random_tape, "
-        "date_tape, math_random_tape, module_tree "
+        "date_tape, math_random_tape, module_tree, source_maps "
         "FROM replay_captures WHERE request_id = ?", -1, &stmt, NULL);
     if (rc != SQLITE_OK) return -1;
 
@@ -205,6 +212,8 @@ int log_db_get_replay(log_db_t *ldb, uint64_t request_id,
     *date_tape = strdup((const char *)sqlite3_column_text(stmt, 4));
     *math_random_tape = strdup((const char *)sqlite3_column_text(stmt, 5));
     *module_tree = strdup((const char *)sqlite3_column_text(stmt, 6));
+    const char *sm = (const char *)sqlite3_column_text(stmt, 7);
+    *source_maps = sm ? strdup(sm) : NULL;
 
     sqlite3_finalize(stmt);
     return 0;
