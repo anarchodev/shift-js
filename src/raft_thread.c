@@ -182,7 +182,8 @@ static int apply_batch(kvstore_t *kv, const void *data, uint32_t data_len,
     uint64_t max_seq = 0;
 
     for (uint32_t i = 0; i < count; i++) {
-        if ((uint32_t)(p - (const uint8_t *)data) + 12 > data_len) return -1;
+        const uint8_t *base = (const uint8_t *)data;
+        if ((size_t)(p - base) + 12 > data_len) return -1;
 
         uint32_t shi, slo;
         memcpy(&shi, p, 4); p += 4;
@@ -195,19 +196,27 @@ static int apply_batch(kvstore_t *kv, const void *data, uint32_t data_len,
         uint32_t op_count = ntohl(noc);
 
         for (uint32_t j = 0; j < op_count; j++) {
+            if ((size_t)(p - base) + 1 > data_len) return -1;
             uint8_t op_type = *p++;
+
+            if ((size_t)(p - base) + 4 > data_len) return -1;
             uint32_t nkl;
             memcpy(&nkl, p, 4); p += 4;
             uint32_t klen = ntohl(nkl);
+
+            if ((size_t)(p - base) + klen + 4 > data_len) return -1;
             char *key = malloc(klen + 1);
             if (!key) return -1;
             memcpy(key, p, klen);
             key[klen] = '\0';
             p += klen;
+
             uint32_t nvl;
             memcpy(&nvl, p, 4); p += 4;
             uint32_t vlen = ntohl(nvl);
+
             if (op_type == RAFT_KV_PUT) {
+                if ((size_t)(p - base) + vlen > data_len) { free(key); return -1; }
                 kv_put_seq(kv, key, p, vlen, seq);
                 p += vlen;
             } else if (op_type == RAFT_KV_DELETE) {
@@ -433,8 +442,12 @@ static int cb_applylog(raft_server_t *raft, void *udata,
     } else {
         /* Follower: apply KV writes from the committed entry. */
         kv_begin(ctx->kv);
-        apply_batch(ctx->kv, entry->data.buf, entry->data.len, &max_seq);
-        kv_commit(ctx->kv);
+        if (apply_batch(ctx->kv, entry->data.buf, entry->data.len, &max_seq) != 0) {
+            kv_rollback(ctx->kv);
+            fprintf(stderr, "raft: apply_batch failed, rolling back\n");
+        } else {
+            kv_commit(ctx->kv);
+        }
     }
 
     if (max_seq > 0) {
@@ -589,13 +602,18 @@ static void on_peer_message(uint32_t from_id, const void *data,
                     "(term=%ld, idx=%ld, %u entries)\n",
                     from_id, (long)snap_term, (long)snap_idx, entry_count);
 
+            const uint8_t *snap_end = (const uint8_t *)data + len;
             kv_begin(ctx->kv);
+            bool snap_ok = true;
             for (uint32_t i = 0; i < entry_count; i++) {
+                if (sp + 4 > snap_end) { snap_ok = false; break; }
                 uint32_t nkl;
                 memcpy(&nkl, sp, 4); sp += 4;
                 uint32_t klen = ntohl(nkl);
+
+                if (sp + klen + 4 > snap_end) { snap_ok = false; break; }
                 char *key = malloc(klen + 1);
-                if (!key) break;
+                if (!key) { snap_ok = false; break; }
                 memcpy(key, sp, klen);
                 key[klen] = '\0';
                 sp += klen;
@@ -603,6 +621,8 @@ static void on_peer_message(uint32_t from_id, const void *data,
                 uint32_t nvl;
                 memcpy(&nvl, sp, 4); sp += 4;
                 uint32_t vlen = ntohl(nvl);
+
+                if (sp + vlen + 8 > snap_end) { free(key); snap_ok = false; break; }
                 const void *val = sp;
                 sp += vlen;
 
@@ -612,8 +632,17 @@ static void on_peer_message(uint32_t from_id, const void *data,
                 uint64_t entry_seq = ((uint64_t)ntohl(shi2) << 32) |
                                       (uint64_t)ntohl(slo2);
 
-                kv_put_seq(ctx->kv, key, val, vlen, entry_seq);
+                if (kv_put_seq(ctx->kv, key, val, vlen, entry_seq) != 0) {
+                    free(key);
+                    snap_ok = false;
+                    break;
+                }
                 free(key);
+            }
+            if (!snap_ok) {
+                kv_rollback(ctx->kv);
+                fprintf(stderr, "raft: snap data error from node %u\n", from_id);
+                return;
             }
             kv_commit(ctx->kv);
 
@@ -1099,8 +1128,9 @@ uint64_t raft_faulted_seq(const raft_handle_t *handle) {
 #define RAFT_MAX_INFLIGHT 2048
 
 bool raft_has_capacity(const raft_handle_t *handle) {
-    uint64_t hw = atomic_load_explicit(&handle->high_watermark, memory_order_acquire);
     uint64_t committed = atomic_load_explicit(&handle->committed_seq, memory_order_acquire);
+    uint64_t hw = atomic_load_explicit(&handle->high_watermark, memory_order_acquire);
+    if (hw <= committed) return true;
     return (hw - committed) < RAFT_MAX_INFLIGHT;
 }
 

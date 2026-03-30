@@ -5,8 +5,11 @@
 
 /* Build "index" or "<path>/index" from a cleaned path segment. */
 static char *make_module_path(const char *p, size_t len) {
-    if (len == 0)
-        return strdup("index");
+    if (len == 0) {
+        char *r = strdup("index");
+        if (!r) return NULL;
+        return r;
+    }
 
     const char *suffix = "/index";
     size_t suffix_len = 6;
@@ -31,7 +34,7 @@ static const char *clean_path(const char *url_path,
     size_t path_len;
     if (qmark) {
         path_len = (size_t)(qmark - p);
-        *query = strdup(qmark + 1);
+        *query = strdup(qmark + 1);  /* NULL on OOM — caller sees no query */
     } else {
         path_len = strlen(p);
         *query = NULL;

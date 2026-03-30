@@ -171,10 +171,26 @@ typedef struct sjs_request_ctx {
     sjs_replay_capture_t *replay_capture;
 } sjs_request_ctx_t;
 
+/* Prefixed key macro — shared across split files. */
+#define sjs_prefixed_key kv_prefixed_key
+
 /* Create/destroy the per-worker runtime. */
 int  sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
                       const sjs_preprocessor_registry_t *preprocessors);
 void sjs_runtime_free(sjs_runtime_t *sjs);
+
+/* Reset the per-request arena (between requests). */
+void arena_reset(sjs_runtime_t *sjs);
+
+/* Restore a snapshot into the arena. Returns 0 on success. */
+int snapshot_restore(const sjs_snapshot_t *snap, sjs_arena_t *arena,
+                     sjs_runtime_t *sjs,
+                     JSRuntime **out_rt, JSContext **out_ctx);
+
+/* Request-time module loader (bytecode from KV cache). */
+JSModuleDef *sjs_request_module_loader(JSContext *ctx,
+                                       const char *module_name,
+                                       void *opaque);
 
 /* Register sjs ECS components with the shift context.
  * Call after sh2_register_components(). */

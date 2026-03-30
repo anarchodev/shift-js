@@ -48,14 +48,19 @@ static uint32_t parse_peers(const char *str,
 
     const char **hosts = calloc(count, sizeof(char *));
     uint16_t *ports = calloc(count, sizeof(uint16_t));
-
     char *dup = strdup(str);
+    if (!hosts || !ports || !dup) {
+        free(hosts); free(ports); free(dup);
+        return 0;
+    }
+
     char *tok = strtok(dup, ",");
     for (uint32_t i = 0; i < count && tok; i++) {
         char *colon = strrchr(tok, ':');
         if (!colon) { free(dup); free(hosts); free(ports); return 0; }
         *colon = '\0';
         hosts[i] = strdup(tok);
+        if (!hosts[i]) { free(dup); free(hosts); free(ports); return 0; }
         ports[i] = (uint16_t)atoi(colon + 1);
         tok = strtok(NULL, ",");
     }

@@ -445,6 +445,7 @@ int raft_net_poll(raft_net_t *net, uint32_t timeout_ms) {
 
             if (err == 0 && res >= 0) {
                 peer->state = PEER_CONNECTED;
+                peer->reconnect_at_ms = 0;
                 submit_recv(net, peer, idx);
 
                 /* Send identification message so the remote side knows
@@ -561,12 +562,21 @@ int raft_net_poll(raft_net_t *net, uint32_t timeout_ms) {
 
     io_uring_cq_advance(&net->ring, count);
 
-    /* Attempt reconnection for disconnected outbound peers */
-    /* (simplified: try every poll cycle; production would use timers) */
-    for (uint32_t i = 0; i < net->peer_count; i++) {
-        if (i == net->node_id) continue;
-        if (net->peers[i].state == PEER_DISCONNECTED) {
-            submit_connect(net, i);
+    /* Attempt reconnection for disconnected outbound peers with backoff */
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t t = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+        for (uint32_t i = 0; i < net->peer_count; i++) {
+            if (i == net->node_id) continue;
+            if (net->peers[i].state == PEER_DISCONNECTED && t >= net->peers[i].reconnect_at_ms) {
+                submit_connect(net, i);
+                /* Backoff: 100ms, 200ms, 400ms, ... capped at 5s */
+                uint64_t delay = net->peers[i].reconnect_at_ms ?
+                    (t - net->peers[i].reconnect_at_ms + 100) * 2 : 100;
+                if (delay > 5000) delay = 5000;
+                net->peers[i].reconnect_at_ms = t + delay;
+            }
         }
     }
 

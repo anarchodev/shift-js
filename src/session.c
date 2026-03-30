@@ -74,7 +74,8 @@ char *sjs_session_parse_cookie(const char *cookie_header, size_t header_len) {
 
 char *sjs_session_cookie_header(const char *session_id) {
     char *buf = NULL;
-    asprintf(&buf, "%s=%s; Path=/; HttpOnly; SameSite=Lax",
-             SJS_SESSION_COOKIE, session_id);
+    if (asprintf(&buf, "%s=%s; Path=/; HttpOnly; SameSite=Lax",
+                 SJS_SESSION_COOKIE, session_id) < 0)
+        return NULL;
     return buf;
 }

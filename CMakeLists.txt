@@ -113,6 +113,8 @@ add_executable(shift-js
     src/worker.c
     src/kvstore.c
     src/js_runtime.c
+    src/js_globals.c
+    src/js_dispatch.c
     src/router.c
     src/preprocessor.c
     src/ejs.c

@@ -311,6 +311,31 @@ static uint64_t now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
+/* Free response headers and body for a completed/drained entity. */
+static void cleanup_response(shift_t *sh, shift_entity_t e,
+                              shift_component_id_t hdr_id,
+                              shift_component_id_t body_id) {
+    sh2_resp_headers_t *rh = NULL;
+    shift_entity_get_component(sh, e, hdr_id, (void **)&rh);
+    if (rh && rh->fields) {
+        for (uint32_t h = 0; h < rh->count; h++) {
+            free((void *)rh->fields[h].name);
+            free((void *)rh->fields[h].value);
+        }
+        free(rh->fields);
+        rh->fields = NULL;
+        rh->count  = 0;
+    }
+
+    sh2_resp_body_t *rb = NULL;
+    shift_entity_get_component(sh, e, body_id, (void **)&rb);
+    if (rb && rb->data) {
+        free(rb->data);
+        rb->data = NULL;
+        rb->len  = 0;
+    }
+}
+
 void *sjs_worker_fn(void *arg) {
     sjs_worker_config_t *wcfg = arg;
 
@@ -600,19 +625,27 @@ void *sjs_worker_fn(void *arg) {
                         sh2_resp_headers_t *rh = NULL;
                         shift_entity_get_component(sh, e, comp.resp_headers, (void **)&rh);
                         sh2_header_field_t *hf = malloc(sizeof(sh2_header_field_t));
-                        hf[0] = (sh2_header_field_t){
-                            .name      = strdup("content-type"),
-                            .name_len  = 12,
-                            .value     = strdup(mime),
-                            .value_len = (uint32_t)strlen(mime),
-                        };
-                        rh->fields = hf;
-                        rh->count  = 1;
+                        char *ct_name = strdup("content-type");
+                        char *ct_val  = strdup(mime);
+                        if (!hf || !ct_name || !ct_val) {
+                            free(hf); free(ct_name); free(ct_val);
+                            free(sval);
+                            rb->data = NULL; rb->len = 0;
+                        } else {
+                            hf[0] = (sh2_header_field_t){
+                                .name      = ct_name,
+                                .name_len  = 12,
+                                .value     = ct_val,
+                                .value_len = (uint32_t)strlen(mime),
+                            };
+                            rh->fields = hf;
+                            rh->count  = 1;
 
-                        shift_entity_move_one(sh, e, response_in);
-                        free(method_str);
-                        free(path_str);
-                        continue;
+                            shift_entity_move_one(sh, e, response_in);
+                            free(method_str);
+                            free(path_str);
+                            continue;
+                        }
                     }
                     /* Not found in __static/ — fall through to normal dispatch */
                 }
@@ -711,6 +744,7 @@ void *sjs_worker_fn(void *arg) {
                 sh2_header_field_t *resp_fields = NULL;
                 if (nhdr > 0) {
                     resp_fields = malloc(nhdr * sizeof(sh2_header_field_t));
+                    if (!resp_fields) nhdr = 0;
                     for (uint32_t h = 0; h < nhdr; h++) {
                         resp_fields[h] = (sh2_header_field_t){
                             .name      = resp_hdrs->names[h],
@@ -788,7 +822,7 @@ void *sjs_worker_fn(void *arg) {
                                                 (void **)&prb);
                     free(prb->data);
                     prb->data = strdup("Service Unavailable (leader lost)");
-                    prb->len  = 32;
+                    prb->len  = 34;
 
                     shift_entity_move_one(sh, pe, response_in);
                 }
@@ -815,26 +849,7 @@ void *sjs_worker_fn(void *arg) {
                 /* Free owned response data before destroy — sh2 destructors
                  * only free the fields array and body pointer, not the
                  * individual header name/value strings we strdup'd. */
-                sh2_resp_headers_t *rh = NULL;
-                shift_entity_get_component(sh, e, comp.resp_headers, (void **)&rh);
-                if (rh && rh->fields) {
-                    for (uint32_t h = 0; h < rh->count; h++) {
-                        free((void *)rh->fields[h].name);
-                        free((void *)rh->fields[h].value);
-                    }
-                    free(rh->fields);
-                    rh->fields = NULL;
-                    rh->count  = 0;
-                }
-
-                sh2_resp_body_t *rb = NULL;
-                shift_entity_get_component(sh, e, comp.resp_body, (void **)&rb);
-                if (rb && rb->data) {
-                    free(rb->data);
-                    rb->data = NULL;
-                    rb->len  = 0;
-                }
-
+                cleanup_response(sh, e, comp.resp_headers, comp.resp_body);
                 shift_entity_destroy_one(sh, e);
             }
         }
@@ -864,26 +879,7 @@ void *sjs_worker_fn(void *arg) {
         size_t cnt = 0;
         shift_collection_get_entities(sh, drain[c], &ents, &cnt);
         for (size_t i = 0; i < cnt; i++) {
-            sh2_resp_headers_t *rh = NULL;
-            shift_entity_get_component(sh, ents[i], comp.resp_headers, (void **)&rh);
-            if (rh && rh->fields) {
-                for (uint32_t h = 0; h < rh->count; h++) {
-                    free((void *)rh->fields[h].name);
-                    free((void *)rh->fields[h].value);
-                }
-                free(rh->fields);
-                rh->fields = NULL;
-                rh->count  = 0;
-            }
-
-            sh2_resp_body_t *rb = NULL;
-            shift_entity_get_component(sh, ents[i], comp.resp_body, (void **)&rb);
-            if (rb && rb->data) {
-                free(rb->data);
-                rb->data = NULL;
-                rb->len  = 0;
-            }
-
+            cleanup_response(sh, ents[i], comp.resp_headers, comp.resp_body);
             shift_entity_destroy_one(sh, ents[i]);
         }
     }

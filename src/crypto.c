@@ -540,6 +540,10 @@ static JSValue js_subtle_deriveBits(JSContext *ctx, JSValue this_val,
         return js_rejected_promise(ctx, "length must be a positive multiple of 8");
     }
     size_t out_bytes = (size_t)(length_bits / 8);
+    if (out_bytes > 4096) {
+        JS_FreeValue(ctx, salt_ab);
+        return js_rejected_promise(ctx, "length too large (max 32768 bits)");
+    }
 
     /* Derive key bytes */
     uint8_t *out = alloca(out_bytes);
