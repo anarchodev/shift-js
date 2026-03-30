@@ -358,7 +358,7 @@ void *sjs_worker_fn(void *arg) {
         /* sh2 components */
         comp.stream_id, comp.session, comp.req_headers, comp.req_body,
         comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
-        comp.domain_tag,
+        comp.domain_tag, comp.peer_cert,
         /* sjs components */
         sjs_comp.resp_headers, sjs_comp.session, sjs_comp.random_tape,
         sjs_comp.route, sjs_comp.bytecode, sjs_comp.resp_status,
