@@ -2,6 +2,7 @@ export default function() {
   return (
     <html>
     <head>
+      <meta charset="utf-8" />
       <title>Code Editor - shift-js</title>
       <link rel="stylesheet" href="/style.css" />
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.css" />

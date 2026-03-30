@@ -105,18 +105,60 @@ static void arena_reset(sjs_runtime_t *sjs) {
  * ====================================================================== */
 
 static const char *js_err_string(JSContext *ctx, sjs_arena_t *arena) {
+    static _Thread_local char err_buf[2048];
+
     JSValue exc = JS_GetException(ctx);
-    if (!JS_IsNull(exc) && !JS_IsUndefined(exc)) {
-        const char *str = JS_ToCString(ctx, exc);
-        if (str) return str;
+    if (JS_IsNull(exc) || JS_IsUndefined(exc)) {
+        snprintf(err_buf, sizeof(err_buf),
+                 "arena exhausted (%zu / %d bytes used)",
+                 arena->used, SJS_ARENA_SIZE);
+        return err_buf;
     }
-    /* Exception is null — almost certainly arena exhaustion.
-     * Return a static string (no arena allocation needed). */
-    static _Thread_local char oom_buf[128];
-    snprintf(oom_buf, sizeof(oom_buf),
-             "arena exhausted (%zu / %d bytes used)",
-             arena->used, SJS_ARENA_SIZE);
-    return oom_buf;
+
+    /* JS_ToCString on the exception gives the message string.
+     * Do NOT access properties (e.g. .stack) — the exception object
+     * lives in the bump arena and its internal shape/property pointers
+     * may reference corrupted memory after a failed JS_ReadObject. */
+    const char *msg = JS_ToCString(ctx, exc);
+    snprintf(err_buf, sizeof(err_buf), "%s", msg ? msg : "(unknown error)");
+    return err_buf;
+}
+
+/* Like js_err_string but also includes the stack trace.  Only safe to
+ * call when the exception was thrown from JS handler execution (not
+ * from bytecode loading, where arena corruption is possible). */
+static const char *js_err_string_with_stack(JSContext *ctx) {
+    static _Thread_local char err_buf[4096];
+
+    JSValue exc = JS_GetException(ctx);
+    if (JS_IsNull(exc) || JS_IsUndefined(exc)) {
+        snprintf(err_buf, sizeof(err_buf), "(unknown error)");
+        return err_buf;
+    }
+
+    const char *msg = JS_ToCString(ctx, exc);
+    if (!msg) msg = "(unknown error)";
+
+    JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
+    if (JS_IsString(stack)) {
+        const char *stack_str = JS_ToCString(ctx, stack);
+        if (stack_str && stack_str[0]) {
+            snprintf(err_buf, sizeof(err_buf), "%s\n%s", msg, stack_str);
+            JS_FreeCString(ctx, stack_str);
+            JS_FreeValue(ctx, stack);
+            JS_FreeCString(ctx, msg);
+            JS_FreeValue(ctx, exc);
+            return err_buf;
+        }
+        if (stack_str) JS_FreeCString(ctx, stack_str);
+    }
+    if (!JS_IsException(stack))
+        JS_FreeValue(ctx, stack);
+
+    snprintf(err_buf, sizeof(err_buf), "%s", msg);
+    JS_FreeCString(ctx, msg);
+    JS_FreeValue(ctx, exc);
+    return err_buf;
 }
 
 /* ======================================================================
@@ -460,16 +502,10 @@ static JSValue js_code_put(JSContext *ctx, JSValue this_val,
         }
     }
 
-    /* 3. Invalidate bytecode cache: delete __compiled/<base> */
+    /* 3. Invalidate bytecode cache: delete __compiled/<path> (with extension) */
     if (rc == 0) {
-        char base[256];
-        snprintf(base, sizeof(base), "%s", path);
-        char *dot = strrchr(base, '.');
-        char *slash = strrchr(base, '/');
-        if (dot && (!slash || dot > slash)) *dot = '\0';
-
         char cache_raw[256];
-        snprintf(cache_raw, sizeof(cache_raw), "__compiled/%s", base);
+        snprintf(cache_raw, sizeof(cache_raw), "__compiled/%s", path);
         char cache_buf[512];
         const char *cache_key = sjs_prefixed_key(prefix, cache_raw,
                                                    cache_buf, sizeof(cache_buf));
@@ -525,15 +561,9 @@ static JSValue js_code_delete(JSContext *ctx, JSValue this_val,
             raft_write_set_add_delete(req->write_set, meta_key);
     }
 
-    /* Delete __compiled/<base> */
-    char base[256];
-    snprintf(base, sizeof(base), "%s", path);
-    char *dot = strrchr(base, '.');
-    char *slash = strrchr(base, '/');
-    if (dot && (!slash || dot > slash)) *dot = '\0';
-
+    /* Delete __compiled/<path> (with extension) */
     char cache_raw[256];
-    snprintf(cache_raw, sizeof(cache_raw), "__compiled/%s", base);
+    snprintf(cache_raw, sizeof(cache_raw), "__compiled/%s", path);
     char cache_buf[512];
     const char *cache_key = sjs_prefixed_key(prefix, cache_raw,
                                                cache_buf, sizeof(cache_buf));
@@ -1279,6 +1309,36 @@ static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
         if (!js) { free(resolved_alloc); return NULL; }
         compile_source = js;
         compile_len    = js_len;
+
+        /* Store transpiled JS for browser replay/debugging */
+        {
+            char js_key[512];
+            snprintf(js_key, sizeof(js_key), "__code_js/%s", resolved_name);
+            char jk[512];
+            const char *jkey = kv_prefixed_key(sjs->current_prefix, js_key,
+                                                jk, sizeof(jk));
+            if (jkey)
+                kv_put(kv, jkey, js, js_len);
+        }
+
+        /* Store source map if TypeScript preprocessor produced one */
+        if (pp->transform == sjs_typescript_transform) {
+            sjs_ts_binding_t *binding = pp->user_data;
+            if (binding && binding->last_source_map) {
+                char sm_key[512];
+                snprintf(sm_key, sizeof(sm_key),
+                         "__code_sourcemap/%s", resolved_name);
+                char pk[512];
+                const char *key = kv_prefixed_key(sjs->current_prefix, sm_key,
+                                                   pk, sizeof(pk));
+                if (key)
+                    kv_put(kv, key, binding->last_source_map,
+                           binding->last_source_map_len);
+                free(binding->last_source_map);
+                binding->last_source_map = NULL;
+                binding->last_source_map_len = 0;
+            }
+        }
     }
 
     JSValue func = JS_Eval(ctx, compile_source, compile_len, resolved_name,
@@ -1293,16 +1353,10 @@ static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
     uint8_t *bc = JS_WriteObject(ctx, &bc_len, func,
                                  JS_WRITE_OBJ_BYTECODE);
     if (bc) {
-        /* Strip extension for cache key: "components/greeting.tsx" →
-         * "__compiled/components/greeting" */
-        char base[256];
-        snprintf(base, sizeof(base), "%s", resolved_name);
-        char *dot = strrchr(base, '.');
-        char *slash = strrchr(base, '/');
-        if (dot && (!slash || dot > slash)) *dot = '\0';
-
+        /* Cache with full extension: "components/greeting.tsx" →
+         * "__compiled/components/greeting.tsx" */
         char raw_cache[256];
-        snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base);
+        snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", resolved_name);
         char cache_buf[512];
         const char *ck = sjs_prefixed_key(sjs->current_prefix, raw_cache,
                                           cache_buf, sizeof(cache_buf));
@@ -1334,23 +1388,65 @@ static JSModuleDef *sjs_request_module_loader(JSContext *ctx,
     sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
     const char *prefix = req ? req->kv_prefix : NULL;
 
-    /* Build cache key: strip extension, look up __compiled/<base> */
-    char base[256];
-    snprintf(base, sizeof(base), "%s", module_name);
-    char *dot = strrchr(base, '.');
-    char *slash = strrchr(base, '/');
-    if (dot && (!slash || dot > slash)) *dot = '\0';
-
-    char raw_cache[256];
-    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base);
-    char cache_buf[512];
-    const char *ck = sjs_prefixed_key(prefix, raw_cache,
-                                      cache_buf, sizeof(cache_buf));
-    if (!ck) return NULL;
-
+    /* Look up __compiled/<module_name> — with or without extension.
+     * If module_name already has an extension, try it directly.
+     * Otherwise probe each registered extension. */
     void  *bc = NULL;
     size_t bc_len = 0;
-    if (kv_get(sjs->kv, ck, &bc, &bc_len) != 0 || !bc) return NULL;
+    char resolved_name[256];
+
+    const char *ext = sjs_path_extension(module_name);
+    if (ext) {
+        /* Explicit extension — try directly */
+        char raw_cache[256];
+        snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", module_name);
+        char cache_buf[512];
+        const char *ck = sjs_prefixed_key(prefix, raw_cache,
+                                          cache_buf, sizeof(cache_buf));
+        if (ck)
+            kv_get(sjs->kv, ck, &bc, &bc_len);
+        snprintf(resolved_name, sizeof(resolved_name), "%s", module_name);
+    } else {
+        /* No extension — probe each */
+        static const char *exts[] = { ".mjs", ".ejs", ".ts", ".tsx" };
+        for (int ei = 0; ei < 4; ei++) {
+            char raw_cache[256];
+            snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s%s",
+                     module_name, exts[ei]);
+            char cache_buf[512];
+            const char *ck = sjs_prefixed_key(prefix, raw_cache,
+                                              cache_buf, sizeof(cache_buf));
+            if (!ck) continue;
+            if (kv_get(sjs->kv, ck, &bc, &bc_len) == 0 && bc) {
+                snprintf(resolved_name, sizeof(resolved_name), "%s%s",
+                         module_name, exts[ei]);
+                break;
+            }
+        }
+    }
+    if (!bc) return NULL;
+
+    /* Record imported module in replay capture */
+    if (sjs->current_replay_capture) {
+        char mod_name[256];
+        snprintf(mod_name, sizeof(mod_name), "%s", resolved_name);
+        char meta_raw[256];
+        snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", mod_name);
+        char meta_buf[512];
+        const char *meta_key = sjs_prefixed_key(prefix, meta_raw,
+                                                 meta_buf, sizeof(meta_buf));
+        if (meta_key) {
+            void *hash_val = NULL;
+            size_t hash_len = 0;
+            if (kv_get(sjs->kv, meta_key, &hash_val, &hash_len) == 0 && hash_val) {
+                char hash_str[65] = {0};
+                if (hash_len >= 64) memcpy(hash_str, hash_val, 64);
+                replay_capture_module(sjs->current_replay_capture,
+                                      mod_name, hash_str);
+                free(hash_val);
+            }
+        }
+    }
 
     JSValue module_val = JS_ReadObject(ctx, bc, bc_len, JS_READ_OBJ_BYTECODE);
     free(bc);
@@ -1982,7 +2078,7 @@ static JSValue parse_query_string(JSContext *ctx, const char *qs) {
  * Returns 0 on success (bytecode/bc_len filled), -1 on not found,
  * positive on error (err_body filled, caller sets status). */
 static int compile_module(sjs_runtime_t *sjs, const char *kv_prefix,
-                          const char *base_path, const char *cache_key,
+                          const char *base_path,
                           void **bytecode, size_t *bc_len,
                           char **out_module_path,
                           char **err_body, uint32_t *err_len) {
@@ -2094,7 +2190,18 @@ static int compile_module(sjs_runtime_t *sjs, const char *kv_prefix,
         return 1;
     }
 
-    kv_put(sjs->kv, cache_key, bc, out_bc_len);
+    /* Store bytecode in cache with full extension:
+     * __compiled/<module_path> e.g. __compiled/hello/index.tsx */
+    {
+        char raw_cache[256];
+        snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", module_path);
+        char cache_buf[512];
+        const char *ck = sjs_prefixed_key(kv_prefix, raw_cache,
+                                           cache_buf, sizeof(cache_buf));
+        if (ck)
+            kv_put(sjs->kv, ck, bc, out_bc_len);
+    }
+
     *bytecode = bc;
     *bc_len = out_bc_len;
     *out_module_path = module_path;
@@ -2148,7 +2255,7 @@ static char *extract_body_string(JSContext *ctx, sjs_arena_t *arena,
             *out_len = (uint32_t)len;
         }
         if (!resp_has_header(resp_hdrs, "content-type"))
-            resp_add_header(resp_hdrs, "content-type", "application/json");
+            resp_add_header(resp_hdrs, "content-type", "application/json; charset=utf-8");
     }
     return body;
 }
@@ -2176,54 +2283,53 @@ static int sjs_resolve_request_route(sjs_runtime_t *sjs, const char *path,
         return 500;
     }
 
-    /* Build cache key */
-    char raw_cache[256];
-    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base_path);
-    char cache_key_buf[512];
-    const char *ck = sjs_prefixed_key(kv_prefix, raw_cache,
-                                       cache_key_buf, sizeof(cache_key_buf));
-    if (!ck) {
-        free(base_path);
-        *err_body = strdup("Key Too Long");
-        *err_len = (uint32_t)strlen(*err_body);
-        return 500;
-    }
-
-    /* Try cache hit */
-    if (kv_get(sjs->kv, ck, &bc->data, &bc->len) == 0) {
-        /* Record module in replay capture even on cache hit.
-         * Try each extension to find the __code_meta/ entry. */
-        if (sjs->current_replay_capture) {
-            static const char *exts[] = { ".mjs", ".ejs", ".ts", ".tsx" };
-            for (int ei = 0; ei < 4; ei++) {
+    /* Try cache hit — probe __compiled/<base_path><ext> for each extension */
+    {
+        static const char *exts[] = { ".mjs", ".ejs", ".ts", ".tsx" };
+        for (int ei = 0; ei < 4; ei++) {
+            char raw_cache[256];
+            snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s%s",
+                     base_path, exts[ei]);
+            char cache_key_buf[512];
+            const char *ck = sjs_prefixed_key(kv_prefix, raw_cache,
+                                               cache_key_buf, sizeof(cache_key_buf));
+            if (!ck) continue;
+            if (kv_get(sjs->kv, ck, &bc->data, &bc->len) == 0) {
+                /* Set module_path with extension — needed for retry cache key
+                 * and error messages */
                 char mod_name[256];
                 snprintf(mod_name, sizeof(mod_name), "%s%s", base_path, exts[ei]);
-                char meta_raw[256];
-                snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", mod_name);
-                char meta_buf[512];
-                const char *meta_key = sjs_prefixed_key(kv_prefix, meta_raw,
-                                                         meta_buf, sizeof(meta_buf));
-                if (!meta_key) continue;
-                void *hash_val = NULL;
-                size_t hash_len = 0;
-                if (kv_get(sjs->kv, meta_key, &hash_val, &hash_len) == 0 && hash_val) {
-                    char hash_str[65] = {0};
-                    if (hash_len >= 64) memcpy(hash_str, hash_val, 64);
-                    replay_capture_module(sjs->current_replay_capture,
-                                          mod_name, hash_str);
-                    free(hash_val);
-                    break;
+                route->module_path = strdup(mod_name);
+
+                /* Record module in replay capture */
+                if (sjs->current_replay_capture) {
+                    char meta_raw[256];
+                    snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", mod_name);
+                    char meta_buf[512];
+                    const char *meta_key = sjs_prefixed_key(kv_prefix, meta_raw,
+                                                             meta_buf, sizeof(meta_buf));
+                    if (meta_key) {
+                        void *hash_val = NULL;
+                        size_t hash_len = 0;
+                        if (kv_get(sjs->kv, meta_key, &hash_val, &hash_len) == 0 && hash_val) {
+                            char hash_str[65] = {0};
+                            if (hash_len >= 64) memcpy(hash_str, hash_val, 64);
+                            replay_capture_module(sjs->current_replay_capture,
+                                                  mod_name, hash_str);
+                            free(hash_val);
+                        }
+                    }
                 }
+                goto found;
             }
         }
-        goto found;
     }
 
     /* Cache miss — compile primary route */
     {
         char *comp_err = NULL;
         uint32_t comp_err_len = 0;
-        int rc = compile_module(sjs, kv_prefix, base_path, ck,
+        int rc = compile_module(sjs, kv_prefix, base_path,
                                 &bc->data, &bc->len, &route->module_path,
                                 &comp_err, &comp_err_len);
         if (rc == 0) goto found;
@@ -2541,7 +2647,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 
         JSValue result = JS_EvalFunction(ctx, module_val);
         if (JS_IsException(result)) {
-            const char *err = js_err_string(ctx, arena);
+            const char *err = js_err_string_with_stack(ctx);
             fprintf(stderr, "shift-js: module eval error in %s: %s\n",
                     route->module_path, err);
             asprintf(&err_msg, "module eval error in %s: %s",
@@ -2578,7 +2684,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         if (is_default_fn) {
             called_func = "default";
             if (!resp_has_header(req->resp_hdrs, "content-type"))
-                resp_add_header(req->resp_hdrs, "content-type", "text/html");
+                resp_add_header(req->resp_hdrs, "content-type", "text/html; charset=utf-8");
 
             ret = JS_Call(ctx, default_fn, JS_UNDEFINED, 0, NULL);
         } else {
@@ -2678,7 +2784,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 
         /* Capture exception immediately */
         if (JS_IsException(ret)) {
-            const char *err = js_err_string(ctx, arena);
+            const char *err = js_err_string_with_stack(ctx);
             fprintf(stderr, "shift-js: handler error in %s.%s: %s\n",
                     route->module_path, called_func, err);
             asprintf(&err_msg, "handler error in %s.%s: %s",

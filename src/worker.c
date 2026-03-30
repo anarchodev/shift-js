@@ -27,12 +27,12 @@ typedef struct {
 } static_mime_t;
 
 static const static_mime_t STATIC_MIMES[] = {
-    { ".js",    "application/javascript" },
-    { ".mjs",   "application/javascript" },
-    { ".css",   "text/css" },
-    { ".html",  "text/html" },
-    { ".json",  "application/json" },
-    { ".svg",   "image/svg+xml" },
+    { ".js",    "application/javascript; charset=utf-8" },
+    { ".mjs",   "application/javascript; charset=utf-8" },
+    { ".css",   "text/css; charset=utf-8" },
+    { ".html",  "text/html; charset=utf-8" },
+    { ".json",  "application/json; charset=utf-8" },
+    { ".svg",   "image/svg+xml; charset=utf-8" },
     { ".png",   "image/png" },
     { ".jpg",   "image/jpeg" },
     { ".jpeg",  "image/jpeg" },
@@ -41,9 +41,9 @@ static const static_mime_t STATIC_MIMES[] = {
     { ".woff",  "font/woff" },
     { ".woff2", "font/woff2" },
     { ".ttf",   "font/ttf" },
-    { ".map",   "application/json" },
-    { ".xml",   "application/xml" },
-    { ".txt",   "text/plain" },
+    { ".map",   "application/json; charset=utf-8" },
+    { ".xml",   "application/xml; charset=utf-8" },
+    { ".txt",   "text/plain; charset=utf-8" },
     { ".wasm",  "application/wasm" },
 };
 
@@ -812,6 +812,29 @@ void *sjs_worker_fn(void *arg) {
                             wcfg->worker_id, io->error);
                 }
 
+                /* Free owned response data before destroy — sh2 destructors
+                 * only free the fields array and body pointer, not the
+                 * individual header name/value strings we strdup'd. */
+                sh2_resp_headers_t *rh = NULL;
+                shift_entity_get_component(sh, e, comp.resp_headers, (void **)&rh);
+                if (rh && rh->fields) {
+                    for (uint32_t h = 0; h < rh->count; h++) {
+                        free((void *)rh->fields[h].name);
+                        free((void *)rh->fields[h].value);
+                    }
+                    free(rh->fields);
+                    rh->fields = NULL;
+                    rh->count  = 0;
+                }
+
+                sh2_resp_body_t *rb = NULL;
+                shift_entity_get_component(sh, e, comp.resp_body, (void **)&rb);
+                if (rb && rb->data) {
+                    free(rb->data);
+                    rb->data = NULL;
+                    rb->len  = 0;
+                }
+
                 shift_entity_destroy_one(sh, e);
             }
         }
@@ -832,7 +855,7 @@ void *sjs_worker_fn(void *arg) {
     sh2_context_destroy(h2);
     shift_flush(sh);
 
-    /* Drain remaining entities — destructors handle cleanup */
+    /* Drain remaining entities — free owned response data before destroy */
     shift_collection_id_t drain[] = { request_out, response_in, response_result_out,
                                        raft_pending };
     int drain_count = (raft_pending != (shift_collection_id_t)-1) ? 4 : 3;
@@ -840,8 +863,29 @@ void *sjs_worker_fn(void *arg) {
         shift_entity_t *ents = NULL;
         size_t cnt = 0;
         shift_collection_get_entities(sh, drain[c], &ents, &cnt);
-        for (size_t i = 0; i < cnt; i++)
+        for (size_t i = 0; i < cnt; i++) {
+            sh2_resp_headers_t *rh = NULL;
+            shift_entity_get_component(sh, ents[i], comp.resp_headers, (void **)&rh);
+            if (rh && rh->fields) {
+                for (uint32_t h = 0; h < rh->count; h++) {
+                    free((void *)rh->fields[h].name);
+                    free((void *)rh->fields[h].value);
+                }
+                free(rh->fields);
+                rh->fields = NULL;
+                rh->count  = 0;
+            }
+
+            sh2_resp_body_t *rb = NULL;
+            shift_entity_get_component(sh, ents[i], comp.resp_body, (void **)&rb);
+            if (rb && rb->data) {
+                free(rb->data);
+                rb->data = NULL;
+                rb->len  = 0;
+            }
+
             shift_entity_destroy_one(sh, ents[i]);
+        }
     }
     shift_flush(sh);
 

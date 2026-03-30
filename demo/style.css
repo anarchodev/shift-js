@@ -44,6 +44,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .status-msg.error { color: #f85149; }
 .status-msg.ok { color: #3fb950; }
 
+/* File tree */
+.tree-label { display: flex; align-items: center; gap: 6px; padding: 4px 0; cursor: pointer; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tree-label:hover { background: #21262d; }
+.tree-dir-label { color: #e6edf3; font-weight: 500; }
+.tree-file { color: #8b949e; }
+.tree-file.active { color: #58a6ff; background: #1f6feb33; }
+.tree-arrow { width: 12px; font-size: 10px; text-align: center; flex-shrink: 0; color: #484f58; }
+.tree-icon { width: 16px; text-align: center; flex-shrink: 0; font-size: 12px; }
+.tree-children { }
+
 /* CodeMirror dark overrides */
 .CodeMirror { height: 100% !important; background: #0d1117 !important; color: #e6edf3 !important; font-size: 14px; }
 .CodeMirror-gutters { background: #161b22 !important; border-right: 1px solid #30363d !important; }

@@ -2,6 +2,7 @@ export default function() {
   return (
     <html>
     <head>
+      <meta charset="utf-8" />
       <title>KV Viewer - shift-js</title>
       <link rel="stylesheet" href="/style.css" />
     </head>

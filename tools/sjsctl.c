@@ -295,15 +295,9 @@ static void on_code_write(kvstore_t *kv, const char *key,
     if (strncmp(raw, "__code/", 7) != 0) return;
     const char *rel = raw + 7;
 
-    /* 1. Invalidate __compiled/ cache */
-    char base[4096];
-    snprintf(base, sizeof(base), "%s", rel);
-    char *dot = strrchr(base, '.');
-    char *slash = strrchr(base, '/');
-    if (dot && (!slash || dot > slash)) *dot = '\0';
-
+    /* 1. Invalidate __compiled/ cache (with extension) */
     char raw_cache[4096];
-    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base);
+    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", rel);
     char cache_key[4096];
     const char *ck = prefixed_key(tenant_prefix, raw_cache,
                                   cache_key, sizeof(cache_key));
@@ -343,15 +337,9 @@ static void on_code_delete(kvstore_t *kv, const char *key,
     if (strncmp(raw, "__code/", 7) != 0) return;
     const char *rel = raw + 7;
 
-    /* Delete __compiled/ cache */
-    char base[4096];
-    snprintf(base, sizeof(base), "%s", rel);
-    char *dot = strrchr(base, '.');
-    char *slash = strrchr(base, '/');
-    if (dot && (!slash || dot > slash)) *dot = '\0';
-
+    /* Delete __compiled/ cache (with extension) */
     char raw_cache[4096];
-    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base);
+    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", rel);
     char cache_key[4096];
     const char *ck = prefixed_key(tenant_prefix, raw_cache,
                                   cache_key, sizeof(cache_key));

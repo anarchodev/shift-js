@@ -145,9 +145,9 @@ int kv_get(kvstore_t *store, const char *key, void **out_value, size_t *out_len)
     if (rc == SQLITE_ROW) {
         const void *blob = sqlite3_column_blob(st, 0);
         int blen = sqlite3_column_bytes(st, 0);
-        void *copy = malloc((size_t)blen);
+        void *copy = malloc((size_t)blen + 1);
         if (!copy) { sqlite3_reset(st); return -2; }
-        memcpy(copy, blob, (size_t)blen);
+        if (blen > 0) memcpy(copy, blob, (size_t)blen);
         *out_value = copy;
         *out_len = (size_t)blen;
         sqlite3_reset(st);
@@ -230,9 +230,9 @@ int kv_range(kvstore_t *store, const char *start, const char *end,
         int vlen = sqlite3_column_bytes(st, 1);
 
         entries[n].key = strdup(k);
-        entries[n].value = malloc((size_t)vlen);
+        entries[n].value = malloc((size_t)vlen + 1);
         if (!entries[n].key || !entries[n].value) goto oom;
-        memcpy(entries[n].value, v, (size_t)vlen);
+        if (vlen > 0) memcpy(entries[n].value, v, (size_t)vlen);
         entries[n].value_len = (size_t)vlen;
         n++;
     }
@@ -323,9 +323,9 @@ int kv_delta(kvstore_t *store, uint64_t after_seq, uint64_t through_seq,
         int vlen = sqlite3_column_bytes(st, 1);
 
         entries[n].key = strdup(k);
-        entries[n].value = malloc((size_t)vlen);
+        entries[n].value = malloc((size_t)vlen + 1);
         if (!entries[n].key || !entries[n].value) goto oom;
-        memcpy(entries[n].value, v, (size_t)vlen);
+        if (vlen > 0) memcpy(entries[n].value, v, (size_t)vlen);
         entries[n].value_len = (size_t)vlen;
         entries[n].seq = (uint64_t)sqlite3_column_int64(st, 2);
         n++;

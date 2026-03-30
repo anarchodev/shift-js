@@ -9,15 +9,18 @@
 
 /* String-based JSX runtime prepended to .tsx output. Kept compact to minimize
  * source map line offset (2 lines). */
+/* JSX runtime appended to .tsx output.  Uses function declarations so
+ * hoisting makes them available to the Sucrase-generated __jsx() calls
+ * that appear earlier in the source. */
 static const char JSX_RUNTIME[] =
-    "const __VOID=new Set([\"area\",\"base\",\"br\",\"col\",\"embed\",\"hr\","
-    "\"img\",\"input\",\"link\",\"meta\",\"param\",\"source\",\"track\",\"wbr\"]);\n"
-    "function __jsx(t,p,...c){if(typeof t===\"function\")return t({...p,children:c});"
+    "\nfunction __jsx(t,p,...c){if(typeof t===\"function\")return t({...p,children:c});"
+    "var V=__jsx.V||(__jsx.V=new Set([\"area\",\"base\",\"br\",\"col\",\"embed\","
+    "\"hr\",\"img\",\"input\",\"link\",\"meta\",\"param\",\"source\",\"track\",\"wbr\"]));"
     "let s=\"<\"+t;if(p)for(const[k,v]of Object.entries(p)){"
     "if(v===false||v==null)continue;"
     "if(v===true){s+=\" \"+k;continue;}"
     "s+=\" \"+k+'=\"'+String(v).replace(/&/g,\"&amp;\").replace(/\"/g,\"&quot;\")+'\"';}"
-    "if(__VOID.has(t))return s+\" />\";s+=\">\";"
+    "if(V.has(t))return s+\" />\";s+=\">\";"
     "for(const x of c){if(x==null||x===false||x===true)continue;"
     "if(Array.isArray(x))for(const i of x){if(i!=null&&i!==false&&i!==true)s+=String(i);}"
     "else s+=String(x);}return s+\"</\"+t+\">\";}"
@@ -205,17 +208,18 @@ char *sjs_typescript_transform(const char *source, size_t len,
     JS_FreeValue(ctx, code_val);
     if (!js) return NULL;
 
-    /* Build output: prepend JSX runtime for .tsx files */
+    /* Build output: append JSX runtime for .tsx files (function declarations
+     * are hoisted, so __jsx/__jsxFrag are available to earlier code). */
     size_t runtime_len = binding->is_tsx ? (sizeof(JSX_RUNTIME) - 1) : 0;
-    char *out = malloc(runtime_len + js_len + 1);
+    char *out = malloc(js_len + runtime_len + 1);
     if (!out) {
         JS_FreeCString(ctx, js);
         return NULL;
     }
+    memcpy(out, js, js_len);
     if (runtime_len > 0)
-        memcpy(out, JSX_RUNTIME, runtime_len);
-    memcpy(out + runtime_len, js, js_len);
-    out[runtime_len + js_len] = '\0';
+        memcpy(out + js_len, JSX_RUNTIME, runtime_len);
+    out[js_len + runtime_len] = '\0';
     JS_FreeCString(ctx, js);
 
     *out_len = runtime_len + js_len;
