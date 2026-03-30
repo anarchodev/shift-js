@@ -64,5 +64,19 @@ int  log_db_get_replay(log_db_t *ldb, uint64_t request_id,
                        char **module_tree,
                        char **source_maps);
 
+/* List recent requests from replay_captures.
+ * Returns an array of (request_id, request_data, response_data) rows.
+ * Caller must free returned strings and the array itself.
+ * Returns count on success, -1 on error. */
+typedef struct {
+    uint64_t request_id;
+    char    *request_data;   /* JSON */
+    char    *response_data;  /* JSON, may be NULL */
+} log_db_request_entry_t;
+
+int  log_db_list_requests(log_db_t *ldb, int limit,
+                          log_db_request_entry_t **out, size_t *out_count);
+void log_db_free_request_entries(log_db_request_entry_t *entries, size_t count);
+
 /* Passive WAL checkpoint — non-blocking. */
 int  log_db_checkpoint(log_db_t *ldb);

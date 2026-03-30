@@ -1116,7 +1116,7 @@ static JSValue js_logs_replay(JSContext *ctx, JSValue this_val,
     PARSE_JSON_FIELD("date_tape", date_tape);
     PARSE_JSON_FIELD("math_random_tape", math_random_tape);
     PARSE_JSON_FIELD("module_tree", module_tree);
-    PARSE_JSON_FIELD("source_maps", source_maps);
+    free(source_maps); /* source maps now served from __code_sourcemap/ KV */
     #undef PARSE_JSON_FIELD
 
     /* random_tape as base64 — for now just hex-encode */
@@ -1139,6 +1139,72 @@ static JSValue js_logs_replay(JSContext *ctx, JSValue this_val,
     return obj;
 }
 
+static JSValue js_logs_requests(JSContext *ctx, JSValue this_val,
+                                int argc, JSValue *argv) {
+    sjs_request_ctx_t *req = js_get_req_ctx(ctx);
+    if (!req || !req->log_db || !req->log_db->db)
+        return JS_NewArray(ctx);
+
+    int64_t limit = 100;
+    if (argc > 0 && JS_IsObject(argv[0])) {
+        JSValue v = JS_GetPropertyStr(ctx, argv[0], "limit");
+        if (JS_IsNumber(v))
+            JS_ToInt64(ctx, &limit, v);
+        JS_FreeValue(ctx, v);
+    }
+    if (limit <= 0) limit = 100;
+    if (limit > 1000) limit = 1000;
+
+    log_db_request_entry_t *entries = NULL;
+    size_t count = 0;
+    if (log_db_list_requests(req->log_db, (int)limit, &entries, &count) != 0)
+        return JS_NewArray(ctx);
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
+    JSValue parse_fn = JS_GetPropertyStr(ctx, json_obj, "parse");
+
+    JSValue arr = JS_NewArray(ctx);
+    for (uint32_t i = 0; i < (uint32_t)count; i++) {
+        JSValue entry = JS_NewObject(ctx);
+
+        char rid_buf[24];
+        snprintf(rid_buf, sizeof(rid_buf), "%" PRIu64, entries[i].request_id);
+        JS_SetPropertyStr(ctx, entry, "request_id", JS_NewString(ctx, rid_buf));
+
+        /* Parse request_data JSON */
+        if (entries[i].request_data) {
+            JSValue s = JS_NewString(ctx, entries[i].request_data);
+            JSValue parsed = JS_Call(ctx, parse_fn, json_obj, 1, &s);
+            JS_SetPropertyStr(ctx, entry, "request",
+                              JS_IsException(parsed) ? JS_NULL : parsed);
+            JS_FreeValue(ctx, s);
+        } else {
+            JS_SetPropertyStr(ctx, entry, "request", JS_NULL);
+        }
+
+        /* Parse response_data JSON */
+        if (entries[i].response_data) {
+            JSValue s = JS_NewString(ctx, entries[i].response_data);
+            JSValue parsed = JS_Call(ctx, parse_fn, json_obj, 1, &s);
+            JS_SetPropertyStr(ctx, entry, "response",
+                              JS_IsException(parsed) ? JS_NULL : parsed);
+            JS_FreeValue(ctx, s);
+        } else {
+            JS_SetPropertyStr(ctx, entry, "response", JS_NULL);
+        }
+
+        JS_SetPropertyUint32(ctx, arr, i, entry);
+    }
+
+    JS_FreeValue(ctx, parse_fn);
+    JS_FreeValue(ctx, json_obj);
+    JS_FreeValue(ctx, global);
+
+    log_db_free_request_entries(entries, count);
+    return arr;
+}
+
 static void js_install_logs(JSContext *ctx) {
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue logs = JS_NewObject(ctx);
@@ -1147,6 +1213,8 @@ static void js_install_logs(JSContext *ctx) {
                       JS_NewCFunction(ctx, js_logs_query, "query", 1));
     JS_SetPropertyStr(ctx, logs, "replay",
                       JS_NewCFunction(ctx, js_logs_replay, "replay", 1));
+    JS_SetPropertyStr(ctx, logs, "requests",
+                      JS_NewCFunction(ctx, js_logs_requests, "requests", 1));
 
     JS_SetPropertyStr(ctx, global, "logs", logs);
     JS_FreeValue(ctx, global);
@@ -1960,6 +2028,17 @@ static int compile_module(sjs_runtime_t *sjs, const char *kv_prefix,
         compile_source = js;
         compile_len    = js_len;
 
+        /* Store transpiled JS in KV for browser replay/debugging */
+        {
+            char js_key[512];
+            snprintf(js_key, sizeof(js_key), "__code_js/%s", module_path);
+            char jk[512];
+            const char *jkey = kv_prefixed_key(kv_prefix, js_key,
+                                                jk, sizeof(jk));
+            if (jkey)
+                kv_put(sjs->kv, jkey, js, js_len);
+        }
+
         /* Store source map in KV if the TypeScript preprocessor produced one */
         if (pp->transform == sjs_typescript_transform) {
             sjs_ts_binding_t *binding = pp->user_data;
@@ -1973,11 +2052,6 @@ static int compile_module(sjs_runtime_t *sjs, const char *kv_prefix,
                 if (key)
                     kv_put(sjs->kv, key, binding->last_source_map,
                            binding->last_source_map_len);
-
-                if (sjs->current_replay_capture)
-                    replay_capture_sourcemap(sjs->current_replay_capture,
-                                             module_path,
-                                             binding->last_source_map);
 
                 free(binding->last_source_map);
                 binding->last_source_map = NULL;
@@ -2705,7 +2779,6 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             replay_capture_finalize(&cap->date_tape);
             replay_capture_finalize(&cap->math_random_tape);
             replay_capture_finalize(&cap->module_tree);
-            replay_capture_finalize(&cap->source_maps);
 
             /* Build request data JSON via QuickJS JSON.stringify */
             char *req_json = NULL;
@@ -2776,7 +2849,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
                 cap->date_tape.data,
                 cap->math_random_tape.data,
                 cap->module_tree.data,
-                cap->source_maps.data);
+                NULL);
 
             free(req_json);
             free(resp_json);

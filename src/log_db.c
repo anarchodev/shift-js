@@ -43,7 +43,9 @@ int log_db_open(log_db_t *ldb, const char *path) {
         return -1;
     }
 
-    /* WAL mode, no fsync, no auto-checkpoint */
+    /* WAL mode, no fsync, no auto-checkpoint.
+     * Busy timeout so concurrent worker inits don't fail on schema creation. */
+    sqlite3_busy_timeout(ldb->db, 5000);
     sqlite3_exec(ldb->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
     sqlite3_exec(ldb->db, "PRAGMA synchronous=OFF", NULL, NULL, NULL);
     sqlite3_wal_autocheckpoint(ldb->db, 0);
@@ -217,6 +219,53 @@ int log_db_get_replay(log_db_t *ldb, uint64_t request_id,
 
     sqlite3_finalize(stmt);
     return 0;
+}
+
+int log_db_list_requests(log_db_t *ldb, int limit,
+                         log_db_request_entry_t **out, size_t *out_count) {
+    *out = NULL;
+    *out_count = 0;
+    if (!ldb->db) return -1;
+
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(ldb->db,
+        "SELECT request_id, request_data, response_data "
+        "FROM replay_captures ORDER BY request_id DESC LIMIT ?",
+        -1, &stmt, NULL);
+    if (rc != SQLITE_OK) return -1;
+
+    sqlite3_bind_int(stmt, 1, limit);
+
+    /* First pass: count rows */
+    size_t cap = 64;
+    log_db_request_entry_t *entries = malloc(cap * sizeof(*entries));
+    size_t count = 0;
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (count >= cap) {
+            cap *= 2;
+            entries = realloc(entries, cap * sizeof(*entries));
+        }
+        entries[count].request_id = (uint64_t)sqlite3_column_int64(stmt, 0);
+        entries[count].request_data =
+            strdup((const char *)sqlite3_column_text(stmt, 1));
+        const char *resp = (const char *)sqlite3_column_text(stmt, 2);
+        entries[count].response_data = resp ? strdup(resp) : NULL;
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+    *out = entries;
+    *out_count = count;
+    return 0;
+}
+
+void log_db_free_request_entries(log_db_request_entry_t *entries, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        free(entries[i].request_data);
+        free(entries[i].response_data);
+    }
+    free(entries);
 }
 
 int log_db_checkpoint(log_db_t *ldb) {

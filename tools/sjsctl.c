@@ -590,6 +590,24 @@ int main(int argc, char **argv) {
         const char *dir = argv[arg_start + 1];
         const char *prefix = (arg_start + 2 < argc) ? argv[arg_start + 2] : "";
 
+        /* Clear all __compiled/ bytecode caches before uploading so stale
+         * entries cannot shadow the new source files. */
+        {
+            char sbuf[4096], ebuf[4096];
+            const char *cs = prefixed_key(tenant_prefix_str, "__compiled/",
+                                          sbuf, sizeof(sbuf));
+            const char *ce = prefixed_key(tenant_prefix_str, "__compiled/\x7f",
+                                          ebuf, sizeof(ebuf));
+            kv_range_result_t cr;
+            if (kv_range(kv, cs, ce, 100000, &cr) == 0) {
+                for (size_t ci = 0; ci < cr.count; ci++)
+                    kv_delete(kv, cr.entries[ci].key);
+                if (cr.count > 0)
+                    printf("Cleared %zu cached bytecode entries\n", cr.count);
+                kv_range_free(&cr);
+            }
+        }
+
         int n = upload_dir(kv, dir, prefix, tenant_prefix_str);
         printf("Imported %d files\n", n);
 
