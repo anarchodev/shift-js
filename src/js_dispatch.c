@@ -546,6 +546,115 @@ static void sjs_jsonp_wrap(char **body, uint32_t *body_len,
 }
 
 /* ======================================================================
+ * Replay capture flush helper
+ * ====================================================================== */
+
+static void flush_replay(sjs_request_ctx_t *req, JSContext *ctx,
+                          int status_code, const char *error_msg) {
+    sjs_replay_capture_t *cap = req->replay_capture;
+    if (!cap || !req->log_db) return;
+
+    replay_capture_finalize(&cap->kv_tape);
+    replay_capture_finalize(&cap->date_tape);
+    replay_capture_finalize(&cap->math_random_tape);
+    replay_capture_finalize(&cap->module_tree);
+
+    /* Build request data JSON */
+    char *req_json = NULL;
+    {
+        JSValue obj = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, obj, "method",
+            JS_NewString(ctx, req->method));
+        JS_SetPropertyStr(ctx, obj, "path",
+            JS_NewString(ctx, req->path));
+        if (req->body && req->body_len > 0)
+            JS_SetPropertyStr(ctx, obj, "body",
+                JS_NewStringLen(ctx, req->body, req->body_len));
+        else
+            JS_SetPropertyStr(ctx, obj, "body", JS_NULL);
+
+        JSValue hdrs = JS_NewObject(ctx);
+        for (uint32_t h = 0; h < req->header_count; h++) {
+            char name[256];
+            size_t nlen = req->headers[h].name_len;
+            if (nlen >= sizeof(name)) nlen = sizeof(name) - 1;
+            memcpy(name, req->headers[h].name, nlen);
+            name[nlen] = '\0';
+            JS_SetPropertyStr(ctx, hdrs, name,
+                JS_NewStringLen(ctx, req->headers[h].value,
+                                req->headers[h].value_len));
+        }
+        JS_SetPropertyStr(ctx, obj, "headers", hdrs);
+
+        if (cap->session_json) {
+            JSValue sjs_str = JS_NewString(ctx, cap->session_json);
+            JSValue parsed = js_json_parse(ctx, sjs_str);
+            JS_SetPropertyStr(ctx, obj, "session",
+                JS_IsException(parsed) ? JS_NULL : parsed);
+        } else {
+            JS_SetPropertyStr(ctx, obj, "session", JS_NULL);
+        }
+
+        JSValue str_result = js_json_stringify(ctx, obj);
+        if (JS_IsString(str_result)) {
+            const char *s = JS_ToCString(ctx, str_result);
+            req_json = strdup(s);
+            JS_FreeCString(ctx, s);
+        }
+    }
+
+    /* Build response JSON (include error if present) */
+    char *resp_json = NULL;
+    if (error_msg) {
+        /* Estimate size: fixed overhead + escaped error string */
+        size_t elen = strlen(error_msg);
+        size_t rsize = 128 + elen * 2;
+        resp_json = malloc(rsize);
+        if (resp_json) {
+            /* Build JSON with escaped error string */
+            int off = snprintf(resp_json, rsize, "{\"status\":%d,\"error\":\"",
+                               status_code);
+            /* Minimal JSON string escape */
+            for (size_t i = 0; i < elen && (size_t)off < rsize - 3; i++) {
+                char c = error_msg[i];
+                if (c == '"' || c == '\\') {
+                    resp_json[off++] = '\\';
+                    resp_json[off++] = c;
+                } else if (c == '\n') {
+                    resp_json[off++] = '\\';
+                    resp_json[off++] = 'n';
+                } else if (c == '\r') {
+                    resp_json[off++] = '\\';
+                    resp_json[off++] = 'r';
+                } else if ((unsigned char)c >= 0x20) {
+                    resp_json[off++] = c;
+                }
+            }
+            resp_json[off++] = '"';
+            resp_json[off++] = '}';
+            resp_json[off] = '\0';
+        }
+    } else {
+        resp_json = malloc(64);
+        if (resp_json)
+            snprintf(resp_json, 64, "{\"status\":%d}", status_code);
+    }
+
+    log_db_flush_replay(req->log_db, req->request_id,
+        req_json, resp_json,
+        cap->kv_tape.data,
+        req->tape ? req->tape->data : NULL,
+        req->tape ? req->tape->len : 0,
+        cap->date_tape.data,
+        cap->math_random_tape.data,
+        cap->module_tree.data,
+        NULL);
+
+    free(req_json);
+    free(resp_json);
+}
+
+/* ======================================================================
  * Main dispatch
  * ====================================================================== */
 
@@ -887,79 +996,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         }
 
         /* Flush replay capture to log DB */
-        if (req->replay_capture && req->log_db) {
-            sjs_replay_capture_t *cap = req->replay_capture;
-
-            replay_capture_finalize(&cap->kv_tape);
-            replay_capture_finalize(&cap->date_tape);
-            replay_capture_finalize(&cap->math_random_tape);
-            replay_capture_finalize(&cap->module_tree);
-
-            /* Build request data JSON */
-            char *req_json = NULL;
-            {
-                JSValue obj = JS_NewObject(ctx);
-                JS_SetPropertyStr(ctx, obj, "method",
-                    JS_NewString(ctx, req->method));
-                JS_SetPropertyStr(ctx, obj, "path",
-                    JS_NewString(ctx, req->path));
-                if (req->body && req->body_len > 0)
-                    JS_SetPropertyStr(ctx, obj, "body",
-                        JS_NewStringLen(ctx, req->body, req->body_len));
-                else
-                    JS_SetPropertyStr(ctx, obj, "body", JS_NULL);
-
-                JSValue hdrs = JS_NewObject(ctx);
-                for (uint32_t h = 0; h < req->header_count; h++) {
-                    char name[256];
-                    size_t nlen = req->headers[h].name_len;
-                    if (nlen >= sizeof(name)) nlen = sizeof(name) - 1;
-                    memcpy(name, req->headers[h].name, nlen);
-                    name[nlen] = '\0';
-                    JS_SetPropertyStr(ctx, hdrs, name,
-                        JS_NewStringLen(ctx, req->headers[h].value,
-                                        req->headers[h].value_len));
-                }
-                JS_SetPropertyStr(ctx, obj, "headers", hdrs);
-
-                if (cap->session_json) {
-                    JSValue sjs_str = JS_NewString(ctx, cap->session_json);
-                    JSValue parsed = js_json_parse(ctx, sjs_str);
-                    JS_SetPropertyStr(ctx, obj, "session",
-                        JS_IsException(parsed) ? JS_NULL : parsed);
-                } else {
-                    JS_SetPropertyStr(ctx, obj, "session", JS_NULL);
-                }
-
-                JSValue str_result = js_json_stringify(ctx, obj);
-                if (JS_IsString(str_result)) {
-                    const char *s = JS_ToCString(ctx, str_result);
-                    req_json = strdup(s);
-                    JS_FreeCString(ctx, s);
-                }
-            }
-
-            char *resp_json = NULL;
-            {
-                size_t rsize = 128 + (body ? *out_len * 2 : 0);
-                resp_json = malloc(rsize);
-                snprintf(resp_json, rsize,
-                    "{\"status\":%d}", req->resp_st->code);
-            }
-
-            log_db_flush_replay(req->log_db, req->request_id,
-                req_json, resp_json,
-                cap->kv_tape.data,
-                req->tape ? req->tape->data : NULL,
-                req->tape ? req->tape->len : 0,
-                cap->date_tape.data,
-                cap->math_random_tape.data,
-                cap->module_tree.data,
-                NULL);
-
-            free(req_json);
-            free(resp_json);
-        }
+        flush_replay(req, ctx, req->resp_st->code, NULL);
 
         sjs->current_replay_capture = NULL;
         arena_reset(sjs);
@@ -977,8 +1014,9 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
                 free((void *)req->log_batch->entries[li].msg);
             req->log_batch->count = 0;
         }
-        arena_reset(sjs);
         req->resp_st->code = 500;
+        flush_replay(req, ctx, 500, err_msg);
+        arena_reset(sjs);
         {
             char *body = err_msg ? err_msg : strdup("Internal Server Error");
             *out_len = (uint32_t)strlen(body);
