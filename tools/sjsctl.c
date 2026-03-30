@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -22,6 +23,25 @@ static void on_code_write(kvstore_t *kv, const char *key,
                           const char *tenant_prefix);
 static void on_code_delete(kvstore_t *kv, const char *key,
                            const char *tenant_prefix);
+
+/* Extensions treated as static files (served from __static/ not __code/) */
+static const char *STATIC_EXTS[] = {
+    ".js", ".css", ".html", ".json", ".svg", ".png", ".jpg", ".jpeg",
+    ".gif", ".ico", ".woff", ".woff2", ".ttf", ".map", ".xml", ".txt",
+    ".wasm",
+};
+static const size_t STATIC_EXT_COUNT =
+    sizeof(STATIC_EXTS) / sizeof(STATIC_EXTS[0]);
+
+static int is_static_file(const char *filename) {
+    const char *dot = strrchr(filename, '.');
+    if (!dot) return 0;
+    for (size_t i = 0; i < STATIC_EXT_COUNT; i++) {
+        if (strcasecmp(dot, STATIC_EXTS[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
 
 static int write_file(const char *path, const void *data, size_t len) {
     FILE *f = fopen(path, "wb");
@@ -116,13 +136,17 @@ static void sync_single_file(watch_ctx_t *ctx, const char *relpath) {
     char filepath[4096];
     snprintf(filepath, sizeof(filepath), "%s/%s", ctx->dir, relpath);
 
-    /* Build KV key: [tenant_prefix]__code/[code_prefix/]<relpath> */
+    /* Determine if this is a static file or a code file */
+    int is_static = is_static_file(relpath);
+    const char *kv_ns = is_static ? "__static" : "__code";
+
+    /* Build KV key: [tenant_prefix]<ns>/[code_prefix/]<relpath> */
     char raw_key[4096];
     if (ctx->code_prefix[0])
-        snprintf(raw_key, sizeof(raw_key), "__code/%s/%s",
-                 ctx->code_prefix, relpath);
+        snprintf(raw_key, sizeof(raw_key), "%s/%s/%s",
+                 kv_ns, ctx->code_prefix, relpath);
     else
-        snprintf(raw_key, sizeof(raw_key), "__code/%s", relpath);
+        snprintf(raw_key, sizeof(raw_key), "%s/%s", kv_ns, relpath);
 
     char key[4096];
     const char *actual_key = prefixed_key(ctx->tenant_prefix, raw_key,
@@ -136,7 +160,8 @@ static void sync_single_file(watch_ctx_t *ctx, const char *relpath) {
     }
 
     if (kv_put(ctx->kv, actual_key, contents, flen) == 0) {
-        on_code_write(ctx->kv, actual_key, contents, flen, ctx->tenant_prefix);
+        if (!is_static)
+            on_code_write(ctx->kv, actual_key, contents, flen, ctx->tenant_prefix);
         printf("  [watch] %s → %s (%zu bytes)\n", relpath, actual_key, flen);
     } else {
         fprintf(stderr, "  [watch] FAILED: %s\n", actual_key);
@@ -146,19 +171,23 @@ static void sync_single_file(watch_ctx_t *ctx, const char *relpath) {
 }
 
 static void delete_single_file(watch_ctx_t *ctx, const char *relpath) {
+    int is_static = is_static_file(relpath);
+    const char *kv_ns = is_static ? "__static" : "__code";
+
     char raw_key[4096];
     if (ctx->code_prefix[0])
-        snprintf(raw_key, sizeof(raw_key), "__code/%s/%s",
-                 ctx->code_prefix, relpath);
+        snprintf(raw_key, sizeof(raw_key), "%s/%s/%s",
+                 kv_ns, ctx->code_prefix, relpath);
     else
-        snprintf(raw_key, sizeof(raw_key), "__code/%s", relpath);
+        snprintf(raw_key, sizeof(raw_key), "%s/%s", kv_ns, relpath);
 
     char key[4096];
     const char *actual_key = prefixed_key(ctx->tenant_prefix, raw_key,
                                           key, sizeof(key));
 
     if (kv_delete(ctx->kv, actual_key) == 0) {
-        on_code_delete(ctx->kv, actual_key, ctx->tenant_prefix);
+        if (!is_static)
+            on_code_delete(ctx->kv, actual_key, ctx->tenant_prefix);
         printf("  [watch] deleted %s\n", actual_key);
     }
 }
@@ -374,13 +403,17 @@ static int upload_dir(kvstore_t *kv, const char *dir_path,
 
         if (!S_ISREG(st.st_mode)) continue;
 
-        /* Build KV key: [tenant_prefix]__code/[code_prefix/]<filename> */
+        /* Determine if this is a static file or a code file */
+        int is_static = is_static_file(ent->d_name);
+        const char *kv_ns = is_static ? "__static" : "__code";
+
+        /* Build KV key: [tenant_prefix]<ns>/[code_prefix/]<filename> */
         char raw_key[4096];
         if (code_prefix[0])
-            snprintf(raw_key, sizeof(raw_key), "__code/%s/%s",
-                     code_prefix, ent->d_name);
+            snprintf(raw_key, sizeof(raw_key), "%s/%s/%s",
+                     kv_ns, code_prefix, ent->d_name);
         else
-            snprintf(raw_key, sizeof(raw_key), "__code/%s", ent->d_name);
+            snprintf(raw_key, sizeof(raw_key), "%s/%s", kv_ns, ent->d_name);
 
         char key[4096];
         const char *actual_key = prefixed_key(tenant_prefix, raw_key,
@@ -394,7 +427,8 @@ static int upload_dir(kvstore_t *kv, const char *dir_path,
         }
 
         if (kv_put(kv, actual_key, contents, flen) == 0) {
-            on_code_write(kv, actual_key, contents, flen, tenant_prefix);
+            if (!is_static)
+                on_code_write(kv, actual_key, contents, flen, tenant_prefix);
             printf("  %s → %s (%zu bytes)\n", filepath, actual_key, flen);
             count++;
         } else {

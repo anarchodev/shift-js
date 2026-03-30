@@ -2120,8 +2120,8 @@ static int sjs_resolve_request_route(sjs_runtime_t *sjs, const char *path,
         /* Record module in replay capture even on cache hit.
          * Try each extension to find the __code_meta/ entry. */
         if (sjs->current_replay_capture) {
-            static const char *exts[] = { ".mjs", ".ejs" };
-            for (int ei = 0; ei < 2; ei++) {
+            static const char *exts[] = { ".mjs", ".ejs", ".ts", ".tsx" };
+            for (int ei = 0; ei < 4; ei++) {
                 char mod_name[256];
                 snprintf(mod_name, sizeof(mod_name), "%s%s", base_path, exts[ei]);
                 char meta_raw[256];

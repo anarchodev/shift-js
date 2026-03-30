@@ -16,8 +16,62 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdatomic.h>
 #include <time.h>
+
+/* Static file extension → content-type mapping */
+typedef struct {
+    const char *ext;
+    const char *content_type;
+} static_mime_t;
+
+static const static_mime_t STATIC_MIMES[] = {
+    { ".js",    "application/javascript" },
+    { ".mjs",   "application/javascript" },
+    { ".css",   "text/css" },
+    { ".html",  "text/html" },
+    { ".json",  "application/json" },
+    { ".svg",   "image/svg+xml" },
+    { ".png",   "image/png" },
+    { ".jpg",   "image/jpeg" },
+    { ".jpeg",  "image/jpeg" },
+    { ".gif",   "image/gif" },
+    { ".ico",   "image/x-icon" },
+    { ".woff",  "font/woff" },
+    { ".woff2", "font/woff2" },
+    { ".ttf",   "font/ttf" },
+    { ".map",   "application/json" },
+    { ".xml",   "application/xml" },
+    { ".txt",   "text/plain" },
+    { ".wasm",  "application/wasm" },
+};
+
+static const size_t STATIC_MIME_COUNT =
+    sizeof(STATIC_MIMES) / sizeof(STATIC_MIMES[0]);
+
+/* Check if a URL path has a static file extension. Returns the content-type
+ * if it matches, or NULL if it's not a static file path. */
+static const char *static_content_type(const char *path, uint32_t path_len) {
+    /* Find the last '.' in the path (ignoring query string) */
+    const char *qmark = memchr(path, '?', path_len);
+    uint32_t check_len = qmark ? (uint32_t)(qmark - path) : path_len;
+
+    const char *dot = NULL;
+    for (int i = (int)check_len - 1; i >= 0; i--) {
+        if (path[i] == '.') { dot = &path[i]; break; }
+        if (path[i] == '/') break;
+    }
+    if (!dot) return NULL;
+
+    size_t ext_len = (size_t)(&path[check_len] - dot);
+    for (size_t i = 0; i < STATIC_MIME_COUNT; i++) {
+        if (strlen(STATIC_MIMES[i].ext) == ext_len &&
+            !strncasecmp(STATIC_MIMES[i].ext, dot, ext_len))
+            return STATIC_MIMES[i].content_type;
+    }
+    return NULL;
+}
 
 #define MAX_CONNECTIONS 4096
 #define MAX_STREAMS     (MAX_CONNECTIONS * 128)
@@ -513,6 +567,55 @@ void *sjs_worker_fn(void *arg) {
 
                 char *method_str = header_to_str(method_val, method_len);
                 char *path_str   = header_to_str(path_val, path_len);
+
+                /* ---- Static file fast path ---- */
+                const char *mime = static_content_type(path_val, path_len);
+                if (mime) {
+                    /* Strip leading slashes and query string to build key */
+                    const char *p = path_val;
+                    uint32_t plen = path_len;
+                    while (plen > 0 && *p == '/') { p++; plen--; }
+                    const char *qm = memchr(p, '?', plen);
+                    if (qm) plen = (uint32_t)(qm - p);
+
+                    char static_raw[512];
+                    snprintf(static_raw, sizeof(static_raw),
+                             "__static/%.*s", (int)plen, p);
+                    char static_key[512];
+                    const char *sk = kv_prefixed_key(prefix, static_raw,
+                                                      static_key, sizeof(static_key));
+
+                    void *sval = NULL;
+                    size_t sval_len = 0;
+                    if (sk && kv_get(kv, sk, &sval, &sval_len) == 0) {
+                        sh2_status_t *st = NULL;
+                        shift_entity_get_component(sh, e, comp.status, (void **)&st);
+                        st->code = 200;
+
+                        sh2_resp_body_t *rb = NULL;
+                        shift_entity_get_component(sh, e, comp.resp_body, (void **)&rb);
+                        rb->data = sval;
+                        rb->len  = (uint32_t)sval_len;
+
+                        sh2_resp_headers_t *rh = NULL;
+                        shift_entity_get_component(sh, e, comp.resp_headers, (void **)&rh);
+                        sh2_header_field_t *hf = malloc(sizeof(sh2_header_field_t));
+                        hf[0] = (sh2_header_field_t){
+                            .name      = strdup("content-type"),
+                            .name_len  = 12,
+                            .value     = strdup(mime),
+                            .value_len = (uint32_t)strlen(mime),
+                        };
+                        rh->fields = hf;
+                        rh->count  = 1;
+
+                        shift_entity_move_one(sh, e, response_in);
+                        free(method_str);
+                        free(path_str);
+                        continue;
+                    }
+                    /* Not found in __static/ — fall through to normal dispatch */
+                }
 
                 /* Get sjs component pointers (initialized by constructors) */
                 sjs_resp_headers_t *resp_hdrs = NULL;
