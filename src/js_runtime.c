@@ -1216,12 +1216,81 @@ static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
     JSValue func = JS_Eval(ctx, compile_source, compile_len, resolved_name,
                            JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
     free(compile_source);
-    free(resolved_alloc);
 
-    if (JS_IsException(func)) return NULL;
+    if (JS_IsException(func)) { free(resolved_alloc); return NULL; }
+
+    /* Cache bytecode for imported modules so the per-request runtime can
+     * load them without a full compile context. */
+    size_t bc_len;
+    uint8_t *bc = JS_WriteObject(ctx, &bc_len, func,
+                                 JS_WRITE_OBJ_BYTECODE);
+    if (bc) {
+        /* Strip extension for cache key: "components/greeting.tsx" →
+         * "__compiled/components/greeting" */
+        char base[256];
+        snprintf(base, sizeof(base), "%s", resolved_name);
+        char *dot = strrchr(base, '.');
+        char *slash = strrchr(base, '/');
+        if (dot && (!slash || dot > slash)) *dot = '\0';
+
+        char raw_cache[256];
+        snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base);
+        char cache_buf[512];
+        const char *ck = sjs_prefixed_key(sjs->current_prefix, raw_cache,
+                                          cache_buf, sizeof(cache_buf));
+        if (ck)
+            kv_put(sjs->kv, ck, bc, bc_len);
+        js_free(ctx, bc);
+    }
+
+    free(resolved_alloc);
 
     JSModuleDef *mod = JS_VALUE_GET_PTR(func);
     JS_FreeValue(ctx, func);
+    return mod;
+}
+
+/* ======================================================================
+ * Request-time module loader
+ *
+ * Loads pre-compiled bytecode from KV for import resolution on the
+ * per-request (snapshot-restored) runtime.
+ * ====================================================================== */
+
+static JSModuleDef *sjs_request_module_loader(JSContext *ctx,
+                                              const char *module_name,
+                                              void *opaque) {
+    sjs_runtime_t *sjs = JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
+    if (!sjs || !sjs->kv) return NULL;
+
+    sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
+    const char *prefix = req ? req->kv_prefix : NULL;
+
+    /* Build cache key: strip extension, look up __compiled/<base> */
+    char base[256];
+    snprintf(base, sizeof(base), "%s", module_name);
+    char *dot = strrchr(base, '.');
+    char *slash = strrchr(base, '/');
+    if (dot && (!slash || dot > slash)) *dot = '\0';
+
+    char raw_cache[256];
+    snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", base);
+    char cache_buf[512];
+    const char *ck = sjs_prefixed_key(prefix, raw_cache,
+                                      cache_buf, sizeof(cache_buf));
+    if (!ck) return NULL;
+
+    void  *bc = NULL;
+    size_t bc_len = 0;
+    if (kv_get(sjs->kv, ck, &bc, &bc_len) != 0 || !bc) return NULL;
+
+    JSValue module_val = JS_ReadObject(ctx, bc, bc_len, JS_READ_OBJ_BYTECODE);
+    free(bc);
+
+    if (JS_IsException(module_val)) return NULL;
+
+    JSModuleDef *mod = JS_VALUE_GET_PTR(module_val);
+    JS_FreeValue(ctx, module_val);
     return mod;
 }
 
@@ -2354,6 +2423,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         }
 
         JS_SetContextOpaque(ctx, req);
+        JS_SetModuleLoaderFunc(rt, NULL, sjs_request_module_loader, NULL);
 
         /* Phase 3: Begin transaction, load bytecode, evaluate module */
         if (kv_begin(sjs->kv) == KV_CONFLICT) {
