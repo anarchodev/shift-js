@@ -76,6 +76,7 @@ int main(int argc, char **argv) {
     uint16_t    port    = 9000;
     int         nworkers = 0;
     bool        tls      = false;
+    bool        no_log   = false;
 
     /* Raft options */
     int         raft_id    = -1;  /* -1 = disabled */
@@ -90,6 +91,7 @@ int main(int argc, char **argv) {
         { "raft-port",  required_argument, NULL, 'Q' },
         { "batch-ms",   required_argument, NULL, 'B' },
         { "batch-max",  required_argument, NULL, 'M' },
+        { "no-log",     no_argument,       NULL, 'N' },
         { NULL, 0, NULL, 0 },
     };
 
@@ -106,6 +108,7 @@ int main(int argc, char **argv) {
         case 'Q': raft_port  = (uint16_t)atoi(optarg); break;
         case 'B': batch_ms   = atoi(optarg); break;
         case 'M': batch_max  = atoi(optarg); break;
+        case 'N': no_log    = true; break;
         default:  usage(argv[0]); return 1;
         }
     }
@@ -194,6 +197,7 @@ int main(int argc, char **argv) {
             .tls         = tls,
             .preprocessors = &preprocessors,
             .raft        = raft,
+            .no_log      = no_log,
         };
         pthread_create(&threads[i], NULL, sjs_worker_fn, &configs[i]);
     }

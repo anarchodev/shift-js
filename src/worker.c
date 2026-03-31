@@ -382,11 +382,14 @@ void *sjs_worker_fn(void *arg) {
 
     /* ---- Log DB (per-worker file, separate from KV) ---- */
     log_db_t log_db = {0};
-    char log_path[64];
-    snprintf(log_path, sizeof(log_path), "logs_%d.db", wcfg->worker_id);
-    if (log_db_open(&log_db, log_path) != 0)
-        fprintf(stderr, "Worker %d: log_db_open failed (logging disabled)\n",
-                wcfg->worker_id);
+    if (!wcfg->no_log) {
+        char log_path[64], replay_path[64];
+        snprintf(log_path, sizeof(log_path), "logs_%d.db", wcfg->worker_id);
+        snprintf(replay_path, sizeof(replay_path), "replay_%d.log", wcfg->worker_id);
+        if (log_db_open(&log_db, log_path, replay_path) != 0)
+            fprintf(stderr, "Worker %d: log_db_open failed (logging disabled)\n",
+                    wcfg->worker_id);
+    }
     uint64_t request_counter = 0;
 
     /* ---- Log DB reader (read-only handles to all worker DBs) ---- */

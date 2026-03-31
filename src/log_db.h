@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <sqlite3.h>
 
 #define LOG_BATCH_MAX 64  /* max console.log calls per request */
@@ -49,14 +50,17 @@ typedef struct {
 
 void sjs_log_record_free(sjs_log_record_t *rec);
 
-/* Per-worker log DB handle */
+/* Per-worker log DB handle.
+ * Console.log entries go to SQLite. Replay captures go to an append-only
+ * binary log file with a tiny SQLite index for lookups. */
 typedef struct log_db {
     sqlite3      *db;
-    sqlite3_stmt *insert_stmt;
-    sqlite3_stmt *replay_insert_stmt;
+    sqlite3_stmt *insert_stmt;        /* console.log insert */
+    sqlite3_stmt *replay_index_stmt;  /* replay index insert */
+    FILE         *replay_file;        /* append-only binary log */
 } log_db_t;
 
-int  log_db_open(log_db_t *ldb, const char *path);
+int  log_db_open(log_db_t *ldb, const char *db_path, const char *replay_path);
 void log_db_close(log_db_t *ldb);
 
 /* Flush a batch of log entries for one request.
@@ -64,40 +68,24 @@ void log_db_close(log_db_t *ldb);
 int  log_db_flush(log_db_t *ldb, int worker_id, uint64_t request_id,
                   const char *session_id, const log_batch_t *batch);
 
-/* Flush replay capture data for one request. */
-int  log_db_flush_replay(log_db_t *ldb, uint64_t request_id,
-                         const char *request_data,
-                         const char *response_data,
-                         const char *kv_tape,
-                         const uint8_t *random_tape, size_t random_tape_len,
-                         const char *date_tape,
-                         const char *math_random_tape,
-                         const char *module_tree,
-                         const char *source_maps);
-
-/* Query replay capture for a request. Caller frees all returned strings.
- * Returns 0 on success, -1 on not found. */
-int  log_db_get_replay(log_db_t *ldb, uint64_t request_id,
+/* Query replay capture for a request from a reader.
+ * Caller frees all returned strings. Returns 0 on success, -1 on not found. */
+int  log_db_get_replay(sqlite3 *db, FILE *replay_file, uint64_t request_id,
                        char **request_data,
-                       char **response_data,
                        char **kv_tape,
                        uint8_t **random_tape, size_t *random_tape_len,
                        char **date_tape,
                        char **math_random_tape,
-                       char **module_tree,
-                       char **source_maps);
+                       char **module_tree);
 
-/* List recent requests from replay_captures.
- * Returns an array of (request_id, request_data, response_data) rows.
- * Caller must free returned strings and the array itself.
- * Returns count on success, -1 on error. */
+/* List recent requests from replay index.
+ * Caller must free returned strings and the array itself. */
 typedef struct {
     uint64_t request_id;
     char    *request_data;   /* JSON */
-    char    *response_data;  /* JSON, may be NULL */
 } log_db_request_entry_t;
 
-int  log_db_list_requests(log_db_t *ldb, int limit,
+int  log_db_list_requests(sqlite3 *db, FILE *replay_file, int limit,
                           log_db_request_entry_t **out, size_t *out_count);
 void log_db_free_request_entries(log_db_request_entry_t *entries, size_t count);
 
@@ -112,6 +100,7 @@ void log_db_flush_commit(log_db_t *ldb);
 /* Read-only multi-DB reader for cross-worker log queries. */
 typedef struct {
     sqlite3 **dbs;
+    FILE    **replay_files;
     int       count;
 } log_db_reader_t;
 

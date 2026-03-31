@@ -985,9 +985,9 @@ static JSValue js_logs_replay(JSContext *ctx, JSValue this_val,
     int64_t rid;
     if (JS_ToInt64(ctx, &rid, argv[0])) return JS_EXCEPTION;
 
-    char *request_data = NULL, *response_data = NULL,
+    char *request_data = NULL,
          *kv_tape = NULL, *date_tape = NULL,
-         *math_random_tape = NULL, *module_tree = NULL, *source_maps = NULL;
+         *math_random_tape = NULL, *module_tree = NULL;
     uint8_t *random_tape = NULL;
     size_t random_tape_len = 0;
 
@@ -995,13 +995,13 @@ static JSValue js_logs_replay(JSContext *ctx, JSValue this_val,
     log_db_reader_t *reader = req->log_reader;
     int rc = -1;
     for (int w = 0; w < reader->count && rc != 0; w++) {
-        if (!reader->dbs[w]) continue;
-        log_db_t tmp = { .db = reader->dbs[w] };
-        rc = log_db_get_replay(&tmp, (uint64_t)rid,
-                               &request_data, &response_data,
+        if (!reader->dbs[w] || !reader->replay_files[w]) continue;
+        rc = log_db_get_replay(reader->dbs[w], reader->replay_files[w],
+                               (uint64_t)rid,
+                               &request_data,
                                &kv_tape, &random_tape, &random_tape_len,
                                &date_tape, &math_random_tape,
-                               &module_tree, &source_maps);
+                               &module_tree);
     }
     if (rc != 0) return JS_NULL;
 
@@ -1023,12 +1023,10 @@ static JSValue js_logs_replay(JSContext *ctx, JSValue this_val,
     } while (0)
 
     PARSE_JSON_FIELD("request", request_data);
-    PARSE_JSON_FIELD("response", response_data);
     PARSE_JSON_FIELD("kv_tape", kv_tape);
     PARSE_JSON_FIELD("date_tape", date_tape);
     PARSE_JSON_FIELD("math_random_tape", math_random_tape);
     PARSE_JSON_FIELD("module_tree", module_tree);
-    PARSE_JSON_FIELD("source_maps", source_maps);
 
     #undef PARSE_JSON_FIELD
 
@@ -1076,11 +1074,11 @@ static JSValue js_logs_requests(JSContext *ctx, JSValue this_val,
     if (!all) return JS_NewArray(ctx);
 
     for (int w = 0; w < reader->count; w++) {
-        if (!reader->dbs[w]) continue;
-        log_db_t tmp = { .db = reader->dbs[w] };
+        if (!reader->dbs[w] || !reader->replay_files[w]) continue;
         log_db_request_entry_t *entries = NULL;
         size_t count = 0;
-        if (log_db_list_requests(&tmp, limit, &entries, &count) != 0)
+        if (log_db_list_requests(reader->dbs[w], reader->replay_files[w],
+                                 limit, &entries, &count) != 0)
             continue;
         for (size_t i = 0; i < count && total < cap; i++)
             all[total++] = entries[i];  /* steal ownership */
@@ -1104,15 +1102,6 @@ static JSValue js_logs_requests(JSContext *ctx, JSValue this_val,
                 JS_IsException(parsed) ? JS_NULL : parsed);
         } else {
             JS_SetPropertyStr(ctx, entry, "request", JS_NULL);
-        }
-
-        if (all[i].response_data) {
-            JSValue s = JS_NewString(ctx, all[i].response_data);
-            JSValue parsed = js_json_parse(ctx, s);
-            JS_SetPropertyStr(ctx, entry, "response",
-                JS_IsException(parsed) ? JS_NULL : parsed);
-        } else {
-            JS_SetPropertyStr(ctx, entry, "response", JS_NULL);
         }
 
         JS_SetPropertyUint32(ctx, arr, (uint32_t)i, entry);
