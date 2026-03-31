@@ -186,6 +186,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nworkers; i++) {
         configs[i] = (sjs_worker_config_t){
             .worker_id   = i,
+            .num_workers = nworkers,
             .worker_core = i,
             .db_path     = db_path,
             .port        = port,

@@ -43,12 +43,10 @@ int log_db_open(log_db_t *ldb, const char *path) {
         return -1;
     }
 
-    /* WAL mode, no fsync, no auto-checkpoint.
-     * Busy timeout so concurrent worker inits don't fail on schema creation. */
+    /* WAL mode, no fsync. Each worker has its own DB so no write contention. */
     sqlite3_busy_timeout(ldb->db, 5000);
     sqlite3_exec(ldb->db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
     sqlite3_exec(ldb->db, "PRAGMA synchronous=OFF", NULL, NULL, NULL);
-    sqlite3_wal_autocheckpoint(ldb->db, 0);
 
     /* Create schema */
     char *err = NULL;
@@ -98,6 +96,82 @@ void log_db_close(log_db_t *ldb) {
         sqlite3_close(ldb->db);
         ldb->db = NULL;
     }
+}
+
+void sjs_log_record_free(sjs_log_record_t *rec) {
+    for (uint32_t i = 0; i < rec->log_count; i++)
+        free((void *)rec->log_entries[i].msg);
+    free(rec->log_entries);
+    free(rec->session_id);
+    free(rec->req_json);
+    free(rec->kv_tape);
+    free(rec->random_tape);
+    free(rec->date_tape);
+    free(rec->math_random_tape);
+    free(rec->module_tree);
+}
+
+void log_db_flush_begin(log_db_t *ldb) {
+    if (ldb->db)
+        sqlite3_exec(ldb->db, "BEGIN", NULL, NULL, NULL);
+}
+
+void log_db_flush_one(log_db_t *ldb, sjs_log_record_t *rec) {
+    if (!ldb->db) return;
+
+    /* console.log entries */
+    if (ldb->insert_stmt) {
+        for (uint32_t i = 0; i < rec->log_count; i++) {
+            const log_pending_t *e = &rec->log_entries[i];
+            sqlite3_stmt *s = ldb->insert_stmt;
+            sqlite3_bind_int64(s, 1, (sqlite3_int64)e->timestamp_ns);
+            sqlite3_bind_int(s, 2, rec->worker_id);
+            sqlite3_bind_int64(s, 3, (sqlite3_int64)rec->request_id);
+            if (rec->session_id)
+                sqlite3_bind_text(s, 4, rec->session_id, -1, SQLITE_STATIC);
+            else
+                sqlite3_bind_null(s, 4);
+            sqlite3_bind_int(s, 5, (int)e->level);
+            sqlite3_bind_text(s, 6, e->msg, (int)e->msg_len, SQLITE_STATIC);
+            sqlite3_step(s);
+            sqlite3_reset(s);
+        }
+    }
+
+    /* replay capture */
+    if (ldb->replay_insert_stmt && rec->req_json) {
+        sqlite3_stmt *s = ldb->replay_insert_stmt;
+        sqlite3_bind_int64(s, 1, (sqlite3_int64)rec->request_id);
+        sqlite3_bind_text(s, 2, rec->req_json, -1, SQLITE_STATIC);
+        sqlite3_bind_null(s, 3);  /* response_data — replay recreates it */
+        sqlite3_bind_text(s, 4, rec->kv_tape, -1, SQLITE_STATIC);
+        if (rec->random_tape && rec->random_tape_len > 0)
+            sqlite3_bind_blob(s, 5, rec->random_tape,
+                              (int)rec->random_tape_len, SQLITE_STATIC);
+        else
+            sqlite3_bind_null(s, 5);
+        sqlite3_bind_text(s, 6, rec->date_tape, -1, SQLITE_STATIC);
+        sqlite3_bind_text(s, 7, rec->math_random_tape, -1, SQLITE_STATIC);
+        sqlite3_bind_text(s, 8, rec->module_tree, -1, SQLITE_STATIC);
+        sqlite3_bind_null(s, 9);  /* source_maps */
+        sqlite3_step(s);
+        sqlite3_reset(s);
+    }
+}
+
+void log_db_flush_commit(log_db_t *ldb) {
+    if (ldb->db)
+        sqlite3_exec(ldb->db, "COMMIT", NULL, NULL, NULL);
+}
+
+int log_db_flush_records(log_db_t *ldb, sjs_log_record_t *records, size_t count) {
+    if (!ldb->db || count == 0) return 0;
+
+    log_db_flush_begin(ldb);
+    for (size_t r = 0; r < count; r++)
+        log_db_flush_one(ldb, &records[r]);
+    log_db_flush_commit(ldb);
+    return 0;
 }
 
 int log_db_flush(log_db_t *ldb, int worker_id, uint64_t request_id,
@@ -268,10 +342,35 @@ void log_db_free_request_entries(log_db_request_entry_t *entries, size_t count) 
     free(entries);
 }
 
-int log_db_checkpoint(log_db_t *ldb) {
-    if (!ldb->db) return -1;
-    int rc = sqlite3_wal_checkpoint_v2(ldb->db, NULL,
-                                        SQLITE_CHECKPOINT_PASSIVE,
-                                        NULL, NULL);
-    return (rc == SQLITE_OK) ? 0 : -1;
+int log_db_reader_open(log_db_reader_t *r, int num_workers) {
+    r->dbs = calloc((size_t)num_workers, sizeof(sqlite3 *));
+    if (!r->dbs) return -1;
+    r->count = num_workers;
+
+    for (int i = 0; i < num_workers; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "logs_%d.db", i);
+        int rc = sqlite3_open_v2(path, &r->dbs[i],
+                                 SQLITE_OPEN_READONLY | SQLITE_OPEN_WAL, NULL);
+        if (rc != SQLITE_OK) {
+            /* DB may not exist yet if worker hasn't started — that's OK */
+            if (r->dbs[i]) sqlite3_close(r->dbs[i]);
+            r->dbs[i] = NULL;
+            continue;
+        }
+        sqlite3_busy_timeout(r->dbs[i], 1000);
+    }
+    return 0;
 }
+
+void log_db_reader_close(log_db_reader_t *r) {
+    if (!r->dbs) return;
+    for (int i = 0; i < r->count; i++) {
+        if (r->dbs[i]) sqlite3_close(r->dbs[i]);
+    }
+    free(r->dbs);
+    r->dbs = NULL;
+    r->count = 0;
+}
+
+

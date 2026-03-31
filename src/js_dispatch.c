@@ -549,10 +549,18 @@ static void sjs_jsonp_wrap(char **body, uint32_t *body_len,
  * Replay capture flush helper
  * ====================================================================== */
 
-static void flush_replay(sjs_request_ctx_t *req, JSContext *ctx,
-                          int status_code, const char *error_msg) {
+/* Populate the log record with replay capture data.  Ownership of
+ * the replay_capture tape buffers transfers to the log_record (the
+ * pointers are stolen, not copied). */
+static void capture_replay(sjs_request_ctx_t *req, JSContext *ctx) {
     sjs_replay_capture_t *cap = req->replay_capture;
-    if (!cap || !req->log_db) return;
+    sjs_log_record_t *rec = req->log_record;
+    if (!cap || !rec) return;
+
+    rec->request_id = req->request_id;
+    rec->worker_id = (int)(req->request_id >> 48);
+    rec->session_id = (req->session && req->session->id)
+                      ? strdup(req->session->id) : NULL;
 
     replay_capture_finalize(&cap->kv_tape);
     replay_capture_finalize(&cap->date_tape);
@@ -560,7 +568,6 @@ static void flush_replay(sjs_request_ctx_t *req, JSContext *ctx,
     replay_capture_finalize(&cap->module_tree);
 
     /* Build request data JSON */
-    char *req_json = NULL;
     {
         JSValue obj = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, obj, "method",
@@ -598,60 +605,45 @@ static void flush_replay(sjs_request_ctx_t *req, JSContext *ctx,
         JSValue str_result = js_json_stringify(ctx, obj);
         if (JS_IsString(str_result)) {
             const char *s = JS_ToCString(ctx, str_result);
-            req_json = strdup(s);
+            rec->req_json = strdup(s);
             JS_FreeCString(ctx, s);
         }
     }
 
-    /* Build response JSON (include error if present) */
-    char *resp_json = NULL;
-    if (error_msg) {
-        /* Estimate size: fixed overhead + escaped error string */
-        size_t elen = strlen(error_msg);
-        size_t rsize = 128 + elen * 2;
-        resp_json = malloc(rsize);
-        if (resp_json) {
-            /* Build JSON with escaped error string */
-            int off = snprintf(resp_json, rsize, "{\"status\":%d,\"error\":\"",
-                               status_code);
-            /* Minimal JSON string escape */
-            for (size_t i = 0; i < elen && (size_t)off < rsize - 3; i++) {
-                char c = error_msg[i];
-                if (c == '"' || c == '\\') {
-                    resp_json[off++] = '\\';
-                    resp_json[off++] = c;
-                } else if (c == '\n') {
-                    resp_json[off++] = '\\';
-                    resp_json[off++] = 'n';
-                } else if (c == '\r') {
-                    resp_json[off++] = '\\';
-                    resp_json[off++] = 'r';
-                } else if ((unsigned char)c >= 0x20) {
-                    resp_json[off++] = c;
-                }
-            }
-            resp_json[off++] = '"';
-            resp_json[off++] = '}';
-            resp_json[off] = '\0';
+    /* Steal tape buffers from replay capture (avoid copy) */
+    rec->kv_tape = cap->kv_tape.data;
+    cap->kv_tape.data = NULL;
+    rec->date_tape = cap->date_tape.data;
+    cap->date_tape.data = NULL;
+    rec->math_random_tape = cap->math_random_tape.data;
+    cap->math_random_tape.data = NULL;
+    rec->module_tree = cap->module_tree.data;
+    cap->module_tree.data = NULL;
+
+    /* Copy random tape (owned by ECS component, freed on arena reset) */
+    if (req->tape && req->tape->data && req->tape->len > 0) {
+        rec->random_tape = malloc(req->tape->len);
+        if (rec->random_tape) {
+            memcpy(rec->random_tape, req->tape->data, req->tape->len);
+            rec->random_tape_len = req->tape->len;
         }
-    } else {
-        resp_json = malloc(64);
-        if (resp_json)
-            snprintf(resp_json, 64, "{\"status\":%d}", status_code);
     }
+}
 
-    log_db_flush_replay(req->log_db, req->request_id,
-        req_json, resp_json,
-        cap->kv_tape.data,
-        req->tape ? req->tape->data : NULL,
-        req->tape ? req->tape->len : 0,
-        cap->date_tape.data,
-        cap->math_random_tape.data,
-        cap->module_tree.data,
-        NULL);
+/* Copy console.log entries from the per-request batch into the log record.
+ * Steals the msg pointers (caller must not free them). */
+static void capture_logs(sjs_request_ctx_t *req) {
+    sjs_log_record_t *rec = req->log_record;
+    log_batch_t *batch = req->log_batch;
+    if (!rec || !batch || batch->count == 0) return;
 
-    free(req_json);
-    free(resp_json);
+    rec->log_entries = malloc(batch->count * sizeof(log_pending_t));
+    if (!rec->log_entries) return;
+    memcpy(rec->log_entries, batch->entries,
+           batch->count * sizeof(log_pending_t));
+    rec->log_count = batch->count;
+    /* Ownership of msg strings transferred — prevent double-free */
+    batch->count = 0;
 }
 
 /* ======================================================================
@@ -984,19 +976,9 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
             continue;
         }
 
-        /* Flush pending log entries to log DB */
-        if (req->log_batch && req->log_batch->count > 0 && req->log_db) {
-            log_db_flush(req->log_db, (int)(req->request_id >> 48),
-                         req->request_id,
-                         req->session ? req->session->id : NULL,
-                         req->log_batch);
-            for (uint32_t i = 0; i < req->log_batch->count; i++)
-                free((void *)req->log_batch->entries[i].msg);
-            req->log_batch->count = 0;
-        }
-
-        /* Flush replay capture to log DB */
-        flush_replay(req, ctx, req->resp_st->code, NULL);
+        /* Capture logs + replay into log record for batched flush */
+        capture_logs(req);
+        capture_replay(req, ctx);
 
         sjs->current_replay_capture = NULL;
         arena_reset(sjs);
@@ -1009,13 +991,9 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
 
     txn_fail:
         kv_rollback(sjs->kv);
-        if (req->log_batch) {
-            for (uint32_t li = 0; li < req->log_batch->count; li++)
-                free((void *)req->log_batch->entries[li].msg);
-            req->log_batch->count = 0;
-        }
         req->resp_st->code = 500;
-        flush_replay(req, ctx, 500, err_msg);
+        capture_logs(req);
+        capture_replay(req, ctx);
         arena_reset(sjs);
         {
             char *body = err_msg ? err_msg : strdup("Internal Server Error");

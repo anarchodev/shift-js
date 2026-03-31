@@ -132,6 +132,7 @@ typedef struct {
     shift_component_id_t bytecode;
     shift_component_id_t resp_status;
     shift_component_id_t raft_seq;
+    shift_component_id_t log_record;
 } sjs_component_ids_t;
 
 /* Per-request view — thin struct of pointers into ECS components.
@@ -163,12 +164,16 @@ typedef struct sjs_request_ctx {
     uint64_t             raft_seq;  /* kv_seq for this request, 0 = not yet assigned */
 
     /* Logging */
-    log_db_t            *log_db;       /* per-worker log DB handle */
+    log_db_t            *log_db;       /* per-worker log DB handle (writes) */
+    log_db_reader_t     *log_reader;   /* read-only handles to all worker DBs */
     log_batch_t         *log_batch;    /* per-request pending entries */
     uint64_t             request_id;   /* monotonic per-worker counter */
 
     /* Replay capture */
     sjs_replay_capture_t *replay_capture;
+
+    /* Output: populated by dispatch, consumed by worker for batched flush */
+    sjs_log_record_t    *log_record;
 } sjs_request_ctx_t;
 
 /* Prefixed key macro — shared across split files. */

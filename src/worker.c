@@ -380,13 +380,19 @@ void *sjs_worker_fn(void *arg) {
         return NULL;
     }
 
-    /* ---- Log DB (per-worker, separate from KV) ---- */
+    /* ---- Log DB (per-worker file, separate from KV) ---- */
     log_db_t log_db = {0};
-    if (log_db_open(&log_db, "logs.db") != 0)
+    char log_path[64];
+    snprintf(log_path, sizeof(log_path), "logs_%d.db", wcfg->worker_id);
+    if (log_db_open(&log_db, log_path) != 0)
         fprintf(stderr, "Worker %d: log_db_open failed (logging disabled)\n",
                 wcfg->worker_id);
     uint64_t request_counter = 0;
-    uint64_t last_log_checkpoint = now_ms();
+
+    /* ---- Log DB reader (read-only handles to all worker DBs) ---- */
+    log_db_reader_t log_reader = {0};
+    if (log_db.db)
+        log_db_reader_open(&log_reader, wcfg->num_workers);
 
     /* ---- Shift context ---- */
     shift_t *sh = NULL;
@@ -441,7 +447,7 @@ void *sjs_worker_fn(void *arg) {
         /* sjs components */
         sjs_comp.resp_headers, sjs_comp.session, sjs_comp.random_tape,
         sjs_comp.route, sjs_comp.bytecode, sjs_comp.resp_status,
-        sjs_comp.raft_seq,
+        sjs_comp.raft_seq, sjs_comp.log_record,
     };
     size_t ncomps = sizeof(all_comps) / sizeof(all_comps[0]);
 
@@ -516,7 +522,7 @@ void *sjs_worker_fn(void *arg) {
             comp.stream_id, comp.session, comp.req_headers, comp.req_body,
             comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
             comp.domain_tag,
-            sjs_comp.raft_seq,
+            sjs_comp.raft_seq, sjs_comp.log_record,
         };
         shift_collection_info_t ci_rp = {
             .name       = "raft_pending",
@@ -688,6 +694,9 @@ void *sjs_worker_fn(void *arg) {
                 uint64_t rid = ((uint64_t)wcfg->worker_id << 48) |
                                (request_counter++);
 
+                sjs_log_record_t *log_rec = NULL;
+                shift_entity_get_component(sh, e, sjs_comp.log_record, (void **)&log_rec);
+
                 sjs_request_ctx_t req = {
                     .method       = method_str,
                     .path         = path_str,
@@ -703,14 +712,18 @@ void *sjs_worker_fn(void *arg) {
                     .write_set    = raft_active ? &ws : NULL,
                     .raft         = wcfg->raft,
                     .log_db       = log_db.db ? &log_db : NULL,
+                    .log_reader   = log_reader.dbs ? &log_reader : NULL,
                     .log_batch    = &log_batch,
                     .request_id   = rid,
                     .replay_capture = &replay_cap,
+                    .log_record   = log_rec,
                 };
 
                 uint32_t body_len = 0;
                 char *body = sjs_dispatch(&sjs, &req, route, bc, &body_len);
                 replay_capture_free(&replay_cap);
+
+                /* log_rec lives on the response entity — flushed during drain */
 
                 /* Submit write-set to Raft if there are writes.
                  * ws.seq was set by kv_next_seq inside the committed txn. */
@@ -829,12 +842,15 @@ void *sjs_worker_fn(void *arg) {
             }
         }
 
-        /* ---- Drain completed responses ---- */
+        /* ---- Drain completed responses & flush logs ---- */
         {
             shift_entity_t *entities = NULL;
             size_t          count    = 0;
             shift_collection_get_entities(sh, response_result_out,
                                           &entities, &count);
+
+            if (log_db.db)
+                log_db_flush_begin(&log_db);
 
             for (size_t i = 0; i < count; i++) {
                 shift_entity_t e = entities[i];
@@ -846,47 +862,61 @@ void *sjs_worker_fn(void *arg) {
                             wcfg->worker_id, io->error);
                 }
 
+                /* Flush log record before destroy (SQLITE_STATIC is safe —
+                 * sqlite3_step completes before entity destructor frees data) */
+                if (log_db.db) {
+                    sjs_log_record_t *lr = NULL;
+                    shift_entity_get_component(sh, e, sjs_comp.log_record, (void **)&lr);
+                    if (lr && (lr->log_count > 0 || lr->req_json))
+                        log_db_flush_one(&log_db, lr);
+                }
+
                 /* Free owned response data before destroy — sh2 destructors
                  * only free the fields array and body pointer, not the
                  * individual header name/value strings we strdup'd. */
                 cleanup_response(sh, e, comp.resp_headers, comp.resp_body);
                 shift_entity_destroy_one(sh, e);
             }
+
+            if (log_db.db)
+                log_db_flush_commit(&log_db);
         }
 
         shift_flush(sh);
-
-        /* ---- Periodic log DB WAL checkpoint ---- */
-        {
-            uint64_t t = now_ms();
-            if (t - last_log_checkpoint >= 500 && log_db.db) {
-                log_db_checkpoint(&log_db);
-                last_log_checkpoint = t;
-            }
-        }
     }
 
     /* ---- Shutdown ---- */
     sh2_context_destroy(h2);
     shift_flush(sh);
 
-    /* Drain remaining entities — free owned response data before destroy */
+    /* Drain remaining entities — flush logs and free response data before destroy */
     shift_collection_id_t drain[] = { request_out, response_in, response_result_out,
                                        raft_pending };
     int drain_count = (raft_pending != (shift_collection_id_t)-1) ? 4 : 3;
+    if (log_db.db)
+        log_db_flush_begin(&log_db);
     for (int c = 0; c < drain_count; c++) {
         shift_entity_t *ents = NULL;
         size_t cnt = 0;
         shift_collection_get_entities(sh, drain[c], &ents, &cnt);
         for (size_t i = 0; i < cnt; i++) {
+            if (log_db.db) {
+                sjs_log_record_t *lr = NULL;
+                shift_entity_get_component(sh, ents[i], sjs_comp.log_record, (void **)&lr);
+                if (lr && (lr->log_count > 0 || lr->req_json))
+                    log_db_flush_one(&log_db, lr);
+            }
             cleanup_response(sh, ents[i], comp.resp_headers, comp.resp_body);
             shift_entity_destroy_one(sh, ents[i]);
         }
     }
+    if (log_db.db)
+        log_db_flush_commit(&log_db);
     shift_flush(sh);
 
     shift_context_destroy(sh);
     sjs_runtime_free(&sjs);
+    log_db_reader_close(&log_reader);
     log_db_close(&log_db);
 #ifdef SH2_HAS_TLS
     if (tls) sh2_tls_config_destroy(tls);

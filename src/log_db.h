@@ -26,6 +26,29 @@ typedef struct log_batch {
     uint32_t      count;
 } log_batch_t;
 
+/* Complete log record for one request (heap-owned, survives arena reset).
+ * Accumulated across requests, then flushed in a single transaction. */
+typedef struct {
+    uint64_t     request_id;
+    int          worker_id;
+    char        *session_id;      /* strdup'd, may be NULL */
+
+    /* console.log entries (heap-copied from per-request batch) */
+    log_pending_t *log_entries;   /* malloc'd array */
+    uint32_t       log_count;
+
+    /* replay capture (all heap-owned, may be NULL if no log_db) */
+    char    *req_json;
+    char    *kv_tape;
+    uint8_t *random_tape;
+    size_t   random_tape_len;
+    char    *date_tape;
+    char    *math_random_tape;
+    char    *module_tree;
+} sjs_log_record_t;
+
+void sjs_log_record_free(sjs_log_record_t *rec);
+
 /* Per-worker log DB handle */
 typedef struct log_db {
     sqlite3      *db;
@@ -78,5 +101,19 @@ int  log_db_list_requests(log_db_t *ldb, int limit,
                           log_db_request_entry_t **out, size_t *out_count);
 void log_db_free_request_entries(log_db_request_entry_t *entries, size_t count);
 
-/* Passive WAL checkpoint — non-blocking. */
-int  log_db_checkpoint(log_db_t *ldb);
+/* Flush an array of log records in a single transaction. */
+int  log_db_flush_records(log_db_t *ldb, sjs_log_record_t *records, size_t count);
+
+/* Transaction-split flush: begin/one/commit for inline iteration. */
+void log_db_flush_begin(log_db_t *ldb);
+void log_db_flush_one(log_db_t *ldb, sjs_log_record_t *rec);
+void log_db_flush_commit(log_db_t *ldb);
+
+/* Read-only multi-DB reader for cross-worker log queries. */
+typedef struct {
+    sqlite3 **dbs;
+    int       count;
+} log_db_reader_t;
+
+int  log_db_reader_open(log_db_reader_t *r, int num_workers);
+void log_db_reader_close(log_db_reader_t *r);

@@ -833,10 +833,27 @@ static int level_from_string(const char *s) {
     return -1;
 }
 
+/* Temporary struct for collecting log entries across DBs before sorting */
+typedef struct {
+    int      worker_id;
+    int64_t  request_id;
+    char    *session_id;   /* strdup'd, may be NULL */
+    int      level;
+    char    *message;      /* strdup'd */
+    double   timestamp;
+} log_query_entry_t;
+
+static int log_entry_cmp_desc(const void *a, const void *b) {
+    const log_query_entry_t *ea = a, *eb = b;
+    if (ea->timestamp > eb->timestamp) return -1;
+    if (ea->timestamp < eb->timestamp) return 1;
+    return 0;
+}
+
 static JSValue js_logs_query(JSContext *ctx, JSValue this_val,
                               int argc, JSValue *argv) {
     sjs_request_ctx_t *req = js_get_req_ctx(ctx);
-    if (!req || !req->log_db || !req->log_db->db)
+    if (!req || !req->log_reader || !req->log_reader->dbs)
         return JS_NewArray(ctx);
 
     /* Parse options object */
@@ -899,37 +916,63 @@ static JSValue js_logs_query(JSContext *ctx, JSValue this_val,
         pos += snprintf(sql + pos, sizeof(sql) - pos, " AND timestamp > %f", after);
     pos += snprintf(sql + pos, sizeof(sql) - pos, " ORDER BY timestamp DESC LIMIT %d", limit);
 
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(req->log_db->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+    /* Query all worker DBs and collect results */
+    log_db_reader_t *reader = req->log_reader;
+    size_t total = 0, cap = (size_t)limit * (size_t)reader->count;
+    log_query_entry_t *entries = malloc(cap * sizeof(*entries));
+    if (!entries) {
         if (session_id) JS_FreeCString(ctx, session_id);
         return JS_NewArray(ctx);
     }
 
-    int bind_idx = 1;
-    if (session_id) {
-        sqlite3_bind_text(stmt, bind_idx++, session_id, -1, SQLITE_STATIC);
+    for (int w = 0; w < reader->count; w++) {
+        if (!reader->dbs[w]) continue;
+
+        sqlite3_stmt *stmt;
+        if (sqlite3_prepare_v2(reader->dbs[w], sql, -1, &stmt, NULL) != SQLITE_OK)
+            continue;
+
+        if (session_id)
+            sqlite3_bind_text(stmt, 1, session_id, -1, SQLITE_STATIC);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW && total < cap) {
+            log_query_entry_t *e = &entries[total++];
+            e->worker_id  = sqlite3_column_int(stmt, 0);
+            e->request_id = sqlite3_column_int64(stmt, 1);
+            const char *sid = (const char *)sqlite3_column_text(stmt, 2);
+            e->session_id = sid ? strdup(sid) : NULL;
+            e->level      = sqlite3_column_int(stmt, 3);
+            e->message    = strdup((const char *)sqlite3_column_text(stmt, 4));
+            e->timestamp  = sqlite3_column_double(stmt, 5);
+        }
+        sqlite3_finalize(stmt);
     }
 
+    /* Sort merged results by timestamp DESC and apply limit */
+    qsort(entries, total, sizeof(*entries), log_entry_cmp_desc);
+    if (total > (size_t)limit) total = (size_t)limit;
+
+    /* Build JS array */
     JSValue arr = JS_NewArray(ctx);
-    uint32_t idx = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    for (size_t i = 0; i < total; i++) {
+        log_query_entry_t *e = &entries[i];
         JSValue entry = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, entry, "worker_id",
-            JS_NewInt32(ctx, sqlite3_column_int(stmt, 0)));
-        JS_SetPropertyStr(ctx, entry, "request_id",
-            JS_NewInt64(ctx, sqlite3_column_int64(stmt, 1)));
-        const char *sid = (const char *)sqlite3_column_text(stmt, 2);
+        JS_SetPropertyStr(ctx, entry, "worker_id", JS_NewInt32(ctx, e->worker_id));
+        JS_SetPropertyStr(ctx, entry, "request_id", JS_NewInt64(ctx, e->request_id));
         JS_SetPropertyStr(ctx, entry, "session_id",
-            sid ? JS_NewString(ctx, sid) : JS_NULL);
-        JS_SetPropertyStr(ctx, entry, "level",
-            JS_NewString(ctx, level_name(sqlite3_column_int(stmt, 3))));
-        JS_SetPropertyStr(ctx, entry, "message",
-            JS_NewString(ctx, (const char *)sqlite3_column_text(stmt, 4)));
-        JS_SetPropertyStr(ctx, entry, "timestamp",
-            JS_NewFloat64(ctx, sqlite3_column_double(stmt, 5)));
-        JS_SetPropertyUint32(ctx, arr, idx++, entry);
+            e->session_id ? JS_NewString(ctx, e->session_id) : JS_NULL);
+        JS_SetPropertyStr(ctx, entry, "level", JS_NewString(ctx, level_name(e->level)));
+        JS_SetPropertyStr(ctx, entry, "message", JS_NewString(ctx, e->message));
+        JS_SetPropertyStr(ctx, entry, "timestamp", JS_NewFloat64(ctx, e->timestamp));
+        JS_SetPropertyUint32(ctx, arr, (uint32_t)i, entry);
     }
-    sqlite3_finalize(stmt);
+
+    /* Cleanup */
+    for (size_t i = 0; i < total; i++) {
+        free(entries[i].session_id);
+        free(entries[i].message);
+    }
+    free(entries);
     if (session_id) JS_FreeCString(ctx, session_id);
     return arr;
 }
@@ -937,7 +980,7 @@ static JSValue js_logs_query(JSContext *ctx, JSValue this_val,
 static JSValue js_logs_replay(JSContext *ctx, JSValue this_val,
                                int argc, JSValue *argv) {
     sjs_request_ctx_t *req = js_get_req_ctx(ctx);
-    if (!req || !req->log_db) return JS_NULL;
+    if (!req || !req->log_reader) return JS_NULL;
 
     int64_t rid;
     if (JS_ToInt64(ctx, &rid, argv[0])) return JS_EXCEPTION;
@@ -948,11 +991,18 @@ static JSValue js_logs_replay(JSContext *ctx, JSValue this_val,
     uint8_t *random_tape = NULL;
     size_t random_tape_len = 0;
 
-    int rc = log_db_get_replay(req->log_db, (uint64_t)rid,
-                                &request_data, &response_data,
-                                &kv_tape, &random_tape, &random_tape_len,
-                                &date_tape, &math_random_tape,
-                                &module_tree, &source_maps);
+    /* Try each worker DB — request_id is in exactly one */
+    log_db_reader_t *reader = req->log_reader;
+    int rc = -1;
+    for (int w = 0; w < reader->count && rc != 0; w++) {
+        if (!reader->dbs[w]) continue;
+        log_db_t tmp = { .db = reader->dbs[w] };
+        rc = log_db_get_replay(&tmp, (uint64_t)rid,
+                               &request_data, &response_data,
+                               &kv_tape, &random_tape, &random_tape_len,
+                               &date_tape, &math_random_tape,
+                               &module_tree, &source_maps);
+    }
     if (rc != 0) return JS_NULL;
 
     JSValue obj = JS_NewObject(ctx);
@@ -1000,10 +1050,17 @@ static JSValue js_logs_replay(JSContext *ctx, JSValue this_val,
     return obj;
 }
 
+static int request_entry_cmp_desc(const void *a, const void *b) {
+    const log_db_request_entry_t *ea = a, *eb = b;
+    if (ea->request_id > eb->request_id) return -1;
+    if (ea->request_id < eb->request_id) return 1;
+    return 0;
+}
+
 static JSValue js_logs_requests(JSContext *ctx, JSValue this_val,
                                  int argc, JSValue *argv) {
     sjs_request_ctx_t *req = js_get_req_ctx(ctx);
-    if (!req || !req->log_db) return JS_NewArray(ctx);
+    if (!req || !req->log_reader) return JS_NewArray(ctx);
 
     int limit = 50;
     if (argc >= 1 && JS_IsObject(argv[0])) {
@@ -1012,19 +1069,36 @@ static JSValue js_logs_requests(JSContext *ctx, JSValue this_val,
         JS_FreeValue(ctx, v);
     }
 
-    log_db_request_entry_t *entries = NULL;
-    size_t count = 0;
-    if (log_db_list_requests(req->log_db, limit, &entries, &count) != 0)
-        return JS_NewArray(ctx);
+    /* Query all worker DBs and merge */
+    log_db_reader_t *reader = req->log_reader;
+    size_t total = 0, cap = (size_t)limit * (size_t)reader->count;
+    log_db_request_entry_t *all = malloc(cap * sizeof(*all));
+    if (!all) return JS_NewArray(ctx);
+
+    for (int w = 0; w < reader->count; w++) {
+        if (!reader->dbs[w]) continue;
+        log_db_t tmp = { .db = reader->dbs[w] };
+        log_db_request_entry_t *entries = NULL;
+        size_t count = 0;
+        if (log_db_list_requests(&tmp, limit, &entries, &count) != 0)
+            continue;
+        for (size_t i = 0; i < count && total < cap; i++)
+            all[total++] = entries[i];  /* steal ownership */
+        free(entries);  /* free array only, not strings */
+    }
+
+    /* Sort by request_id DESC and apply limit */
+    qsort(all, total, sizeof(*all), request_entry_cmp_desc);
+    if (total > (size_t)limit) total = (size_t)limit;
 
     JSValue arr = JS_NewArray(ctx);
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < total; i++) {
         JSValue entry = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, entry, "request_id",
-            JS_NewInt64(ctx, (int64_t)entries[i].request_id));
+            JS_NewInt64(ctx, (int64_t)all[i].request_id));
 
-        if (entries[i].request_data) {
-            JSValue s = JS_NewString(ctx, entries[i].request_data);
+        if (all[i].request_data) {
+            JSValue s = JS_NewString(ctx, all[i].request_data);
             JSValue parsed = js_json_parse(ctx, s);
             JS_SetPropertyStr(ctx, entry, "request",
                 JS_IsException(parsed) ? JS_NULL : parsed);
@@ -1032,8 +1106,8 @@ static JSValue js_logs_requests(JSContext *ctx, JSValue this_val,
             JS_SetPropertyStr(ctx, entry, "request", JS_NULL);
         }
 
-        if (entries[i].response_data) {
-            JSValue s = JS_NewString(ctx, entries[i].response_data);
+        if (all[i].response_data) {
+            JSValue s = JS_NewString(ctx, all[i].response_data);
             JSValue parsed = js_json_parse(ctx, s);
             JS_SetPropertyStr(ctx, entry, "response",
                 JS_IsException(parsed) ? JS_NULL : parsed);
@@ -1043,7 +1117,7 @@ static JSValue js_logs_requests(JSContext *ctx, JSValue this_val,
 
         JS_SetPropertyUint32(ctx, arr, (uint32_t)i, entry);
     }
-    log_db_free_request_entries(entries, count);
+    log_db_free_request_entries(all, total);
     return arr;
 }
 

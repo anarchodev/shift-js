@@ -633,6 +633,16 @@ static void sjs_bytecode_dtor(shift_t *ctx, shift_collection_id_t col_id,
         free(p[i].data);
 }
 
+static void sjs_log_record_dtor(shift_t *ctx, shift_collection_id_t col_id,
+                                const shift_entity_t *entities, void *data,
+                                uint32_t offset, uint32_t count,
+                                void *user_data) {
+    (void)ctx; (void)col_id; (void)entities; (void)user_data;
+    sjs_log_record_t *p = (sjs_log_record_t *)data + offset;
+    for (uint32_t i = 0; i < count; i++)
+        sjs_log_record_free(&p[i]);
+}
+
 int sjs_register_components(shift_t *sh, sjs_component_ids_t *out) {
     shift_result_t r;
     out->resp_headers = shift_component_add_ex(sh, sizeof(sjs_resp_headers_t),
@@ -655,6 +665,9 @@ int sjs_register_components(shift_t *sh, sjs_component_ids_t *out) {
     if (r != shift_ok) return -1;
     out->raft_seq = shift_component_add_ex(sh, sizeof(sjs_raft_seq_t),
                                             NULL, NULL, &r);
+    if (r != shift_ok) return -1;
+    out->log_record = shift_component_add_ex(sh, sizeof(sjs_log_record_t),
+                                              NULL, sjs_log_record_dtor, &r);
     if (r != shift_ok) return -1;
     return 0;
 }

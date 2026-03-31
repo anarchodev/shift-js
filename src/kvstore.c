@@ -148,6 +148,7 @@ int kv_get(kvstore_t *store, const char *key, void **out_value, size_t *out_len)
         void *copy = malloc((size_t)blen + 1);
         if (!copy) { sqlite3_reset(st); return -2; }
         if (blen > 0) memcpy(copy, blob, (size_t)blen);
+        ((char *)copy)[blen] = '\0';
         *out_value = copy;
         *out_len = (size_t)blen;
         sqlite3_reset(st);

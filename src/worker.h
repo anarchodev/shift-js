@@ -9,6 +9,7 @@ typedef struct raft_handle raft_handle_t;
 
 typedef struct {
     int         worker_id;
+    int         num_workers;
     int         worker_core;
     const char *db_path;
     uint16_t    port;
