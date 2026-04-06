@@ -1,5 +1,6 @@
 #pragma once
 
+#include "qjs_snap.h"
 #include "kvstore.h"
 #include "log_db.h"
 #include "preprocessor.h"
@@ -12,37 +13,6 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-/* Fixed-size arena for per-request JS runtimes.
- * One arena per worker — reset between requests. */
-#define SJS_ARENA_SIZE (10 * 1024 * 1024)  /* 10 MB per arena */
-
-typedef struct sjs_arena {
-    size_t  used;
-    char    data[];          /* flexible array — SJS_ARENA_SIZE bytes */
-} sjs_arena_t;
-
-/* Frozen snapshot of a JS runtime+context with intrinsics set up.
- * Created once at worker init. Restored per-request via memcpy + relocation. */
-
-#define SJS_SNAPSHOT_MAX_VOLATILE 8  /* max non-deterministic slots to track */
-
-typedef struct {
-    void     *data;         /* saved arena content */
-    size_t    used;         /* bytes used in arena */
-    uint64_t *bitmap;       /* relocation bitmap: 1 bit per 8-byte slot */
-    size_t    bitmap_words; /* number of uint64_t words in bitmap */
-    char     *old_base;     /* arena data base when snapshot was taken */
-    /* Offsets of JSRuntime* and JSContext* within the arena data,
-     * so we can find them after restore without searching. */
-    size_t    rt_offset;
-    size_t    ctx_offset;
-    /* Byte offsets of non-deterministic data slots (e.g. random_state,
-     * time_origin, stack_top).  Zeroed in the snapshot, re-initialized
-     * after each restore. */
-    size_t    volatile_offsets[SJS_SNAPSHOT_MAX_VOLATILE];
-    size_t    volatile_count;
-} sjs_snapshot_t;
-
 /* Per-worker JS state — one per thread, long-lived. */
 typedef struct {
     /* Long-lived compiler runtime (standard allocator). */
@@ -50,10 +20,10 @@ typedef struct {
     JSContext *compile_ctx;
 
     /* Frozen snapshot for fast per-request context creation. */
-    sjs_snapshot_t snapshot;
+    qjs_snap_snapshot_t snapshot;
 
     /* Single pre-allocated arena, reset between requests. */
-    sjs_arena_t *arena;
+    qjs_snap_arena_t *arena;
 
     kvstore_t *kv;
 
@@ -69,6 +39,11 @@ typedef struct {
 
     /* TypeScript/Sucrase context (one per worker). */
     sjs_ts_ctx_t ts_ctx;
+
+    /* Cached current deployment tree hash (40 hex chars + NUL).
+     * Empty string = no deployed tree (use legacy __compiled/ path). */
+    char    current_tree_hash[41];
+    int64_t tree_hash_ts;    /* monotonic ns of last check, 0 = never checked */
 } sjs_runtime_t;
 
 /* ======================================================================
@@ -188,7 +163,7 @@ void sjs_runtime_free(sjs_runtime_t *sjs);
 void arena_reset(sjs_runtime_t *sjs);
 
 /* Restore a snapshot into the arena. Returns 0 on success. */
-int snapshot_restore(const sjs_snapshot_t *snap, sjs_arena_t *arena,
+int snapshot_restore(const qjs_snap_snapshot_t *snap, qjs_snap_arena_t *arena,
                      sjs_runtime_t *sjs,
                      JSRuntime **out_rt, JSContext **out_ctx);
 

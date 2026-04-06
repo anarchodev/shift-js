@@ -25,9 +25,10 @@ export default function() {
         <div class="main">
           <div class="toolbar">
             <span class="filename" id="current-key">Select a key</span>
+            <button class="btn btn-primary" id="save-btn" style="margin-left:auto;font-size:13px;padding:4px 16px;display:none" onclick="saveKey()">Save</button>
           </div>
           <div class="value-pane" id="value-pane">
-            <pre id="value-display" style="min-height:100px">Click a key to view its value</pre>
+            <textarea id="value-display" style="min-height:100px;width:100%;height:100%;background:transparent;color:#e6edf3;border:none;outline:none;resize:none;font-family:monospace;font-size:13px;padding:0" spellcheck="false">Click a key to view its value</textarea>
           </div>
         </div>
       </div>

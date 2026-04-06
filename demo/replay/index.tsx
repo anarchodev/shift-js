@@ -37,7 +37,7 @@ export default function() {
             <h3 style="font-size:14px;margin-bottom:8px;color:#8b949e">How to debug</h3>
             <ol style="font-size:13px;color:#8b949e;padding-left:20px;line-height:1.8">
               <li>Open DevTools (F12) and go to the <strong>Sources</strong> tab</li>
-              <li>Find the source files under the <code>(no domain)</code> section</li>
+              <li>Find the source files under the <code>shift-js://</code> section</li>
               <li>Set a breakpoint in the handler function</li>
               <li>Click the <strong>Replay</strong> button above</li>
               <li>Step through the code with the original request context</li>

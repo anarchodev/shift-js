@@ -15,81 +15,29 @@
 #include <stdint.h>
 #include <sys/time.h>
 
-/* ======================================================================
- * Fixed-size bump allocator for per-request JS runtimes
- * ====================================================================== */
-
-typedef struct { size_t size; } bump_hdr_t;
-
-static void *bump_js_malloc(void *opaque, size_t size) {
-    sjs_arena_t *a = opaque;
-    size_t need = (sizeof(bump_hdr_t) + size + 15) & ~(size_t)15;
-    if (a->used + need > SJS_ARENA_SIZE)
-        return NULL;
-    bump_hdr_t *h = (bump_hdr_t *)(a->data + a->used);
-    a->used += need;
-    h->size = size;
-    return h + 1;
-}
-
-static void *bump_js_calloc(void *opaque, size_t count, size_t size) {
-    size_t total = count * size;
-    void *p = bump_js_malloc(opaque, total);
-    if (p) memset(p, 0, total);
-    return p;
-}
-
-static void bump_js_free(void *opaque, void *ptr) {
-    (void)opaque; (void)ptr;
-}
-
-static void *bump_js_realloc(void *opaque, void *ptr, size_t new_size) {
-    if (!ptr) return bump_js_malloc(opaque, new_size);
-    if (new_size == 0) return NULL;
-
-    sjs_arena_t *a = opaque;
-    bump_hdr_t *old_h = (bump_hdr_t *)ptr - 1;
-    size_t old_size = old_h->size;
-
-    size_t old_total = (sizeof(bump_hdr_t) + old_size + 15) & ~(size_t)15;
-    char *old_end = (char *)old_h + old_total;
-    if (old_end == a->data + a->used) {
-        size_t new_total = (sizeof(bump_hdr_t) + new_size + 15) & ~(size_t)15;
-        size_t delta = new_total - old_total;
-        if (a->used + delta <= SJS_ARENA_SIZE) {
-            a->used += delta;
-            old_h->size = new_size;
-            return ptr;
-        }
-        return NULL;
-    }
-
-    void *new_ptr = bump_js_malloc(opaque, new_size);
-    if (!new_ptr) return NULL;
-    memcpy(new_ptr, ptr, old_size < new_size ? old_size : new_size);
-    return new_ptr;
-}
-
-static size_t bump_js_usable_size(const void *ptr) {
-    const bump_hdr_t *h = (const bump_hdr_t *)ptr - 1;
-    return h->size;
-}
-
-static const JSMallocFunctions bump_mf = {
-    .js_calloc             = bump_js_calloc,
-    .js_malloc             = bump_js_malloc,
-    .js_free               = bump_js_free,
-    .js_realloc            = bump_js_realloc,
-    .js_malloc_usable_size = bump_js_usable_size,
-};
-
 void arena_reset(sjs_runtime_t *sjs) {
-    sjs->arena->used = 0;
+    qjs_snap_arena_reset(sjs->arena);
 }
 
 /* ======================================================================
  * Module loader (compile context only)
  * ====================================================================== */
+
+typedef struct {
+    kvstore_t  *kv;
+    const char *prefix;
+} kv_fetch_ctx_t;
+
+static int kv_fetch(const char *key, void **out, size_t *out_len, void *ctx) {
+    kv_fetch_ctx_t *fc = ctx;
+    char raw_key[256];
+    int n = snprintf(raw_key, sizeof(raw_key), "__code/%s", key);
+    if (n < 0 || (size_t)n >= sizeof(raw_key)) return -1;
+    char buf[512];
+    const char *k = kv_prefixed_key(fc->prefix, raw_key, buf, sizeof(buf));
+    if (!k) return -1;
+    return kv_get(fc->kv, k, out, out_len);
+}
 
 static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
                                       void *opaque) {
@@ -115,9 +63,10 @@ static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
 
         if (kv_get(kv, key, &source, &source_len) != 0) return NULL;
     } else {
+        kv_fetch_ctx_t fc = { .kv = kv, .prefix = sjs->current_prefix };
         resolved_alloc = sjs_resolve_with_extensions(
-            sjs->preprocessors, kv, module_name,
-            sjs->current_prefix, &source, &source_len);
+            sjs->preprocessors, kv_fetch, &fc,
+            module_name, &source, &source_len);
         if (!resolved_alloc) return NULL;
         resolved_name = resolved_alloc;
         ext = sjs_path_extension(resolved_name);
@@ -317,11 +266,14 @@ static JSValue js_math_random_capture(JSContext *ctx, JSValue this_val,
  * relocatable image. Restore per-request via memcpy + pointer fixup.
  * ====================================================================== */
 
-static int snapshot_init_runtime(sjs_arena_t *arena,
-                                 size_t *out_rt_offset, size_t *out_ctx_offset) {
+static int snapshot_init_runtime(qjs_snap_arena_t *arena,
+                                 size_t *out_rt_offset,
+                                 size_t *out_ctx_offset,
+                                 void *user_data) {
+    (void)user_data;
     arena->used = 0;
 
-    JSRuntime *rt = JS_NewRuntime2(&bump_mf, arena);
+    JSRuntime *rt = JS_NewRuntime2(&qjs_snap_bump_mf, arena);
     if (!rt) return -1;
 
     JSContext *ctx = JS_NewContextRaw(rt);
@@ -391,173 +343,10 @@ static int snapshot_init_runtime(sjs_arena_t *arena,
     return 0;
 }
 
-static int snapshot_create(sjs_runtime_t *sjs, sjs_snapshot_t *snap) {
-    sjs_arena_t *arena_a = sjs->arena;
-
-    memset(arena_a->data, 0, SJS_ARENA_SIZE);
-
-    size_t rt_off, ctx_off;
-    if (snapshot_init_runtime(arena_a, &rt_off, &ctx_off) != 0)
-        return -1;
-
-    size_t used_a = arena_a->used;
-
-    char *data_a = malloc(used_a);
-    if (!data_a) return -1;
-    memcpy(data_a, arena_a->data, used_a);
-
-    sjs_arena_t *arena_b = malloc(sizeof(sjs_arena_t) + SJS_ARENA_SIZE);
-    if (!arena_b) { free(data_a); return -1; }
-    memset(arena_b->data, 0, SJS_ARENA_SIZE);
-
-    size_t rt_off_b, ctx_off_b;
-    if (snapshot_init_runtime(arena_b, &rt_off_b, &ctx_off_b) != 0) {
-        free(arena_b);
-        free(data_a);
-        return -1;
-    }
-
-    size_t used_b = arena_b->used;
-
-    if (used_a != used_b || rt_off != rt_off_b || ctx_off != ctx_off_b) {
-        fprintf(stderr, "shift-js: snapshot_create: non-deterministic init "
-                "(used %zu vs %zu, rt_off %zu vs %zu, ctx_off %zu vs %zu)\n",
-                used_a, used_b, rt_off, rt_off_b, ctx_off, ctx_off_b);
-        free(arena_b);
-        free(data_a);
-        return -1;
-    }
-
-    /* Build relocation bitmap by diffing the two copies. */
-    size_t num_slots = used_a / sizeof(void *);
-    snap->bitmap_words = (num_slots + 63) / 64;
-    snap->bitmap = calloc(snap->bitmap_words, sizeof(uint64_t));
-    if (!snap->bitmap) { free(arena_b); free(data_a); return -1; }
-
-    ptrdiff_t base_delta = arena_b->data - arena_a->data;
-    size_t reloc_count = 0;
-    size_t volatile_count = 0;
-    size_t error_count = 0;
-
-    for (size_t i = 0; i < num_slots; i++) {
-        uint64_t val_a, val_b;
-        memcpy(&val_a, data_a        + i * sizeof(void *), sizeof(uint64_t));
-        memcpy(&val_b, arena_b->data + i * sizeof(void *), sizeof(uint64_t));
-
-        if (val_a == val_b)
-            continue;
-
-        if ((int64_t)(val_b - val_a) == base_delta) {
-            snap->bitmap[i / 64] |= (uint64_t)1 << (i % 64);
-            reloc_count++;
-        } else {
-            size_t byte_off = i * sizeof(void *);
-            if (volatile_count < SJS_SNAPSHOT_MAX_VOLATILE) {
-                snap->volatile_offsets[volatile_count++] = byte_off;
-                uint64_t zero = 0;
-                memcpy(data_a + byte_off, &zero, sizeof(uint64_t));
-            } else {
-                fprintf(stderr, "shift-js: snapshot_create: too many "
-                        "non-deterministic slots (slot %zu, max %d)\n",
-                        i, SJS_SNAPSHOT_MAX_VOLATILE);
-                error_count++;
-            }
-        }
-    }
-
-    snap->volatile_count = volatile_count;
-    free(arena_b);
-
-    if (error_count > 0) {
-        free(snap->bitmap);
-        free(data_a);
-        return -1;
-    }
-
-    /* Safety checks for volatile slots */
-    {
-        size_t ctx_start = ctx_off;
-        size_t ctx_end   = ctx_off + 1024;
-        if (ctx_end > used_a) ctx_end = used_a;
-
-        for (size_t i = 0; i < volatile_count; i++) {
-            size_t off = snap->volatile_offsets[i];
-            if (off < ctx_start || off >= ctx_end) {
-                fprintf(stderr, "shift-js: FATAL: volatile slot at byte "
-                        "offset %zu is outside JSContext [%zu, %zu). "
-                        "Likely a QuickJS upstream change — audit the "
-                        "snapshot system before proceeding.\n",
-                        off, ctx_start, ctx_end);
-                abort();
-            }
-        }
-        if (volatile_count > 2) {
-            fprintf(stderr, "shift-js: FATAL: %zu volatile slots detected "
-                    "(expected at most 2: random_state, time_origin). "
-                    "Likely a QuickJS upstream change.\n", volatile_count);
-            abort();
-        }
-    }
-
-    snap->data     = data_a;
-    snap->used     = used_a;
-    snap->old_base = arena_a->data;
-    snap->rt_offset  = rt_off;
-    snap->ctx_offset = ctx_off;
-
-    fprintf(stderr, "shift-js: snapshot created: %zu bytes, %zu relocations, "
-            "%zu volatile slots\n",
-            snap->used, reloc_count, volatile_count);
-
-    return 0;
-}
-
-static void snapshot_destroy(sjs_snapshot_t *snap) {
-    free(snap->data);
-    free(snap->bitmap);
-    memset(snap, 0, sizeof(*snap));
-}
-
-int snapshot_restore(const sjs_snapshot_t *snap, sjs_arena_t *arena,
+int snapshot_restore(const qjs_snap_snapshot_t *snap, qjs_snap_arena_t *arena,
                      sjs_runtime_t *sjs,
                      JSRuntime **out_rt, JSContext **out_ctx) {
-    memcpy(arena->data, snap->data, snap->used);
-    arena->used = snap->used;
-
-    ptrdiff_t delta = arena->data - snap->old_base;
-
-    if (delta != 0) {
-        for (size_t i = 0; i < snap->bitmap_words; i++) {
-            uint64_t word = snap->bitmap[i];
-            while (word) {
-                int bit = __builtin_ctzll(word);
-                size_t offset = ((size_t)i * 64 + (size_t)bit) * sizeof(void *);
-                char **slot = (char **)(arena->data + offset);
-                *slot += delta;
-                word &= word - 1;
-            }
-        }
-    }
-
-    JSRuntime *rt  = (JSRuntime *)(arena->data + snap->rt_offset);
-    JSContext *ctx  = (JSContext *)(arena->data + snap->ctx_offset);
-
-    JS_SetRuntimeOpaque(rt, sjs);
-
-    JS_UpdateStackTop(rt);
-    JS_SetMaxStackSize(rt, JS_DEFAULT_STACK_SIZE);
-
-    for (size_t i = 0; i < snap->volatile_count; i++) {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        uint64_t seed = (uint64_t)tv.tv_sec * 1000000 + (uint64_t)tv.tv_usec;
-        if (seed == 0) seed = 1;
-        memcpy(arena->data + snap->volatile_offsets[i], &seed, sizeof(seed));
-    }
-
-    *out_rt = rt;
-    *out_ctx = ctx;
-    return 0;
+    return qjs_snap_restore(snap, arena, sjs, out_rt, out_ctx);
 }
 
 /* ======================================================================
@@ -719,17 +508,16 @@ int sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
             e->user_data = &sjs->ts_ctx.ts_binding;
     }
 
-    sjs->arena = malloc(sizeof(sjs_arena_t) + SJS_ARENA_SIZE);
+    sjs->arena = qjs_snap_arena_alloc();
     if (!sjs->arena) {
         JS_FreeContext(sjs->compile_ctx);
         JS_FreeRuntime(sjs->compile_rt);
         return -1;
     }
-    sjs->arena->used = 0;
 
-    if (snapshot_create(sjs, &sjs->snapshot) != 0) {
+    if (qjs_snap_create(sjs->arena, snapshot_init_runtime, NULL, &sjs->snapshot) != 0) {
         fprintf(stderr, "shift-js: snapshot_create failed\n");
-        free(sjs->arena);
+        qjs_snap_arena_free(sjs->arena);
         JS_FreeContext(sjs->compile_ctx);
         JS_FreeRuntime(sjs->compile_rt);
         return -1;
@@ -739,7 +527,7 @@ int sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
 }
 
 void sjs_runtime_free(sjs_runtime_t *sjs) {
-    snapshot_destroy(&sjs->snapshot);
+    qjs_snap_destroy(&sjs->snapshot);
     sjs_typescript_free(&sjs->ts_ctx);
     if (sjs->compile_ctx) {
         JS_FreeContext(sjs->compile_ctx);
@@ -749,6 +537,6 @@ void sjs_runtime_free(sjs_runtime_t *sjs) {
         JS_FreeRuntime(sjs->compile_rt);
         sjs->compile_rt = NULL;
     }
-    free(sjs->arena);
+    qjs_snap_arena_free(sjs->arena);
     sjs->arena = NULL;
 }

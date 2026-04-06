@@ -36,22 +36,33 @@ async function loadKeys() {
 async function openKey(key) {
   currentKey = key;
   document.getElementById('current-key').textContent = key;
+  document.getElementById('save-btn').style.display = '';
   const data = await api('get', { key: key });
-  const pre = document.getElementById('value-display');
+  const ta = document.getElementById('value-display');
   if (data.error) {
-    pre.textContent = 'Error: ' + data.error;
+    ta.value = 'Error: ' + data.error;
     return;
   }
   try {
     const parsed = JSON.parse(data.value);
-    pre.textContent = JSON.stringify(parsed, null, 2);
+    ta.value = JSON.stringify(parsed, null, 2);
   } catch (e) {
-    pre.textContent = data.value;
+    ta.value = data.value;
   }
   document.querySelectorAll('#key-list .sidebar-item').forEach(function(el) {
     const span = el.querySelector('span');
     el.className = 'sidebar-item' + (span && span.textContent === key ? ' active' : '');
   });
+}
+
+async function saveKey() {
+  if (!currentKey) return;
+  const value = document.getElementById('value-display').value;
+  const resp = await fetch('/_api/kv?fn=put&key=' + encodeURIComponent(currentKey) + '&value=' + encodeURIComponent(value));
+  const data = await resp.json();
+  if (data.ok) {
+    loadKeys();
+  }
 }
 
 document.getElementById('prefix-input').addEventListener('keydown', function(e) {

@@ -16,6 +16,32 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <time.h>
+
+/* Refresh the cached current_tree_hash from KV every 100ms. */
+static void refresh_tree_hash(sjs_runtime_t *sjs) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
+
+    if (sjs->tree_hash_ts != 0 &&
+        (now_ns - sjs->tree_hash_ts) < 100000000LL)   /* 100ms */
+        return;
+
+    sjs->tree_hash_ts = now_ns;
+
+    void *val = NULL;
+    size_t vlen = 0;
+    if (kv_get(sjs->kv, "database/default/current_hash", &val, &vlen) == 0
+        && val && vlen >= 40) {
+        memcpy(sjs->current_tree_hash, val, 40);
+        sjs->current_tree_hash[40] = '\0';
+        free(val);
+    } else {
+        sjs->current_tree_hash[0] = '\0';
+        free(val);
+    }
+}
 
 /* ======================================================================
  * Response header helpers
@@ -108,6 +134,22 @@ static JSValue parse_query_string(JSContext *ctx, const char *qs) {
  * Module compilation and caching
  * ====================================================================== */
 
+typedef struct {
+    kvstore_t  *kv;
+    const char *prefix;
+} kv_fetch_ctx_t;
+
+static int kv_fetch(const char *key, void **out, size_t *out_len, void *ctx) {
+    kv_fetch_ctx_t *fc = ctx;
+    char raw_key[256];
+    int n = snprintf(raw_key, sizeof(raw_key), "__code/%s", key);
+    if (n < 0 || (size_t)n >= sizeof(raw_key)) return -1;
+    char buf[512];
+    const char *k = kv_prefixed_key(fc->prefix, raw_key, buf, sizeof(buf));
+    if (!k) return -1;
+    return kv_get(fc->kv, k, out, out_len);
+}
+
 static int compile_module(sjs_runtime_t *sjs, const char *kv_prefix,
                           const char *base_path,
                           void **bytecode, size_t *bc_len,
@@ -115,9 +157,10 @@ static int compile_module(sjs_runtime_t *sjs, const char *kv_prefix,
                           char **err_body, uint32_t *err_len) {
     void  *source = NULL;
     size_t source_len = 0;
+    kv_fetch_ctx_t fc = { .kv = sjs->kv, .prefix = kv_prefix };
     char *module_path = sjs_resolve_with_extensions(
-        sjs->preprocessors, sjs->kv, base_path,
-        kv_prefix, &source, &source_len);
+        sjs->preprocessors, kv_fetch, &fc,
+        base_path, &source, &source_len);
 
     if (!module_path) return -1;
 
@@ -242,7 +285,7 @@ static int compile_module(sjs_runtime_t *sjs, const char *kv_prefix,
  * Body extraction (return value → libc heap string)
  * ====================================================================== */
 
-static char *extract_body_string(JSContext *ctx, sjs_arena_t *arena,
+static char *extract_body_string(JSContext *ctx, qjs_snap_arena_t *arena,
                                  sjs_resp_headers_t *resp_hdrs,
                                  JSValue ret, const char *module_path,
                                  const char *func_name,
@@ -297,6 +340,8 @@ static int sjs_resolve_request_route(sjs_runtime_t *sjs, const char *path,
                               const char *kv_prefix,
                               sjs_route_info_t *route, sjs_bytecode_t *bc,
                               char **err_body, uint32_t *err_len) {
+    refresh_tree_hash(sjs);
+
     sjs_route_t parsed;
     sjs_resolve_route(path, &parsed);
 
@@ -311,6 +356,42 @@ static int sjs_resolve_request_route(sjs_runtime_t *sjs, const char *path,
         *err_len = (uint32_t)strlen(*err_body);
         return 500;
     }
+
+    /* ---- Tree-hash path: deployed bytecode ---- */
+    if (sjs->current_tree_hash[0]) {
+        static const char *exts[] = { ".mjs", ".ejs", ".ts", ".tsx" };
+        for (int ei = 0; ei < 4; ei++) {
+            char key[1024];
+            snprintf(key, sizeof(key), "database/default/code/%s/%s%s",
+                     sjs->current_tree_hash, base_path, exts[ei]);
+            if (kv_get(sjs->kv, key, &bc->data, &bc->len) == 0) {
+                char mod_name[256];
+                snprintf(mod_name, sizeof(mod_name), "%s%s", base_path, exts[ei]);
+                route->module_path = strdup(mod_name);
+
+                /* Extract sha1 (first 40 bytes) for replay capture,
+                 * then shift data to bytecode-only. */
+                if (bc->len > 40) {
+                    if (sjs->current_replay_capture) {
+                        char hash_str[41] = {0};
+                        memcpy(hash_str, bc->data, 40);
+                        replay_capture_module(sjs->current_replay_capture,
+                                              mod_name, hash_str);
+                    }
+                    bc->len -= 40;
+                    memmove(bc->data, (char *)bc->data + 40, bc->len);
+                }
+                goto found;
+            }
+        }
+        /* Deployed code is authoritative — no fallback to compilation. */
+        free(base_path);
+        *err_body = strdup("Not Found");
+        *err_len = (uint32_t)strlen(*err_body);
+        return 404;
+    }
+
+    /* ---- Legacy path: __compiled/ cache + on-demand compilation ---- */
 
     /* Try cache hit — probe __compiled/<base_path><ext> for each extension */
     {
@@ -712,7 +793,7 @@ char *sjs_dispatch(sjs_runtime_t *sjs, sjs_request_ctx_t *req,
         }
 
         /* Phase 2: Restore snapshot into a fresh arena */
-        sjs_arena_t *arena = sjs->arena;
+        qjs_snap_arena_t *arena = sjs->arena;
 
         JSRuntime *rt = NULL;
         JSContext *ctx = NULL;

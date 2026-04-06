@@ -1,4 +1,10 @@
 #include "kvstore.h"
+#include "code_db.h"
+#include "preprocessor.h"
+#include "ejs.h"
+#include "typescript.h"
+
+#include <quickjs.h>
 
 #define DMON_IMPL
 #include "dmon.h"
@@ -233,7 +239,8 @@ static void usage(const char *prog) {
         "  putfile <key> <file>        Set key to file contents\n"
         "  delete <key>                Delete key\n"
         "  range <start> <end> [count] List keys in range\n"
-        "  upload <dir> [prefix]       Upload directory tree as __code/<prefix>/...\n"
+        "  upload <dir> [prefix]       Upload directory to code database\n"
+        "  deploy                      Compile and deploy code to KV\n"
         "  import <dir> [prefix]       Alias for upload\n"
         "  export <dir>                Export all __code/ entries to directory\n"
         "  watch <dir> [prefix]        Watch directory and sync changes to server\n"
@@ -430,6 +437,381 @@ static int upload_dir(kvstore_t *kv, const char *dir_path,
     return count;
 }
 
+/* ---- code_db upload -------------------------------------------------- */
+
+static int upload_dir_code_db(code_db_t *cdb, const char *database_id,
+                              const char *dir_path, const char *prefix) {
+    DIR *d = opendir(dir_path);
+    if (!d) {
+        fprintf(stderr, "Cannot open directory: %s: %s\n",
+                dir_path, strerror(errno));
+        return -1;
+    }
+
+    struct dirent *ent;
+    int count = 0;
+
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+
+        char filepath[4096];
+        snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, ent->d_name);
+
+        struct stat st;
+        if (stat(filepath, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            char subprefix[4096];
+            if (prefix[0])
+                snprintf(subprefix, sizeof(subprefix), "%s/%s",
+                         prefix, ent->d_name);
+            else
+                snprintf(subprefix, sizeof(subprefix), "%s", ent->d_name);
+
+            int sub = upload_dir_code_db(cdb, database_id, filepath, subprefix);
+            if (sub > 0) count += sub;
+            continue;
+        }
+
+        if (!S_ISREG(st.st_mode)) continue;
+
+        /* Build path: [prefix/]filename */
+        char path[4096];
+        if (prefix[0])
+            snprintf(path, sizeof(path), "%s/%s", prefix, ent->d_name);
+        else
+            snprintf(path, sizeof(path), "%s", ent->d_name);
+
+        size_t flen;
+        char *contents = read_file(filepath, &flen);
+        if (!contents) {
+            fprintf(stderr, "Cannot read %s\n", filepath);
+            continue;
+        }
+
+        if (code_db_put_file(cdb, database_id, path, contents, flen) == 0) {
+            printf("  %s → %s (%zu bytes)\n", filepath, path, flen);
+            count++;
+        } else {
+            fprintf(stderr, "  FAILED: %s\n", path);
+        }
+
+        free(contents);
+    }
+
+    closedir(d);
+    return count;
+}
+
+/* ---- deploy: compile & write to KV ----------------------------------- */
+
+/* Deploy context — passed to module loader via JS_SetRuntimeOpaque. */
+typedef struct {
+    code_db_t                        *cdb;
+    const char                       *database_id;
+    const char                       *tree_hash;
+    const sjs_preprocessor_registry_t *preprocessors;
+    JSRuntime                        *compile_rt;
+    JSContext                        *compile_ctx;
+    sjs_ts_ctx_t                      ts_ctx;
+} deploy_ctx_t;
+
+/* Module loader for deploy-time compilation: resolves imports from code_db. */
+static JSModuleDef *deploy_module_loader(JSContext *ctx,
+                                         const char *module_name,
+                                         void *opaque) {
+    deploy_ctx_t *dc = JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
+    if (!dc) return NULL;
+
+    /* Resolve module source from code_db tree */
+    void *source = NULL;
+    size_t source_len = 0;
+    const char *resolved_name = module_name;
+    char *resolved_alloc = NULL;
+
+    const char *ext = sjs_path_extension(module_name);
+    if (ext) {
+        if (code_db_tree_get(dc->cdb, dc->database_id, dc->tree_hash,
+                             module_name, &source, &source_len) != 0)
+            return NULL;
+    } else {
+        /* Try extensions in order: .mjs, then preprocessor extensions */
+        static const char *try_exts[] = { ".mjs", ".ejs", ".ts", ".tsx" };
+        for (int i = 0; i < 4; i++) {
+            char try_name[512];
+            snprintf(try_name, sizeof(try_name), "%s%s", module_name, try_exts[i]);
+            if (code_db_tree_get(dc->cdb, dc->database_id, dc->tree_hash,
+                                 try_name, &source, &source_len) == 0) {
+                resolved_alloc = strdup(try_name);
+                resolved_name = resolved_alloc;
+                ext = sjs_path_extension(resolved_name);
+                break;
+            }
+        }
+        if (!source) return NULL;
+    }
+
+    char  *compile_source = source;
+    size_t compile_len    = source_len;
+
+    const sjs_preprocessor_entry_t *pp = ext
+        ? sjs_preprocessor_find(dc->preprocessors, ext)
+        : NULL;
+
+    if (pp) {
+        if (pp->transform == sjs_typescript_transform) {
+            sjs_ts_binding_t *binding = pp->user_data;
+            if (binding && binding->ts_ctx)
+                binding->ts_ctx->current_module_path = resolved_name;
+        }
+        size_t js_len;
+        char *js = pp->transform(source, source_len, &js_len, pp->user_data);
+        free(source);
+        if (!js) { free(resolved_alloc); return NULL; }
+        compile_source = js;
+        compile_len = js_len;
+    }
+
+    JSValue func = JS_Eval(ctx, compile_source, compile_len, resolved_name,
+                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    free(compile_source);
+    free(resolved_alloc);
+
+    if (JS_IsException(func)) return NULL;
+
+    JSModuleDef *mod = JS_VALUE_GET_PTR(func);
+    JS_FreeValue(ctx, func);
+    return mod;
+}
+
+static int deploy_init(deploy_ctx_t *dc, code_db_t *cdb,
+                       const char *database_id, const char *tree_hash,
+                       const sjs_preprocessor_registry_t *pp) {
+    memset(dc, 0, sizeof(*dc));
+    dc->cdb = cdb;
+    dc->database_id = database_id;
+    dc->tree_hash = tree_hash;
+    dc->preprocessors = pp;
+
+    dc->compile_rt = JS_NewRuntime();
+    if (!dc->compile_rt) return -1;
+
+    JS_SetRuntimeOpaque(dc->compile_rt, dc);
+    JS_SetModuleLoaderFunc(dc->compile_rt, NULL, deploy_module_loader, NULL);
+
+    dc->compile_ctx = JS_NewContext(dc->compile_rt);
+    if (!dc->compile_ctx) {
+        JS_FreeRuntime(dc->compile_rt);
+        return -1;
+    }
+
+    if (sjs_typescript_init(dc->compile_ctx, &dc->ts_ctx) != 0) {
+        fprintf(stderr, "deploy: failed to initialize Sucrase\n");
+        JS_FreeContext(dc->compile_ctx);
+        JS_FreeRuntime(dc->compile_rt);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void deploy_free(deploy_ctx_t *dc) {
+    sjs_typescript_free(&dc->ts_ctx);
+    if (dc->compile_ctx) JS_FreeContext(dc->compile_ctx);
+    if (dc->compile_rt) JS_FreeRuntime(dc->compile_rt);
+}
+
+/* Compile a single source file to bytecode.
+ * Returns malloc'd bytecode (caller frees), NULL on error. */
+static void *deploy_compile(deploy_ctx_t *dc, const char *path,
+                            const void *source, size_t source_len,
+                            size_t *out_bc_len) {
+    const char *ext = sjs_path_extension(path);
+    const sjs_preprocessor_entry_t *pp = ext
+        ? sjs_preprocessor_find(dc->preprocessors, ext) : NULL;
+
+    char  *compile_source = (char *)source;
+    size_t compile_len    = source_len;
+    char  *to_free        = NULL;
+
+    if (pp) {
+        if (pp->transform == sjs_typescript_transform) {
+            sjs_ts_binding_t *binding = pp->user_data;
+            if (binding && binding->ts_ctx)
+                binding->ts_ctx->current_module_path = path;
+        }
+        size_t js_len;
+        char *js = pp->transform(source, source_len, &js_len, pp->user_data);
+        if (!js) {
+            fprintf(stderr, "deploy: preprocess failed: %s\n", path);
+            return NULL;
+        }
+        compile_source = js;
+        compile_len = js_len;
+        to_free = js;
+    }
+
+    JSContext *cc = dc->compile_ctx;
+    JSValue module_val = JS_Eval(cc, compile_source, compile_len, path,
+                                 JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    free(to_free);
+
+    if (JS_IsException(module_val)) {
+        JSValue exc = JS_GetException(cc);
+        const char *err = JS_ToCString(cc, exc);
+        fprintf(stderr, "deploy: compile error in %s: %s\n",
+                path, err ? err : "(unknown)");
+        JS_FreeCString(cc, err);
+        JS_FreeValue(cc, exc);
+        return NULL;
+    }
+
+    size_t bc_len;
+    uint8_t *bc = JS_WriteObject(cc, &bc_len, module_val,
+                                 JS_WRITE_OBJ_BYTECODE);
+    JS_FreeValue(cc, module_val);
+
+    if (!bc) {
+        fprintf(stderr, "deploy: bytecode write failed: %s\n", path);
+        return NULL;
+    }
+
+    *out_bc_len = bc_len;
+    return bc;
+}
+
+static int do_deploy(kvstore_t *kv, code_db_t *cdb, const char *database_id) {
+    /* Snapshot working tree. */
+    char *tree_hash = code_db_snapshot(cdb, database_id);
+    if (!tree_hash) {
+        fprintf(stderr, "deploy: no files in working tree\n");
+        return -1;
+    }
+
+    printf("Tree hash: %s\n", tree_hash);
+
+    /* Set up preprocessor registry. */
+    sjs_preprocessor_registry_t pp;
+    sjs_preprocessor_init(&pp);
+    sjs_preprocessor_register(&pp, ".ejs", sjs_ejs_transform, NULL);
+    sjs_preprocessor_register(&pp, ".ts",  sjs_typescript_transform, NULL);
+    sjs_preprocessor_register(&pp, ".tsx", sjs_typescript_transform, NULL);
+
+    /* Set up deploy compilation context. */
+    deploy_ctx_t dc;
+    if (deploy_init(&dc, cdb, database_id, tree_hash, &pp) != 0) {
+        free(tree_hash);
+        return -1;
+    }
+
+    /* Wire up TypeScript bindings to preprocessor entries. */
+    for (size_t i = 0; i < pp.count; i++) {
+        sjs_preprocessor_entry_t *e = &pp.entries[i];
+        if (e->transform != sjs_typescript_transform) continue;
+        if (strcmp(e->extension, ".tsx") == 0)
+            e->user_data = &dc.ts_ctx.tsx_binding;
+        else
+            e->user_data = &dc.ts_ctx.ts_binding;
+    }
+
+    /* List all files in the tree. */
+    code_tree_t tree;
+    if (code_db_tree_list(cdb, database_id, tree_hash, &tree) != 0) {
+        fprintf(stderr, "deploy: failed to list tree\n");
+        deploy_free(&dc);
+        free(tree_hash);
+        return -1;
+    }
+
+    int code_count = 0, file_count = 0, errors = 0;
+
+    for (size_t i = 0; i < tree.count; i++) {
+        const char *path = tree.entries[i].path;
+        const char *sha1 = tree.entries[i].sha1;
+
+        /* Fetch file content from code_db. */
+        void *content = NULL;
+        size_t content_len = 0;
+        if (code_db_get_file(cdb, sha1, &content, &content_len) != 0) {
+            fprintf(stderr, "deploy: missing blob %s for %s\n", sha1, path);
+            errors++;
+            continue;
+        }
+
+        if (is_static_file(path)) {
+            /* Write static file to KV. */
+            char key[1024];
+            snprintf(key, sizeof(key), "database/%s/files/%s/%s",
+                     database_id, tree_hash, path);
+            if (kv_put(kv, key, content, content_len) == 0) {
+                file_count++;
+            } else {
+                fprintf(stderr, "deploy: kv_put failed: %s\n", key);
+                errors++;
+            }
+        } else {
+            /* Compile and write bytecode to KV.
+             * Value format: [40 bytes sha1 hex][bytecode] */
+            size_t bc_len = 0;
+            void *bc = deploy_compile(&dc, path, content, content_len, &bc_len);
+            if (!bc) {
+                errors++;
+                free(content);
+                continue;
+            }
+
+            size_t val_len = 40 + bc_len;
+            char *val = malloc(val_len);
+            if (!val) {
+                js_free(dc.compile_ctx, bc);
+                errors++;
+                free(content);
+                continue;
+            }
+            memcpy(val, sha1, 40);
+            memcpy(val + 40, bc, bc_len);
+            js_free(dc.compile_ctx, bc);
+
+            char key[1024];
+            snprintf(key, sizeof(key), "database/%s/code/%s/%s",
+                     database_id, tree_hash, path);
+            if (kv_put(kv, key, val, val_len) == 0) {
+                code_count++;
+            } else {
+                fprintf(stderr, "deploy: kv_put failed: %s\n", key);
+                errors++;
+            }
+            free(val);
+        }
+
+        free(content);
+    }
+
+    code_db_tree_free(&tree);
+    deploy_free(&dc);
+
+    if (errors > 0) {
+        fprintf(stderr, "deploy: %d errors, aborting\n", errors);
+        free(tree_hash);
+        return -1;
+    }
+
+    /* Atomic switch: set current_hash. */
+    char hash_key[256];
+    snprintf(hash_key, sizeof(hash_key), "database/%s/current_hash", database_id);
+    if (kv_put(kv, hash_key, tree_hash, 40) != 0) {
+        fprintf(stderr, "deploy: failed to set current_hash\n");
+        free(tree_hash);
+        return -1;
+    }
+
+    printf("Deployed: %d code files, %d static files\n", code_count, file_count);
+    free(tree_hash);
+    return 0;
+}
+
+/* ---- main ------------------------------------------------------------ */
+
 int main(int argc, char **argv) {
     const char *db_path = NULL;
     const char *tenant_prefix_str = NULL;
@@ -578,8 +960,22 @@ int main(int argc, char **argv) {
         const char *dir = argv[arg_start + 1];
         const char *prefix = (arg_start + 2 < argc) ? argv[arg_start + 2] : "";
 
-        /* Clear all __compiled/ bytecode caches before uploading so stale
-         * entries cannot shadow the new source files. */
+        /* Upload to code_db (content-addressed). */
+        char code_db_path[4096];
+        snprintf(code_db_path, sizeof(code_db_path), "%s.code", db_path);
+        code_db_t *cdb = NULL;
+        if (code_db_open(code_db_path, &cdb) != 0) {
+            fprintf(stderr, "Failed to open code database: %s\n", code_db_path);
+            rc = 1;
+            goto done;
+        }
+
+        code_db_tree_clear(cdb, "default");
+        int n = upload_dir_code_db(cdb, "default", dir, prefix);
+        printf("Uploaded %d files to code database\n", n);
+        code_db_close(cdb);
+
+        /* Also upload to legacy KV for backward compatibility. */
         {
             char sbuf[4096], ebuf[4096];
             const char *cs = prefixed_key(tenant_prefix_str, "__compiled/",
@@ -595,9 +991,22 @@ int main(int argc, char **argv) {
                 kv_range_free(&cr);
             }
         }
+        upload_dir(kv, dir, prefix, tenant_prefix_str);
 
-        int n = upload_dir(kv, dir, prefix, tenant_prefix_str);
-        printf("Imported %d files\n", n);
+    } else if (!strcmp(cmd, "deploy")) {
+        char code_db_path[4096];
+        snprintf(code_db_path, sizeof(code_db_path), "%s.code", db_path);
+        code_db_t *cdb = NULL;
+        if (code_db_open(code_db_path, &cdb) != 0) {
+            fprintf(stderr, "Failed to open code database: %s\n", code_db_path);
+            rc = 1;
+            goto done;
+        }
+
+        if (do_deploy(kv, cdb, "default") != 0)
+            rc = 1;
+
+        code_db_close(cdb);
 
     } else if (!strcmp(cmd, "watch")) {
         if (arg_start + 1 >= argc) { usage(argv[0]); rc = 1; goto done; }

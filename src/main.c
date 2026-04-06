@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "worker.h"
+#include "ctl.h"
 #include "preprocessor.h"
 #include "ejs.h"
 #include "typescript.h"
@@ -21,10 +22,14 @@ static void handle_signal(int sig) {
     g_running = false;
 }
 
-static void usage(const char *prog) {
+/* ======================================================================
+ * sjs serve  (all-in-one server, current behavior)
+ * ====================================================================== */
+
+static void serve_usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s [options]\n"
-            "  -d <path>    SQLite database path (default: shift-js.db)\n"
+            "Usage: %s serve [options]\n"
+            "  -d <path>    SQLite database path (default: sjs.db)\n"
             "  -p <port>    Listen port (default: 9000)\n"
             "  -w <count>   Worker thread count (default: number of CPUs)\n"
             "  -t           Enable TLS (certs loaded from KV)\n"
@@ -41,7 +46,6 @@ static void usage(const char *prog) {
  * Returns node count, or 0 on error. */
 static uint32_t parse_peers(const char *str,
                             const char ***out_hosts, uint16_t **out_ports) {
-    /* Count commas to determine node count */
     uint32_t count = 1;
     for (const char *p = str; *p; p++)
         if (*p == ',') count++;
@@ -71,15 +75,15 @@ static uint32_t parse_peers(const char *str,
     return count;
 }
 
-int main(int argc, char **argv) {
-    const char *db_path = "shift-js.db";
+static int cmd_serve(int argc, char **argv) {
+    const char *db_path = "sjs.db";
     uint16_t    port    = 9000;
     int         nworkers = 0;
     bool        tls      = false;
     bool        no_log   = false;
 
     /* Raft options */
-    int         raft_id    = -1;  /* -1 = disabled */
+    int         raft_id    = -1;
     const char *raft_peers = NULL;
     uint16_t    raft_port  = 9100;
     int         batch_ms   = 2;
@@ -95,6 +99,7 @@ int main(int argc, char **argv) {
         { NULL, 0, NULL, 0 },
     };
 
+    optind = 1;  /* reset getopt for subcommand parsing */
     int opt;
     while ((opt = getopt_long(argc, argv, "d:p:w:th", long_opts, NULL)) != -1) {
         switch (opt) {
@@ -102,14 +107,14 @@ int main(int argc, char **argv) {
         case 'p': port       = (uint16_t)atoi(optarg); break;
         case 'w': nworkers   = atoi(optarg); break;
         case 't': tls        = true; break;
-        case 'h': usage(argv[0]); return 0;
+        case 'h': serve_usage(argv[0]); return 0;
         case 'R': raft_id    = atoi(optarg); break;
         case 'P': raft_peers = optarg; break;
         case 'Q': raft_port  = (uint16_t)atoi(optarg); break;
         case 'B': batch_ms   = atoi(optarg); break;
         case 'M': batch_max  = atoi(optarg); break;
         case 'N': no_log    = true; break;
-        default:  usage(argv[0]); return 1;
+        default:  serve_usage(argv[0]); return 1;
         }
     }
 
@@ -122,14 +127,14 @@ int main(int argc, char **argv) {
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
 
-    /* Preprocessor registry — populated before workers start, read-only after. */
+    /* Preprocessor registry */
     sjs_preprocessor_registry_t preprocessors;
     sjs_preprocessor_init(&preprocessors);
     sjs_preprocessor_register(&preprocessors, ".ejs", sjs_ejs_transform, NULL);
     sjs_preprocessor_register(&preprocessors, ".ts",  sjs_typescript_transform, NULL);
     sjs_preprocessor_register(&preprocessors, ".tsx", sjs_typescript_transform, NULL);
 
-    /* ---- Raft setup ---- */
+    /* Raft setup */
     raft_handle_t *raft = NULL;
 
     if (raft_id >= 0) {
@@ -159,7 +164,7 @@ int main(int argc, char **argv) {
             .batch_interval_ms    = (uint64_t)batch_ms,
             .batch_max_entries    = (uint32_t)batch_max,
             .worker_count         = (uint32_t)nworkers,
-            .raft_core            = (uint32_t)ncpus - 1, /* last core */
+            .raft_core            = (uint32_t)ncpus - 1,
             .running              = &g_running,
         };
 
@@ -171,16 +176,15 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* peer_hosts/ports are copied by raft_handle_create */
         for (uint32_t i = 0; i < node_count; i++) free((char *)peer_hosts[i]);
         free(peer_hosts);
         free(peer_ports);
 
-        printf("shift-js: raft enabled (node %d, %u peers, raft port %d)\n",
+        printf("sjs: raft enabled (node %d, %u peers, raft port %d)\n",
                raft_id, node_count, raft_port);
     }
 
-    printf("shift-js: %d workers, port %d, db %s%s\n",
+    printf("sjs: %d workers, port %d, db %s%s\n",
            nworkers, port, db_path, tls ? ", TLS" : "");
 
     sjs_worker_config_t *configs = calloc((size_t)nworkers, sizeof(*configs));
@@ -205,13 +209,66 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nworkers; i++)
         pthread_join(threads[i], NULL);
 
-    /* Destroy Raft after workers have stopped */
     if (raft)
         raft_handle_destroy(raft);
 
-    printf("shift-js: shutdown complete\n");
+    printf("sjs: shutdown complete\n");
 
     free(threads);
     free(configs);
     return 0;
+}
+
+/* ======================================================================
+ * Top-level dispatch
+ * ====================================================================== */
+
+static void usage(void) {
+    fprintf(stderr,
+            "Usage: sjs <command> [options]\n\n"
+            "Commands:\n"
+            "  serve      Start all-in-one server (default)\n"
+            "  ctl        Admin CLI (manage KV, deploy code, etc.)\n"
+            "  login      Authenticate to a remote server\n"
+            "\n"
+            "Run 'sjs <command> -h' for command-specific help.\n");
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        /* No subcommand — default to serve */
+        return cmd_serve(argc, argv);
+    }
+
+    const char *cmd = argv[1];
+
+    /* Shift argv so subcommand sees itself as argv[0] */
+    if (strcmp(cmd, "serve") == 0) {
+        argv[1] = argv[0];  /* keep program name for usage messages */
+        return cmd_serve(argc - 1, argv + 1);
+    } else if (strcmp(cmd, "ctl") == 0) {
+        return cmd_ctl(argc - 2, argv + 2);
+    } else if (strcmp(cmd, "login") == 0) {
+        fprintf(stderr, "sjs login: not yet implemented\n");
+        return 1;
+    } else if (strcmp(cmd, "code") == 0) {
+        fprintf(stderr, "sjs code: not yet implemented\n");
+        return 1;
+    } else if (strcmp(cmd, "replay") == 0) {
+        fprintf(stderr, "sjs replay: not yet implemented\n");
+        return 1;
+    } else if (strcmp(cmd, "worker") == 0) {
+        fprintf(stderr, "sjs worker: not yet implemented\n");
+        return 1;
+    } else if (strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0) {
+        usage();
+        return 0;
+    } else if (cmd[0] == '-') {
+        /* Flags without subcommand — treat as serve */
+        return cmd_serve(argc, argv);
+    } else {
+        fprintf(stderr, "sjs: unknown command '%s'\n\n", cmd);
+        usage();
+        return 1;
+    }
 }

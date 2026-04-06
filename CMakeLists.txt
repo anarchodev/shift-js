@@ -106,48 +106,87 @@ add_custom_target(sucrase_bundle DEPENDS "${SUCRASE_HEADER}")
 find_package(OpenSSL REQUIRED)
 
 # ----------------------------------------------------------------------
-# shift-js server
+# qjs_snap: standalone QuickJS snapshot library
 # ----------------------------------------------------------------------
-add_executable(shift-js
+add_library(qjs_snap STATIC src/qjs_snap.c)
+target_include_directories(qjs_snap PUBLIC src)
+target_link_libraries(qjs_snap PUBLIC qjs)
+
+# ----------------------------------------------------------------------
+# kvstore: KV storage library (SQLite-backed)
+# ----------------------------------------------------------------------
+add_library(kvstore STATIC src/kvstore.c)
+target_include_directories(kvstore PUBLIC src)
+target_link_libraries(kvstore PUBLIC sqlite3)
+
+# ----------------------------------------------------------------------
+# code_db: content-addressed code storage library
+# ----------------------------------------------------------------------
+add_library(code_db STATIC src/code_db.c)
+target_include_directories(code_db PUBLIC src)
+target_link_libraries(code_db PUBLIC sqlite3 OpenSSL::Crypto)
+
+# ----------------------------------------------------------------------
+# preprocessors: EJS + TypeScript (Sucrase) transform pipeline
+# ----------------------------------------------------------------------
+add_library(preprocessors STATIC src/preprocessor.c src/ejs.c src/typescript.c)
+add_dependencies(preprocessors sucrase_bundle)
+target_include_directories(preprocessors PUBLIC src ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(preprocessors PUBLIC qjs)
+
+# ----------------------------------------------------------------------
+# log_db: per-worker request logging (SQLite + binary replay log)
+# ----------------------------------------------------------------------
+add_library(log_db STATIC src/log_db.c)
+target_include_directories(log_db PUBLIC src)
+target_link_libraries(log_db PUBLIC sqlite3)
+
+# ----------------------------------------------------------------------
+# replay_capture: deterministic replay tape recording
+# ----------------------------------------------------------------------
+add_library(replay_capture STATIC src/replay_capture.c)
+target_include_directories(replay_capture PUBLIC src)
+target_link_libraries(replay_capture PUBLIC kvstore)
+
+# ----------------------------------------------------------------------
+# sjs_raft: Raft consensus subsystem
+# ----------------------------------------------------------------------
+add_library(sjs_raft STATIC
+    src/raft_thread.c
+    src/raft_net.c
+    src/raft_rpc.c
+    src/raft_log.c
+)
+target_include_directories(sjs_raft PUBLIC src)
+target_link_libraries(sjs_raft PUBLIC kvstore raft sqlite3 OpenSSL::Crypto uring pthread)
+
+# ----------------------------------------------------------------------
+# sjs: single executable with subcommands
+# ----------------------------------------------------------------------
+add_executable(sjs
     src/main.c
     src/worker.c
-    src/kvstore.c
+    src/admin.c
+    src/ctl.c
     src/js_runtime.c
     src/js_globals.c
     src/js_dispatch.c
     src/router.c
-    src/preprocessor.c
-    src/ejs.c
-    src/typescript.c
     src/session.c
     src/crypto.c
-    src/raft_log.c
-    src/raft_rpc.c
-    src/raft_net.c
-    src/raft_thread.c
-    src/log_db.c
-    src/replay_capture.c
 )
-add_dependencies(shift-js sucrase_bundle)
-target_include_directories(shift-js PRIVATE src ${CMAKE_BINARY_DIR}/generated)
-target_link_libraries(shift-js PRIVATE
+target_include_directories(sjs PRIVATE src)
+target_link_libraries(sjs PRIVATE
     shift_h2
-    qjs
-    sqlite3
-    raft
+    qjs_snap
+    kvstore
+    code_db
+    preprocessors
+    log_db
+    replay_capture
+    sjs_raft
     OpenSSL::Crypto
     pthread
-    uring
     m
     dl
 )
-
-# ----------------------------------------------------------------------
-# CLI tool
-# ----------------------------------------------------------------------
-add_executable(sjsctl
-    tools/sjsctl.c
-    src/kvstore.c
-)
-target_include_directories(sjsctl PRIVATE src ${dmon_SOURCE_DIR})
-target_link_libraries(sjsctl PRIVATE sqlite3 pthread OpenSSL::Crypto)

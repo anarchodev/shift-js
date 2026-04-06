@@ -14,16 +14,20 @@ static const char *SCHEMA_SQL =
     "CREATE INDEX IF NOT EXISTS idx_logs_request ON logs(request_id);"
     "CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(timestamp);"
     "CREATE TABLE IF NOT EXISTS replay_index ("
-    "  request_id INTEGER PRIMARY KEY,"
-    "  offset     INTEGER NOT NULL"
+    "  request_id  INTEGER PRIMARY KEY,"
+    "  offset      INTEGER NOT NULL,"
+    "  status_code INTEGER NOT NULL DEFAULT 0"
     ");";
+
+static const char *MIGRATE_SQL =
+    "ALTER TABLE replay_index ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0";
 
 static const char *INSERT_SQL =
     "INSERT INTO logs (timestamp, worker_id, request_id, session_id, level, message) "
     "VALUES (?, ?, ?, ?, ?, ?)";
 
 static const char *REPLAY_INDEX_SQL =
-    "INSERT OR REPLACE INTO replay_index (request_id, offset) VALUES (?, ?)";
+    "INSERT OR REPLACE INTO replay_index (request_id, offset, status_code) VALUES (?, ?, ?)";
 
 /* ---- Binary replay record helpers ---- */
 
@@ -114,6 +118,9 @@ int log_db_open(log_db_t *ldb, const char *db_path, const char *replay_path) {
         ldb->db = NULL;
         return -1;
     }
+
+    /* Migrate: add status_code column if missing (idempotent) */
+    sqlite3_exec(ldb->db, MIGRATE_SQL, NULL, NULL, NULL);
 
     /* Prepare insert statements */
     rc = sqlite3_prepare_v2(ldb->db, INSERT_SQL, -1, &ldb->insert_stmt, NULL);
@@ -247,6 +254,7 @@ void log_db_flush_one(log_db_t *ldb, sjs_log_record_t *rec) {
             sqlite3_stmt *s = ldb->replay_index_stmt;
             sqlite3_bind_int64(s, 1, (sqlite3_int64)rec->request_id);
             sqlite3_bind_int64(s, 2, (sqlite3_int64)offset);
+            sqlite3_bind_int(s, 3, rec->status_code);
             sqlite3_step(s);
             sqlite3_reset(s);
         }
@@ -364,7 +372,7 @@ int log_db_list_requests(sqlite3 *db, FILE *replay_file, int limit,
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db,
-        "SELECT request_id, offset FROM replay_index ORDER BY request_id DESC LIMIT ?",
+        "SELECT request_id, offset, status_code FROM replay_index ORDER BY request_id DESC LIMIT ?",
         -1, &stmt, NULL);
     if (rc != SQLITE_OK) return -1;
 
@@ -383,6 +391,7 @@ int log_db_list_requests(sqlite3 *db, FILE *replay_file, int limit,
         long offset = (long)sqlite3_column_int64(stmt, 1);
 
         entries[count].request_id = rid;
+        entries[count].status_code = sqlite3_column_int(stmt, 2);
         entries[count].request_data = NULL;
 
         /* Read just the req_json field from the binary log */
@@ -425,7 +434,7 @@ void log_db_free_request_entries(log_db_request_entry_t *entries, size_t count) 
     free(entries);
 }
 
-int log_db_reader_open(log_db_reader_t *r, int num_workers) {
+int log_db_reader_open(log_db_reader_t *r, int num_workers, const char *db_path) {
     r->dbs = calloc((size_t)num_workers, sizeof(sqlite3 *));
     r->replay_files = calloc((size_t)num_workers, sizeof(FILE *));
     if (!r->dbs || !r->replay_files) {
@@ -436,8 +445,8 @@ int log_db_reader_open(log_db_reader_t *r, int num_workers) {
     r->count = num_workers;
 
     for (int i = 0; i < num_workers; i++) {
-        char path[64];
-        snprintf(path, sizeof(path), "logs_%d.db", i);
+        char path[256];
+        snprintf(path, sizeof(path), "%s.logs_%d.db", db_path, i);
         int rc = sqlite3_open_v2(path, &r->dbs[i],
                                  SQLITE_OPEN_READONLY | SQLITE_OPEN_WAL, NULL);
         if (rc != SQLITE_OK) {
@@ -447,7 +456,7 @@ int log_db_reader_open(log_db_reader_t *r, int num_workers) {
         }
         sqlite3_busy_timeout(r->dbs[i], 1000);
 
-        snprintf(path, sizeof(path), "replay_%d.log", i);
+        snprintf(path, sizeof(path), "%s.replay_%d.log", db_path, i);
         r->replay_files[i] = fopen(path, "rb");
         /* May not exist yet — that's OK */
     }

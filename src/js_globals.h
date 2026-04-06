@@ -18,7 +18,7 @@ void js_install_logs(JSContext *ctx);
 const char *sha256_hex(const void *data, size_t len);
 
 /* JS error extraction helpers. */
-const char *js_err_string(JSContext *ctx, sjs_arena_t *arena);
+const char *js_err_string(JSContext *ctx, qjs_snap_arena_t *arena);
 const char *js_err_string_with_stack(JSContext *ctx);
 
 /* JSON stringify/parse via the global JSON object.

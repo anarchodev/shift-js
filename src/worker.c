@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "worker.h"
+#include "admin.h"
 #include "crypto.h"
 #include "kvstore.h"
 #include "js_runtime.h"
@@ -383,9 +384,9 @@ void *sjs_worker_fn(void *arg) {
     /* ---- Log DB (per-worker file, separate from KV) ---- */
     log_db_t log_db = {0};
     if (!wcfg->no_log) {
-        char log_path[64], replay_path[64];
-        snprintf(log_path, sizeof(log_path), "logs_%d.db", wcfg->worker_id);
-        snprintf(replay_path, sizeof(replay_path), "replay_%d.log", wcfg->worker_id);
+        char log_path[256], replay_path[256];
+        snprintf(log_path, sizeof(log_path), "%s.logs_%d.db", wcfg->db_path, wcfg->worker_id);
+        snprintf(replay_path, sizeof(replay_path), "%s.replay_%d.log", wcfg->db_path, wcfg->worker_id);
         if (log_db_open(&log_db, log_path, replay_path) != 0)
             fprintf(stderr, "Worker %d: log_db_open failed (logging disabled)\n",
                     wcfg->worker_id);
@@ -395,7 +396,7 @@ void *sjs_worker_fn(void *arg) {
     /* ---- Log DB reader (read-only handles to all worker DBs) ---- */
     log_db_reader_t log_reader = {0};
     if (log_db.db)
-        log_db_reader_open(&log_reader, wcfg->num_workers);
+        log_db_reader_open(&log_reader, wcfg->num_workers, wcfg->db_path);
 
     /* ---- Shift context ---- */
     shift_t *sh = NULL;
@@ -612,16 +613,33 @@ void *sjs_worker_fn(void *arg) {
                     const char *qm = memchr(p, '?', plen);
                     if (qm) plen = (uint32_t)(qm - p);
 
-                    char static_raw[512];
-                    snprintf(static_raw, sizeof(static_raw),
-                             "__static/%.*s", (int)plen, p);
-                    char static_key[512];
-                    const char *sk = kv_prefixed_key(prefix, static_raw,
-                                                      static_key, sizeof(static_key));
-
                     void *sval = NULL;
                     size_t sval_len = 0;
-                    if (sk && kv_get(kv, sk, &sval, &sval_len) == 0) {
+                    int static_found = 0;
+
+                    /* Try tree-hash path first if deployed. */
+                    if (sjs.current_tree_hash[0]) {
+                        char tree_key[1024];
+                        snprintf(tree_key, sizeof(tree_key),
+                                 "database/default/files/%s/%.*s",
+                                 sjs.current_tree_hash, (int)plen, p);
+                        if (kv_get(kv, tree_key, &sval, &sval_len) == 0)
+                            static_found = 1;
+                    }
+
+                    /* Legacy __static/ fallback. */
+                    if (!static_found) {
+                        char static_raw[512];
+                        snprintf(static_raw, sizeof(static_raw),
+                                 "__static/%.*s", (int)plen, p);
+                        char static_key[512];
+                        const char *sk = kv_prefixed_key(prefix, static_raw,
+                                                          static_key, sizeof(static_key));
+                        if (sk && kv_get(kv, sk, &sval, &sval_len) == 0)
+                            static_found = 1;
+                    }
+
+                    if (static_found) {
                         sh2_status_t *st = NULL;
                         shift_entity_get_component(sh, e, comp.status, (void **)&st);
                         st->code = 200;
@@ -657,6 +675,58 @@ void *sjs_worker_fn(void *arg) {
                         }
                     }
                     /* Not found in __static/ — fall through to normal dispatch */
+                }
+
+                /* ---- Admin API fast path ---- */
+                if (admin_match(path_val, path_len)) {
+                    admin_request_t areq = {
+                        .method     = method_str,
+                        .path       = path_str,
+                        .body       = rqb ? rqb->data : NULL,
+                        .body_len   = rqb ? rqb->len : 0,
+                        .kv_prefix  = prefix,
+                    };
+                    admin_response_t aresp;
+                    admin_dispatch(kv, &areq, &aresp);
+
+                    sh2_status_t *st = NULL;
+                    shift_entity_get_component(sh, e, comp.status, (void **)&st);
+                    st->code = aresp.status;
+
+                    sh2_resp_body_t *rb = NULL;
+                    shift_entity_get_component(sh, e, comp.resp_body, (void **)&rb);
+                    rb->data = aresp.body;
+                    rb->len  = aresp.body_len;
+
+                    sh2_resp_headers_t *rh = NULL;
+                    shift_entity_get_component(sh, e, comp.resp_headers, (void **)&rh);
+                    if (aresp.content_type) {
+                        sh2_header_field_t *hf = malloc(sizeof(sh2_header_field_t));
+                        char *ct_name = strdup("content-type");
+                        char *ct_val  = strdup(aresp.content_type);
+                        if (hf && ct_name && ct_val) {
+                            hf[0] = (sh2_header_field_t){
+                                .name      = ct_name,
+                                .name_len  = 12,
+                                .value     = ct_val,
+                                .value_len = (uint32_t)strlen(aresp.content_type),
+                            };
+                            rh->fields = hf;
+                            rh->count  = 1;
+                        } else {
+                            free(hf); free(ct_name); free(ct_val);
+                            rh->fields = NULL;
+                            rh->count  = 0;
+                        }
+                    } else {
+                        rh->fields = NULL;
+                        rh->count  = 0;
+                    }
+
+                    shift_entity_move_one(sh, e, response_in);
+                    free(method_str);
+                    free(path_str);
+                    continue;
                 }
 
                 /* Get sjs component pointers (initialized by constructors) */
@@ -754,6 +824,7 @@ void *sjs_worker_fn(void *arg) {
                 sh2_status_t *st = NULL;
                 shift_entity_get_component(sh, e, comp.status, (void **)&st);
                 st->code = resp_st->code;
+                if (log_rec) log_rec->status_code = resp_st->code;
 
                 /* Transfer response headers to sh2 (string ownership moves) */
                 uint32_t nhdr = resp_hdrs->count;

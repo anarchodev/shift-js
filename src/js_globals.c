@@ -23,14 +23,14 @@
  * QuickJS from allocating an exception object.
  * ====================================================================== */
 
-const char *js_err_string(JSContext *ctx, sjs_arena_t *arena) {
+const char *js_err_string(JSContext *ctx, qjs_snap_arena_t *arena) {
     static _Thread_local char err_buf[2048];
 
     JSValue exc = JS_GetException(ctx);
     if (JS_IsNull(exc) || JS_IsUndefined(exc)) {
         snprintf(err_buf, sizeof(err_buf),
                  "arena exhausted (%zu / %d bytes used)",
-                 arena->used, SJS_ARENA_SIZE);
+                 arena->used, QJS_SNAP_ARENA_SIZE);
         return err_buf;
     }
 
@@ -1102,6 +1102,13 @@ static JSValue js_logs_requests(JSContext *ctx, JSValue this_val,
                 JS_IsException(parsed) ? JS_NULL : parsed);
         } else {
             JS_SetPropertyStr(ctx, entry, "request", JS_NULL);
+        }
+
+        if (all[i].status_code > 0) {
+            JSValue resp = JS_NewObject(ctx);
+            JS_SetPropertyStr(ctx, resp, "status",
+                JS_NewInt32(ctx, all[i].status_code));
+            JS_SetPropertyStr(ctx, entry, "response", resp);
         }
 
         JS_SetPropertyUint32(ctx, arr, (uint32_t)i, entry);

@@ -14,7 +14,7 @@ async function loadReplay() {
   }
 
   // Show request info
-  var rd = replayData.request_data;
+  var rd = replayData.request;
   var infoEl = document.getElementById('request-info');
   infoEl.innerHTML = '';
   var table = document.createElement('table');
@@ -22,10 +22,6 @@ async function loadReplay() {
     addRow(table, 'Method', rd.method || '');
     addRow(table, 'Path', rd.path || '');
     if (rd.body) addRow(table, 'Body', rd.body);
-  }
-  var respd = replayData.response_data;
-  if (respd) {
-    addRow(table, 'Status', String(respd.status || ''));
   }
   infoEl.appendChild(table);
 
@@ -320,9 +316,9 @@ async function registerModulesForDevtools() {
       var b64 = btoa(unescape(encodeURIComponent(smJson)));
       scriptContent = processed.code +
         '\n//# sourceMappingURL=data:application/json;base64,' + b64 +
-        '\n//# sourceURL=' + absPath + '.compiled.js';
+        '\n//# sourceURL=shift-js://' + absPath + '.compiled.js';
     } else {
-      scriptContent = processed.code + '\n//# sourceURL=/' + mod.path;
+      scriptContent = processed.code + '\n//# sourceURL=shift-js:///' + mod.path;
     }
 
     scriptContents.push(scriptContent);
@@ -345,7 +341,7 @@ function setupShims() {
   var kvTape = replayData.kv_tape || [];
   var dateTape = replayData.date_tape || [];
   var mathRandomTape = replayData.math_random_tape || [];
-  var rd = replayData.request_data || {};
+  var rd = replayData.request || {};
 
   var kvIdx = 0;
   var dateIdx = 0;
@@ -431,7 +427,7 @@ async function doReplay() {
   var mainReg = window.__sjs_mod[mainMod.path];
 
   // Parse the original request to find fn name and args
-  var rd = replayData.request_data || {};
+  var rd = replayData.request || {};
   var origPath = rd.path || '';
   var origQs = origPath.split('?')[1] || '';
   var origParams = {};

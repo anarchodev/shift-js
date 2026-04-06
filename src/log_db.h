@@ -46,6 +46,7 @@ typedef struct {
     char    *date_tape;
     char    *math_random_tape;
     char    *module_tree;
+    int      status_code;     /* HTTP response status (e.g. 200, 404) */
 } sjs_log_record_t;
 
 void sjs_log_record_free(sjs_log_record_t *rec);
@@ -83,6 +84,7 @@ int  log_db_get_replay(sqlite3 *db, FILE *replay_file, uint64_t request_id,
 typedef struct {
     uint64_t request_id;
     char    *request_data;   /* JSON */
+    int      status_code;    /* HTTP response status */
 } log_db_request_entry_t;
 
 int  log_db_list_requests(sqlite3 *db, FILE *replay_file, int limit,
@@ -104,5 +106,5 @@ typedef struct {
     int       count;
 } log_db_reader_t;
 
-int  log_db_reader_open(log_db_reader_t *r, int num_workers);
+int  log_db_reader_open(log_db_reader_t *r, int num_workers, const char *db_path);
 void log_db_reader_close(log_db_reader_t *r);

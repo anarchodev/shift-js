@@ -1,6 +1,5 @@
 #pragma once
 
-#include "kvstore.h"
 #include <stddef.h>
 
 /* Transform function: takes source bytes, returns malloc'd JS string.
@@ -34,14 +33,20 @@ const sjs_preprocessor_entry_t *sjs_preprocessor_find(
 /* Return pointer to the extension within path (e.g. ".ejs"), or NULL. */
 const char *sjs_path_extension(const char *path);
 
-/* Resolve a module by probing KV for base_path with each known extension.
+/* Callback for fetching a module by key.
+ * Returns 0 on success (sets *out and *out_len), -1 on not-found. */
+typedef int (*sjs_fetch_fn)(const char *key, void **out, size_t *out_len,
+                            void *user_ctx);
+
+/* Resolve a module by probing for base_path with each known extension.
  * Tries ".mjs" first, then each registered preprocessor extension.
+ * The fetch callback is called with "<base_path><ext>" — the caller's
+ * callback is responsible for any key prefix (e.g. "__code/", tenant).
  * Returns malloc'd resolved filename (e.g. "index.ejs") on success,
  * sets *source and *source_len to the fetched content (caller frees *source).
  * Returns NULL if nothing found. */
 char *sjs_resolve_with_extensions(
     const sjs_preprocessor_registry_t *reg,
-    kvstore_t *kv,
+    sjs_fetch_fn fetch, void *fetch_ctx,
     const char *base_path,
-    const char *kv_prefix,
     void **source, size_t *source_len);

@@ -14,3 +14,8 @@ export function get(args: {key: string}): object {
   }
   return { key: args.key, value: value };
 }
+
+export function put(args: {key: string, value: string}): object {
+  kv.put(args.key, args.value);
+  return { ok: true, key: args.key };
+}
