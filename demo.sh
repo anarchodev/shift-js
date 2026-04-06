@@ -5,13 +5,6 @@ PORT="${PORT:-9443}"
 DB="demo.db"
 CERT_DIR=".data/certs"
 
-# ---- Kill stray shift-js processes ----
-if pgrep -f "shift-js" >/dev/null 2>&1; then
-    echo "Killing stray shift-js processes..."
-    pkill -9 -f "shift-js" 2>/dev/null || true
-    sleep 1
-fi
-
 # ---- Build if needed ----
 if [ ! -f build/shift-js ] || [ ! -f build/sjsctl ]; then
     echo "Building..."
@@ -19,7 +12,7 @@ if [ ! -f build/shift-js ] || [ ! -f build/sjsctl ]; then
 fi
 
 # ---- Fresh database ----
-rm -f "$DB" "$DB-wal" "$DB-shm" logs.db logs.db-wal logs.db-shm
+rm -f "$DB" "$DB-wal" "$DB-shm" "$DB".logs_*.db "$DB".logs_*.db-wal "$DB".logs_*.db-shm "$DB".replay_*.log
 echo "Uploading demo files..."
 ./build/sjsctl -d "$DB" upload demo
 
