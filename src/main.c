@@ -2,6 +2,10 @@
 
 #include "worker.h"
 #include "ctl.h"
+#include "code_db.h"
+#include "code_store.h"
+#include "code_server.h"
+#include "code_client.h"
 #include "preprocessor.h"
 #include "ejs.h"
 #include "typescript.h"
@@ -187,6 +191,17 @@ static int cmd_serve(int argc, char **argv) {
     printf("sjs: %d workers, port %d, db %s%s\n",
            nworkers, port, db_path, tls ? ", TLS" : "");
 
+    /* Code database + in-memory bytecode store */
+    code_db_t *cdb = NULL;
+    char code_path[512];
+    snprintf(code_path, sizeof(code_path), "%s.code", db_path);
+    if (code_db_open(code_path, &cdb) != 0) {
+        fprintf(stderr, "sjs: warning: code_db_open failed (%s)\n", code_path);
+        /* Non-fatal — code_db features disabled */
+    }
+
+    code_store_t *code_store = code_store_create();
+
     sjs_worker_config_t *configs = calloc((size_t)nworkers, sizeof(*configs));
     pthread_t           *threads = calloc((size_t)nworkers, sizeof(*threads));
 
@@ -202,6 +217,8 @@ static int cmd_serve(int argc, char **argv) {
             .preprocessors = &preprocessors,
             .raft        = raft,
             .no_log      = no_log,
+            .code_db     = cdb,
+            .code_store  = code_store,
         };
         pthread_create(&threads[i], NULL, sjs_worker_fn, &configs[i]);
     }
@@ -211,6 +228,8 @@ static int cmd_serve(int argc, char **argv) {
 
     if (raft)
         raft_handle_destroy(raft);
+    code_store_destroy(code_store);
+    code_db_close(cdb);
 
     printf("sjs: shutdown complete\n");
 
@@ -252,14 +271,107 @@ int main(int argc, char **argv) {
         fprintf(stderr, "sjs login: not yet implemented\n");
         return 1;
     } else if (strcmp(cmd, "code") == 0) {
-        fprintf(stderr, "sjs code: not yet implemented\n");
-        return 1;
+        /* sjs code -d <db_path> -p <port> */
+        const char *db = "code.db";
+        uint16_t cport = 9001;
+        for (int a = 2; a < argc; a++) {
+            if (strcmp(argv[a], "-d") == 0 && a + 1 < argc) db = argv[++a];
+            else if (strcmp(argv[a], "-p") == 0 && a + 1 < argc) cport = (uint16_t)atoi(argv[++a]);
+        }
+        code_server_config_t ccfg = {
+            .db_path     = db,
+            .database_id = "default",
+            .port        = cport,
+            .store       = NULL,
+        };
+        return code_server_run(&ccfg);
     } else if (strcmp(cmd, "replay") == 0) {
         fprintf(stderr, "sjs replay: not yet implemented\n");
         return 1;
     } else if (strcmp(cmd, "worker") == 0) {
-        fprintf(stderr, "sjs worker: not yet implemented\n");
-        return 1;
+        /* sjs worker -d <db> -p <port> --code-server=host:port */
+        const char *db = "sjs.db";
+        uint16_t wport = 9000;
+        int nw = 0;
+        const char *cs_host = NULL;
+        uint16_t cs_port = 9001;
+
+        for (int a = 2; a < argc; a++) {
+            if (strcmp(argv[a], "-d") == 0 && a + 1 < argc) db = argv[++a];
+            else if (strcmp(argv[a], "-p") == 0 && a + 1 < argc) wport = (uint16_t)atoi(argv[++a]);
+            else if (strcmp(argv[a], "-w") == 0 && a + 1 < argc) nw = atoi(argv[++a]);
+            else if (strncmp(argv[a], "--code-server=", 14) == 0) {
+                const char *val = argv[a] + 14;
+                char *colon = strrchr(val, ':');
+                if (colon) {
+                    cs_host = strndup(val, (size_t)(colon - val));
+                    cs_port = (uint16_t)atoi(colon + 1);
+                } else {
+                    cs_host = val;
+                }
+            }
+        }
+
+        if (!cs_host) {
+            fprintf(stderr, "sjs worker: --code-server=host:port is required\n");
+            return 1;
+        }
+
+        signal(SIGINT,  handle_signal);
+        signal(SIGTERM, handle_signal);
+
+        long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+        if (nw <= 0) nw = (int)ncpus;
+
+        code_store_t *wstore = code_store_create();
+
+        /* Pull initial snapshot from code server */
+        printf("sjs worker: connecting to code server %s:%d...\n", cs_host, cs_port);
+        code_client_t *cclient = NULL;
+        code_client_config_t cc_cfg = {
+            .host    = cs_host,
+            .port    = cs_port,
+            .store   = wstore,
+            .running = &g_running,
+        };
+        if (code_client_start(&cc_cfg, &cclient) != 0) {
+            fprintf(stderr, "sjs worker: failed to pull from code server\n");
+            code_store_destroy(wstore);
+            return 1;
+        }
+
+        printf("sjs worker: code loaded, starting %d workers on port %d\n", nw, wport);
+
+        sjs_preprocessor_registry_t wpp;
+        sjs_preprocessor_init(&wpp);
+
+        sjs_worker_config_t *wconfigs = calloc((size_t)nw, sizeof(*wconfigs));
+        pthread_t *wthreads = calloc((size_t)nw, sizeof(*wthreads));
+        for (int wi = 0; wi < nw; wi++) {
+            wconfigs[wi] = (sjs_worker_config_t){
+                .worker_id     = wi,
+                .num_workers   = nw,
+                .worker_core   = wi,
+                .db_path       = db,
+                .port          = wport,
+                .running       = &g_running,
+                .preprocessors = &wpp,
+                .code_store    = wstore,
+                .code_server_host = cs_host,
+                .code_server_port = cs_port,
+                .no_log        = true, /* TODO: connect to replay server */
+            };
+            pthread_create(&wthreads[wi], NULL, sjs_worker_fn, &wconfigs[wi]);
+        }
+
+        for (int wi = 0; wi < nw; wi++)
+            pthread_join(wthreads[wi], NULL);
+
+        code_client_stop(cclient);
+        code_store_destroy(wstore);
+        free(wconfigs);
+        free(wthreads);
+        return 0;
     } else if (strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0) {
         usage();
         return 0;

@@ -1,4 +1,7 @@
 #include "admin.h"
+#include "code_db.h"
+#include "code_store.h"
+#include "code_server.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -234,8 +237,9 @@ static void handle_kv_range(kvstore_t *kv, const admin_request_t *req,
     resp_json(resp, 200, buf, (uint32_t)pos);
 }
 
-static void handle_kv(kvstore_t *kv, const admin_request_t *req,
+static void handle_kv(const admin_services_t *svc, const admin_request_t *req,
                       admin_response_t *resp) {
+    kvstore_t *kv = svc->kv;
     if (path_starts_with(req->path, "/_admin/kv/range")) {
         handle_kv_range(kv, req, resp);
     } else if (strcmp(req->method, "GET") == 0) {
@@ -254,8 +258,9 @@ static void handle_kv(kvstore_t *kv, const admin_request_t *req,
  * /_admin/domain — domain mapping
  * ====================================================================== */
 
-static void handle_domain(kvstore_t *kv, const admin_request_t *req,
+static void handle_domain(const admin_services_t *svc, const admin_request_t *req,
                           admin_response_t *resp) {
+    kvstore_t *kv = svc->kv;
     if (strcmp(req->method, "PUT") == 0 ||
         strcmp(req->method, "POST") == 0) {
         char *host = query_param(req->path, "host");
@@ -302,8 +307,9 @@ static void handle_domain(kvstore_t *kv, const admin_request_t *req,
  * /_admin/cert — TLS certificate storage
  * ====================================================================== */
 
-static void handle_cert(kvstore_t *kv, const admin_request_t *req,
+static void handle_cert(const admin_services_t *svc, const admin_request_t *req,
                         admin_response_t *resp) {
+    kvstore_t *kv = svc->kv;
     if (strcmp(req->method, "PUT") != 0 &&
         strcmp(req->method, "POST") != 0) {
         resp_error(resp, 405, "method not allowed");
@@ -349,19 +355,94 @@ static void handle_cert(kvstore_t *kv, const admin_request_t *req,
  * ====================================================================== */
 
 int admin_match(const char *path, uint32_t path_len) {
-    return path_len >= 8 && strncmp(path, "/_admin/", 8) == 0;
+    if (path_len >= 8 && strncmp(path, "/_admin/", 8) == 0) return 1;
+    if (path_len >= 7 && strncmp(path, "/upload", 7) == 0) return 1;
+    if (path_len >= 7 && strncmp(path, "/deploy", 7) == 0) return 1;
+    return 0;
 }
 
-int admin_dispatch(kvstore_t *kv, const admin_request_t *req,
+/* ======================================================================
+ * /_admin/code — upload and deploy
+ * ====================================================================== */
+
+static int handle_code_upload(const admin_services_t *svc,
+                              const admin_request_t *req,
+                              admin_response_t *resp) {
+    if (!svc->code_db) return ADMIN_NEEDS_PROXY;
+    char *path = query_param(req->path, "path");
+    if (!path) {
+        resp_error(resp, 400, "missing path parameter");
+        return 0;
+    }
+    if (!req->body || req->body_len == 0) {
+        resp_error(resp, 400, "missing request body");
+        free(path);
+        return 0;
+    }
+
+    int rc = code_db_put_file(svc->code_db, "default",
+                              path, req->body, req->body_len);
+    free(path);
+
+    if (rc != 0) {
+        resp_error(resp, 500, "upload failed");
+        return 0;
+    }
+    char *body = strdup("{\"ok\":true}");
+    resp_json(resp, 200, body, body ? 11 : 0);
+    return 0;
+}
+
+static int handle_code_deploy(const admin_services_t *svc,
+                              admin_response_t *resp) {
+    if (!svc->code_db || !svc->code_store) return ADMIN_NEEDS_PROXY;
+
+    int rc = code_server_deploy(svc->code_db, "default", svc->code_store);
+    if (rc != 0) {
+        resp_error(resp, 500, "deploy failed");
+        return 0;
+    }
+    char *body = strdup("{\"ok\":true}");
+    resp_json(resp, 200, body, body ? 11 : 0);
+    return 0;
+}
+
+static int handle_code(const admin_services_t *svc, const admin_request_t *req,
+                       admin_response_t *resp) {
+    if (path_starts_with(req->path, "/_admin/code/upload") ||
+        path_starts_with(req->path, "/upload")) {
+        if (strcmp(req->method, "PUT") == 0 || strcmp(req->method, "POST") == 0)
+            return handle_code_upload(svc, req, resp);
+        resp_error(resp, 405, "method not allowed");
+    } else if (path_starts_with(req->path, "/_admin/code/deploy") ||
+               path_starts_with(req->path, "/deploy")) {
+        if (strcmp(req->method, "POST") == 0)
+            return handle_code_deploy(svc, resp);
+        resp_error(resp, 405, "method not allowed");
+    } else {
+        resp_error(resp, 404, "unknown code endpoint");
+    }
+    return 0;
+}
+
+/* ======================================================================
+ * Public dispatch
+ * ====================================================================== */
+
+int admin_dispatch(const admin_services_t *svc, const admin_request_t *req,
                    admin_response_t *resp) {
     memset(resp, 0, sizeof(*resp));
 
     if (path_starts_with(req->path, "/_admin/kv")) {
-        handle_kv(kv, req, resp);
+        handle_kv(svc, req, resp);
+    } else if (path_starts_with(req->path, "/_admin/code") ||
+               path_starts_with(req->path, "/upload") ||
+               path_starts_with(req->path, "/deploy")) {
+        return handle_code(svc, req, resp);
     } else if (path_starts_with(req->path, "/_admin/domain")) {
-        handle_domain(kv, req, resp);
+        handle_domain(svc, req, resp);
     } else if (path_starts_with(req->path, "/_admin/cert")) {
-        handle_cert(kv, req, resp);
+        handle_cert(svc, req, resp);
     } else {
         resp_error(resp, 404, "unknown admin endpoint");
     }

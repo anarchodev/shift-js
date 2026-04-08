@@ -1,13 +1,12 @@
 #define _GNU_SOURCE
 #include "js_globals.h"
 #include "js_runtime.h"
+#include "code_store.h"
 #include "kvstore.h"
-#include "preprocessor.h"
 #include "router.h"
 #include "session.h"
 #include "replay_capture.h"
 #include "log_db.h"
-#include "typescript.h"
 #include "raft_thread.h"
 
 #include <quickjs.h>
@@ -18,28 +17,14 @@
 #include <inttypes.h>
 #include <time.h>
 
-/* Refresh the cached current_tree_hash from KV every 100ms. */
+/* Refresh the cached current_tree_hash from the in-memory code store. */
 static void refresh_tree_hash(sjs_runtime_t *sjs) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    int64_t now_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec;
-
-    if (sjs->tree_hash_ts != 0 &&
-        (now_ns - sjs->tree_hash_ts) < 100000000LL)   /* 100ms */
-        return;
-
-    sjs->tree_hash_ts = now_ns;
-
-    void *val = NULL;
-    size_t vlen = 0;
-    if (kv_get(sjs->kv, "database/default/current_hash", &val, &vlen) == 0
-        && val && vlen >= 40) {
-        memcpy(sjs->current_tree_hash, val, 40);
-        sjs->current_tree_hash[40] = '\0';
-        free(val);
+    const char *h = code_store_tree_hash(sjs->code_store);
+    if (h) {
+        snprintf(sjs->current_tree_hash,
+                 sizeof(sjs->current_tree_hash), "%s", h);
     } else {
         sjs->current_tree_hash[0] = '\0';
-        free(val);
     }
 }
 
@@ -130,156 +115,8 @@ static JSValue parse_query_string(JSContext *ctx, const char *qs) {
     return obj;
 }
 
-/* ======================================================================
- * Module compilation and caching
- * ====================================================================== */
-
-typedef struct {
-    kvstore_t  *kv;
-    const char *prefix;
-} kv_fetch_ctx_t;
-
-static int kv_fetch(const char *key, void **out, size_t *out_len, void *ctx) {
-    kv_fetch_ctx_t *fc = ctx;
-    char raw_key[256];
-    int n = snprintf(raw_key, sizeof(raw_key), "__code/%s", key);
-    if (n < 0 || (size_t)n >= sizeof(raw_key)) return -1;
-    char buf[512];
-    const char *k = kv_prefixed_key(fc->prefix, raw_key, buf, sizeof(buf));
-    if (!k) return -1;
-    return kv_get(fc->kv, k, out, out_len);
-}
-
-static int compile_module(sjs_runtime_t *sjs, const char *kv_prefix,
-                          const char *base_path,
-                          void **bytecode, size_t *bc_len,
-                          char **out_module_path,
-                          char **err_body, uint32_t *err_len) {
-    void  *source = NULL;
-    size_t source_len = 0;
-    kv_fetch_ctx_t fc = { .kv = sjs->kv, .prefix = kv_prefix };
-    char *module_path = sjs_resolve_with_extensions(
-        sjs->preprocessors, kv_fetch, &fc,
-        base_path, &source, &source_len);
-
-    if (!module_path) return -1;
-
-    /* Record module load for replay capture */
-    if (sjs->current_replay_capture) {
-        const char *hash = sha256_hex(source, source_len);
-        replay_capture_module(sjs->current_replay_capture,
-                              module_path, hash);
-    }
-
-    const char *ext = sjs_path_extension(module_path);
-    const sjs_preprocessor_entry_t *pp = ext
-        ? sjs_preprocessor_find(sjs->preprocessors, ext) : NULL;
-
-    char  *compile_source = source;
-    size_t compile_len    = source_len;
-
-    if (pp) {
-        if (pp->transform == sjs_typescript_transform) {
-            sjs_ts_binding_t *binding = pp->user_data;
-            if (binding && binding->ts_ctx)
-                binding->ts_ctx->current_module_path = module_path;
-        }
-
-        size_t js_len;
-        char *js = pp->transform(source, source_len, &js_len, pp->user_data);
-        free(source);
-        if (!js) {
-            free(module_path);
-            *err_body = strdup("Preprocessor Error");
-            *err_len = (uint32_t)strlen(*err_body);
-            return 1;
-        }
-        compile_source = js;
-        compile_len    = js_len;
-
-        /* Store transpiled JS in KV for browser replay/debugging */
-        {
-            char js_key[512];
-            snprintf(js_key, sizeof(js_key), "__code_js/%s", module_path);
-            char jk[512];
-            const char *jkey = kv_prefixed_key(kv_prefix, js_key,
-                                                jk, sizeof(jk));
-            if (jkey)
-                kv_put(sjs->kv, jkey, js, js_len);
-        }
-
-        /* Store source map if TypeScript preprocessor produced one */
-        if (pp->transform == sjs_typescript_transform) {
-            sjs_ts_binding_t *binding = pp->user_data;
-            if (binding && binding->last_source_map) {
-                char sm_key[512];
-                snprintf(sm_key, sizeof(sm_key),
-                         "__code_sourcemap/%s", module_path);
-                char pk[512];
-                const char *key = kv_prefixed_key(kv_prefix, sm_key,
-                                                   pk, sizeof(pk));
-                if (key)
-                    kv_put(sjs->kv, key, binding->last_source_map,
-                           binding->last_source_map_len);
-
-                free(binding->last_source_map);
-                binding->last_source_map = NULL;
-                binding->last_source_map_len = 0;
-            }
-        }
-    }
-
-    sjs->current_prefix = kv_prefix;
-    JSContext *cc = sjs->compile_ctx;
-    JSValue module_val = JS_Eval(cc, compile_source, compile_len,
-                                 module_path,
-                                 JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    free(compile_source);
-    sjs->current_prefix = NULL;
-
-    if (JS_IsException(module_val)) {
-        JSValue exc = JS_GetException(cc);
-        const char *err = JS_ToCString(cc, exc);
-        fprintf(stderr, "shift-js: compile error in %s: %s\n",
-                module_path, err ? err : "(unknown)");
-        if (asprintf(err_body, "compile error in %s: %s",
-                     module_path, err ? err : "(unknown)") < 0)
-            *err_body = strdup("compile error");
-        JS_FreeCString(cc, err);
-        JS_FreeValue(cc, exc);
-        free(module_path);
-        *err_len = *err_body ? (uint32_t)strlen(*err_body) : 0;
-        return 1;
-    }
-
-    size_t out_bc_len;
-    uint8_t *bc = JS_WriteObject(cc, &out_bc_len, module_val,
-                                 JS_WRITE_OBJ_BYTECODE);
-    JS_FreeValue(cc, module_val);
-
-    if (!bc) {
-        free(module_path);
-        *err_body = strdup("Bytecode Serialization Error");
-        *err_len = (uint32_t)strlen(*err_body);
-        return 1;
-    }
-
-    /* Store bytecode in cache */
-    {
-        char raw_cache[256];
-        snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", module_path);
-        char cache_buf[512];
-        const char *ck = sjs_prefixed_key(kv_prefix, raw_cache,
-                                           cache_buf, sizeof(cache_buf));
-        if (ck)
-            kv_put(sjs->kv, ck, bc, out_bc_len);
-    }
-
-    *bytecode = bc;
-    *bc_len = out_bc_len;
-    *out_module_path = module_path;
-    return 0;
-}
+/* (Module compilation moved to code_server.c — worker only loads
+ * pre-compiled bytecode from the in-memory code store.) */
 
 /* ======================================================================
  * Body extraction (return value → libc heap string)
@@ -357,95 +194,24 @@ static int sjs_resolve_request_route(sjs_runtime_t *sjs, const char *path,
         return 500;
     }
 
-    /* ---- Tree-hash path: deployed bytecode ---- */
-    if (sjs->current_tree_hash[0]) {
-        static const char *exts[] = { ".mjs", ".ejs", ".ts", ".tsx" };
-        for (int ei = 0; ei < 4; ei++) {
-            char key[1024];
-            snprintf(key, sizeof(key), "database/default/code/%s/%s%s",
-                     sjs->current_tree_hash, base_path, exts[ei]);
-            if (kv_get(sjs->kv, key, &bc->data, &bc->len) == 0) {
-                char mod_name[256];
-                snprintf(mod_name, sizeof(mod_name), "%s%s", base_path, exts[ei]);
-                route->module_path = strdup(mod_name);
-
-                /* Extract sha1 (first 40 bytes) for replay capture,
-                 * then shift data to bytecode-only. */
-                if (bc->len > 40) {
-                    if (sjs->current_replay_capture) {
-                        char hash_str[41] = {0};
-                        memcpy(hash_str, bc->data, 40);
-                        replay_capture_module(sjs->current_replay_capture,
-                                              mod_name, hash_str);
-                    }
-                    bc->len -= 40;
-                    memmove(bc->data, (char *)bc->data + 40, bc->len);
-                }
-                goto found;
-            }
-        }
-        /* Deployed code is authoritative — no fallback to compilation. */
-        free(base_path);
-        *err_body = strdup("Not Found");
-        *err_len = (uint32_t)strlen(*err_body);
-        return 404;
-    }
-
-    /* ---- Legacy path: __compiled/ cache + on-demand compilation ---- */
-
-    /* Try cache hit — probe __compiled/<base_path><ext> for each extension */
+    /* Look up bytecode from in-memory code store */
     {
         static const char *exts[] = { ".mjs", ".ejs", ".ts", ".tsx" };
         for (int ei = 0; ei < 4; ei++) {
-            char raw_cache[256];
-            snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s%s",
-                     base_path, exts[ei]);
-            char cache_key_buf[512];
-            const char *ck = sjs_prefixed_key(kv_prefix, raw_cache,
-                                               cache_key_buf, sizeof(cache_key_buf));
-            if (!ck) continue;
-            if (kv_get(sjs->kv, ck, &bc->data, &bc->len) == 0) {
-                char mod_name[256];
-                snprintf(mod_name, sizeof(mod_name), "%s%s", base_path, exts[ei]);
-                route->module_path = strdup(mod_name);
+            char mod_name[256];
+            snprintf(mod_name, sizeof(mod_name), "%s%s", base_path, exts[ei]);
 
-                /* Record module in replay capture */
-                if (sjs->current_replay_capture) {
-                    char meta_raw[256];
-                    snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", mod_name);
-                    char meta_buf[512];
-                    const char *meta_key = sjs_prefixed_key(kv_prefix, meta_raw,
-                                                             meta_buf, sizeof(meta_buf));
-                    if (meta_key) {
-                        void *hash_val = NULL;
-                        size_t hash_len = 0;
-                        if (kv_get(sjs->kv, meta_key, &hash_val, &hash_len) == 0 && hash_val) {
-                            char hash_str[65] = {0};
-                            if (hash_len >= 64) memcpy(hash_str, hash_val, 64);
-                            replay_capture_module(sjs->current_replay_capture,
-                                                  mod_name, hash_str);
-                            free(hash_val);
-                        }
-                    }
-                }
+            code_entry_t entry;
+            if (code_store_get(sjs->code_store, mod_name, &entry) == 0) {
+                bc->data = malloc(entry.bytecode_len);
+                memcpy(bc->data, entry.bytecode, entry.bytecode_len);
+                bc->len = entry.bytecode_len;
+                route->module_path = strdup(mod_name);
+                if (sjs->current_replay_capture && entry.source_hash[0])
+                    replay_capture_module(sjs->current_replay_capture,
+                                          mod_name, entry.source_hash);
                 goto found;
             }
-        }
-    }
-
-    /* Cache miss — compile primary route */
-    {
-        char *comp_err = NULL;
-        uint32_t comp_err_len = 0;
-        int rc = compile_module(sjs, kv_prefix, base_path,
-                                &bc->data, &bc->len, &route->module_path,
-                                &comp_err, &comp_err_len);
-        if (rc == 0) goto found;
-        if (rc > 0) {
-            free(base_path);
-            *err_body = comp_err;
-            *err_len = comp_err_len;
-            return 500;
         }
     }
 

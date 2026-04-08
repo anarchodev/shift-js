@@ -11,6 +11,7 @@
 #include <shift_h2.h>
 #include <shift.h>
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
@@ -337,6 +338,314 @@ static void cleanup_response(shift_t *sh, shift_entity_t e,
     }
 }
 
+/* ======================================================================
+ * Proxy subsystem — forwards admin requests to code server
+ * Follows the h2c_proxy.c example pattern from shift-h2.
+ * ====================================================================== */
+
+typedef struct {
+    shift_entity_t peer;  /* client-side entity ID */
+} proxy_peer_t;
+
+typedef struct {
+    shift_t                *sh;
+    sh2_component_ids_t     comp;
+    shift_component_id_t    proxy_peer;
+
+    /* sh2-owned server collections */
+    shift_collection_id_t   response_in;
+
+    /* proxy-owned collections */
+    shift_collection_id_t   pending;
+    shift_collection_id_t   inflight;
+
+    /* client-side collections */
+    shift_collection_id_t   connect_in;
+    shift_collection_id_t   connect_out;
+    shift_collection_id_t   disconnect_in;
+    shift_collection_id_t   client_request_in;
+    shift_collection_id_t   client_cancel_in;
+    shift_collection_id_t   client_response_out;
+
+    /* backend state */
+    shift_entity_t          backend_session;
+    bool                    backend_connecting;
+    const char             *backend_host;
+    uint16_t                backend_port;
+    struct sockaddr_in      backend_addr;
+} proxy_t;
+
+static bool proxy_backend_connected(const proxy_t *p) {
+    return !shift_entity_is_stale(p->sh, p->backend_session);
+}
+
+/* Create a client request entity from a server request entity */
+static shift_entity_t submit_upstream(proxy_t *p, shift_entity_t server_e) {
+    sh2_req_headers_t *rqh = NULL;
+    sh2_req_body_t    *rqb = NULL;
+    shift_entity_get_component(p->sh, server_e, p->comp.req_headers,
+                               (void **)&rqh);
+    shift_entity_get_component(p->sh, server_e, p->comp.req_body,
+                               (void **)&rqb);
+
+    shift_entity_t client_e;
+    shift_entity_create_one_begin(p->sh, p->client_request_in, &client_e);
+
+    /* bind to backend session */
+    sh2_session_t *rsess = NULL;
+    shift_entity_get_component(p->sh, client_e, p->comp.session,
+                               (void **)&rsess);
+    rsess->entity = p->backend_session;
+
+    /* copy request headers, replacing :authority and rewriting :path */
+    sh2_header_field_t *fields = calloc(rqh->count, sizeof(sh2_header_field_t));
+    for (uint32_t j = 0; j < rqh->count; j++) {
+        const sh2_header_field_t *f = &rqh->fields[j];
+        if (f->name_len == 10 && memcmp(f->name, ":authority", 10) == 0) {
+            char *auth = malloc(strlen(p->backend_host) + 8);
+            int auth_len = sprintf(auth, "%s:%u",
+                                   p->backend_host, p->backend_port);
+            fields[j] = (sh2_header_field_t){
+                .name = strdup(":authority"), .name_len = 10,
+                .value = auth, .value_len = (uint32_t)auth_len,
+            };
+        } else if (f->name_len == 5 && memcmp(f->name, ":path", 5) == 0 &&
+                   f->value_len >= 13 &&
+                   memcmp(f->value, "/_admin/code/", 13) == 0) {
+            /* strip /_admin/code prefix: /_admin/code/upload → /upload */
+            uint32_t new_len = f->value_len - 12;
+            char *v = malloc(new_len);
+            memcpy(v, f->value + 12, new_len);
+            fields[j] = (sh2_header_field_t){
+                .name = strdup(":path"), .name_len = 5,
+                .value = v, .value_len = new_len,
+            };
+        } else {
+            char *n = malloc(f->name_len);
+            char *v = malloc(f->value_len);
+            memcpy(n, f->name, f->name_len);
+            memcpy(v, f->value, f->value_len);
+            fields[j] = (sh2_header_field_t){
+                .name = n, .name_len = f->name_len,
+                .value = v, .value_len = f->value_len,
+            };
+        }
+    }
+
+    sh2_req_headers_t *crh = NULL;
+    shift_entity_get_component(p->sh, client_e, p->comp.req_headers,
+                               (void **)&crh);
+    crh->fields = fields;
+    crh->count  = rqh->count;
+
+    /* copy request body */
+    if (rqb && rqb->data && rqb->len > 0) {
+        sh2_req_body_t *crb = NULL;
+        shift_entity_get_component(p->sh, client_e, p->comp.req_body,
+                                   (void **)&crb);
+        crb->data = malloc(rqb->len);
+        memcpy(crb->data, rqb->data, rqb->len);
+        crb->len = rqb->len;
+    }
+
+    shift_entity_create_one_end(p->sh, client_e);
+    return client_e;
+}
+
+/* System: consume connect results */
+static void system_proxy_connect(proxy_t *p) {
+    if (!p->backend_connecting) return;
+
+    shift_entity_t *entities = NULL;
+    size_t count = 0;
+    shift_collection_get_entities(p->sh, p->connect_out, &entities, &count);
+
+    for (size_t i = 0; i < count; i++) {
+        sh2_io_result_t *io = NULL;
+        shift_entity_get_component(p->sh, entities[i], p->comp.io_result,
+                                   (void **)&io);
+        if (io && io->error == 0) {
+            sh2_session_t *sess = NULL;
+            shift_entity_get_component(p->sh, entities[i], p->comp.session,
+                                       (void **)&sess);
+            p->backend_session = sess->entity;
+            p->backend_connecting = false;
+            printf("Proxy: backend connected to %s:%u\n",
+                   p->backend_host, p->backend_port);
+        } else {
+            fprintf(stderr, "Proxy: backend connect failed: %d\n",
+                    io ? io->error : -1);
+            p->backend_connecting = false;
+        }
+        shift_entity_destroy_one(p->sh, entities[i]);
+    }
+}
+
+/* System: flush pending requests once backend connects */
+static void system_proxy_flush_pending(proxy_t *p) {
+    if (!proxy_backend_connected(p)) return;
+
+    shift_entity_t *entities = NULL;
+    size_t count = 0;
+    shift_collection_get_entities(p->sh, p->pending, &entities, &count);
+
+    for (size_t i = 0; i < count; i++) {
+        shift_entity_t client_e = submit_upstream(p, entities[i]);
+
+        /* set cross-reference: server → client.
+         * Entity is in pending (has proxy_peer). Client entity travels
+         * through sh2 internal collections that lack proxy_peer, so the
+         * reference must live on the server side. */
+        proxy_peer_t *pp = NULL;
+        shift_entity_get_component(p->sh, entities[i], p->proxy_peer,
+                                   (void **)&pp);
+        pp->peer = client_e;
+
+        shift_entity_move_one(p->sh, entities[i], p->inflight);
+    }
+}
+
+/* System: map upstream responses back to downstream */
+static void system_proxy_map_responses(proxy_t *p) {
+    shift_entity_t *entities = NULL;
+    size_t count = 0;
+    shift_collection_get_entities(p->sh, p->client_response_out,
+                                  &entities, &count);
+
+    /* get inflight server entities and their peer components for scanning */
+    shift_entity_t *inflight_ents = NULL;
+    proxy_peer_t   *inflight_peers = NULL;
+    size_t          inflight_count = 0;
+    shift_collection_get_entities(p->sh, p->inflight,
+                                  &inflight_ents, &inflight_count);
+    if (inflight_count > 0)
+        shift_collection_get_component_array(p->sh, p->inflight, p->proxy_peer,
+                                             (void **)&inflight_peers, NULL);
+
+    for (size_t i = 0; i < count; i++) {
+        shift_entity_t client_e = entities[i];
+
+        /* scan inflight for the server entity whose peer matches client_e */
+        shift_entity_t server_e = {0};
+        for (size_t j = 0; j < inflight_count; j++) {
+            if (inflight_peers[j].peer.index == client_e.index &&
+                inflight_peers[j].peer.generation == client_e.generation) {
+                server_e = inflight_ents[j];
+                break;
+            }
+        }
+        if (server_e.index == 0 && server_e.generation == 0) {
+            fprintf(stderr, "Proxy: orphan response (no matching inflight)\n");
+            shift_entity_destroy_one(p->sh, client_e);
+            continue;
+        }
+
+        /* check for upstream errors */
+        sh2_io_result_t *uio = NULL;
+        shift_entity_get_component(p->sh, client_e, p->comp.io_result,
+                                   (void **)&uio);
+        if (uio && uio->error != 0) {
+            fprintf(stderr, "Proxy: upstream error %d, sending 502\n",
+                    uio->error);
+
+            sh2_status_t *st = NULL;
+            shift_entity_get_component(p->sh, server_e, p->comp.status,
+                                       (void **)&st);
+            st->code = 502;
+
+            sh2_resp_headers_t *rh = NULL;
+            shift_entity_get_component(p->sh, server_e, p->comp.resp_headers,
+                                       (void **)&rh);
+            rh->fields = NULL;
+            rh->count  = 0;
+
+            sh2_resp_body_t *rb = NULL;
+            shift_entity_get_component(p->sh, server_e, p->comp.resp_body,
+                                       (void **)&rb);
+            rb->data = strdup("Bad Gateway\n");
+            rb->len  = 12;
+
+            shift_entity_move_one(p->sh, server_e, p->response_in);
+            shift_entity_destroy_one(p->sh, client_e);
+            continue;
+        }
+
+        /* copy status */
+        sh2_status_t *ust = NULL;
+        shift_entity_get_component(p->sh, client_e, p->comp.status,
+                                   (void **)&ust);
+        sh2_status_t *st = NULL;
+        shift_entity_get_component(p->sh, server_e, p->comp.status,
+                                   (void **)&st);
+        st->code = ust ? ust->code : 502;
+
+        /* copy response headers */
+        sh2_resp_headers_t *urh = NULL;
+        shift_entity_get_component(p->sh, client_e, p->comp.resp_headers,
+                                   (void **)&urh);
+        sh2_resp_headers_t *rh = NULL;
+        shift_entity_get_component(p->sh, server_e, p->comp.resp_headers,
+                                   (void **)&rh);
+        if (urh && urh->count > 0) {
+            sh2_header_field_t *dst = malloc(urh->count * sizeof(*dst));
+            for (uint32_t j = 0; j < urh->count; j++) {
+                char *n = malloc(urh->fields[j].name_len);
+                char *v = malloc(urh->fields[j].value_len);
+                memcpy(n, urh->fields[j].name, urh->fields[j].name_len);
+                memcpy(v, urh->fields[j].value, urh->fields[j].value_len);
+                dst[j] = (sh2_header_field_t){
+                    .name = n, .name_len = urh->fields[j].name_len,
+                    .value = v, .value_len = urh->fields[j].value_len,
+                };
+            }
+            rh->fields = dst;
+            rh->count  = urh->count;
+        } else {
+            rh->fields = NULL;
+            rh->count  = 0;
+        }
+
+        /* copy response body */
+        sh2_resp_body_t *urb = NULL;
+        shift_entity_get_component(p->sh, client_e, p->comp.resp_body,
+                                   (void **)&urb);
+        sh2_resp_body_t *rb = NULL;
+        shift_entity_get_component(p->sh, server_e, p->comp.resp_body,
+                                   (void **)&rb);
+        if (urb && urb->data && urb->len > 0) {
+            rb->data = malloc(urb->len);
+            memcpy(rb->data, urb->data, urb->len);
+            rb->len = urb->len;
+        } else {
+            rb->data = NULL;
+            rb->len  = 0;
+        }
+
+        /* moves last */
+        shift_entity_move_one(p->sh, server_e, p->response_in);
+        shift_entity_destroy_one(p->sh, client_e);
+    }
+}
+
+/* System: reconnect if backend disconnected */
+static void system_proxy_reconnect(proxy_t *p) {
+    if (proxy_backend_connected(p) || p->backend_connecting)
+        return;
+
+    shift_entity_t ce;
+    shift_entity_create_one_begin(p->sh, p->connect_in, &ce);
+    sh2_connect_target_t *tgt = NULL;
+    shift_entity_get_component(p->sh, ce, p->comp.connect_target,
+                               (void **)&tgt);
+    tgt->addr         = p->backend_addr;
+    tgt->hostname     = p->backend_host;
+    tgt->hostname_len = (uint32_t)strlen(p->backend_host);
+    shift_entity_create_one_end(p->sh, ce);
+    p->backend_connecting = true;
+    printf("Proxy: reconnecting to %s:%u...\n",
+           p->backend_host, p->backend_port);
+}
+
 void *sjs_worker_fn(void *arg) {
     sjs_worker_config_t *wcfg = arg;
 
@@ -380,6 +689,8 @@ void *sjs_worker_fn(void *arg) {
         kv_close(kv);
         return NULL;
     }
+    sjs.code_db    = wcfg->code_db;
+    sjs.code_store = wcfg->code_store;
 
     /* ---- Log DB (per-worker file, separate from KV) ---- */
     log_db_t log_db = {0};
@@ -403,7 +714,7 @@ void *sjs_worker_fn(void *arg) {
     shift_config_t sh_cfg = {
         .max_entities            = MAX_CONNECTIONS * 16 + MAX_STREAMS + 1024,
         .max_components          = 32,
-        .max_collections         = 32,
+        .max_collections         = 64,
         .deferred_queue_capacity = MAX_CONNECTIONS * 256,
     };
     if (shift_context_create(&sh_cfg, &sh) != shift_ok) {
@@ -455,13 +766,13 @@ void *sjs_worker_fn(void *arg) {
     };
     size_t ncomps = sizeof(all_comps) / sizeof(all_comps[0]);
 
-    shift_collection_id_t request_out, response_in, response_result_out;
+    shift_collection_id_t request_out, response_in, response_out;
     shift_collection_info_t ci_req  = { .name = "request_out",        .comp_ids = all_comps, .comp_count = ncomps };
     shift_collection_info_t ci_resp = { .name = "response_in",        .comp_ids = all_comps, .comp_count = ncomps };
-    shift_collection_info_t ci_res  = { .name = "response_result_out", .comp_ids = all_comps, .comp_count = ncomps };
+    shift_collection_info_t ci_res  = { .name = "response_out", .comp_ids = all_comps, .comp_count = ncomps };
     if (shift_collection_register(sh, &ci_req,  &request_out) != shift_ok ||
         shift_collection_register(sh, &ci_resp, &response_in) != shift_ok ||
-        shift_collection_register(sh, &ci_res,  &response_result_out) != shift_ok) {
+        shift_collection_register(sh, &ci_res,  &response_out) != shift_ok) {
         fprintf(stderr, "Worker %d: collection register failed\n", wcfg->worker_id);
         shift_context_destroy(sh);
         sjs_runtime_free(&sjs);
@@ -470,6 +781,67 @@ void *sjs_worker_fn(void *arg) {
 #endif
         kv_close(kv);
         return NULL;
+    }
+
+    /* ---- Proxy: collections (if code server configured) ---- */
+    bool proxy_enabled = wcfg->code_server_host != NULL;
+    proxy_t proxy = {0};
+
+    if (proxy_enabled) {
+        /* Register proxy_peer component */
+        shift_component_info_t peer_info = {
+            .element_size = sizeof(proxy_peer_t),
+        };
+        shift_component_register(sh, &peer_info, &proxy.proxy_peer);
+
+        /* sh2-only components (for client-side collections) */
+        shift_component_id_t sh2_comps[] = {
+            comp.stream_id, comp.session, comp.req_headers, comp.req_body,
+            comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
+            comp.domain_tag, comp.peer_cert,
+        };
+        const size_t sh2_comps_count = sizeof(sh2_comps) / sizeof(sh2_comps[0]);
+
+        /* proxy-owned collections add proxy_peer for cross-referencing */
+        shift_component_id_t proxy_comps[] = {
+            comp.stream_id, comp.session, comp.req_headers, comp.req_body,
+            comp.resp_headers, comp.resp_body, comp.status, comp.io_result,
+            comp.domain_tag, comp.peer_cert, proxy.proxy_peer,
+        };
+        const size_t proxy_comps_count = sizeof(proxy_comps) / sizeof(proxy_comps[0]);
+
+        shift_component_id_t connect_comps[] = {
+            comp.connect_target, comp.session, comp.io_result,
+        };
+
+        shift_collection_info_t colls[] = {
+            { .name = "proxy_pending",         .comp_ids = proxy_comps,   .comp_count = proxy_comps_count },
+            { .name = "proxy_inflight",        .comp_ids = proxy_comps,   .comp_count = proxy_comps_count },
+            { .name = "proxy_connect_in",      .comp_ids = connect_comps, .comp_count = 3 },
+            { .name = "proxy_connect_out",     .comp_ids = sh2_comps,     .comp_count = sh2_comps_count },
+            { .name = "proxy_disconnect_in",   .comp_ids = sh2_comps,     .comp_count = sh2_comps_count },
+            { .name = "proxy_request_in",      .comp_ids = sh2_comps,     .comp_count = sh2_comps_count },
+            { .name = "proxy_cancel_in",       .comp_ids = sh2_comps,     .comp_count = sh2_comps_count },
+            { .name = "proxy_response_out",    .comp_ids = sh2_comps,     .comp_count = sh2_comps_count },
+        };
+        shift_collection_id_t *ids[] = {
+            &proxy.pending, &proxy.inflight,
+            &proxy.connect_in, &proxy.connect_out, &proxy.disconnect_in,
+            &proxy.client_request_in, &proxy.client_cancel_in,
+            &proxy.client_response_out,
+        };
+        for (int c = 0; c < 8; c++) {
+            if (shift_collection_register(sh, &colls[c], ids[c]) != shift_ok) {
+                fprintf(stderr, "Worker %d: proxy collection register failed: %s\n",
+                        wcfg->worker_id, colls[c].name);
+            }
+        }
+
+        proxy.sh           = sh;
+        proxy.comp         = comp;
+        proxy.response_in  = response_in;
+        proxy.backend_host = wcfg->code_server_host;
+        proxy.backend_port = wcfg->code_server_port;
     }
 
     /* ---- Create sh2 context ---- */
@@ -483,11 +855,22 @@ void *sjs_worker_fn(void *arg) {
         .buf_size            = BUF_SIZE,
         .request_out         = request_out,
         .response_in         = response_in,
-        .response_result_out = response_result_out,
+        .response_out        = response_out,
 #ifdef SH2_HAS_TLS
         .tls                 = tls,
 #endif
+        .enable_connect      = proxy_enabled,
     };
+    if (proxy_enabled) {
+        h2cfg.client_colls = (sh2_client_collection_ids_t){
+            .connect_in      = proxy.connect_in,
+            .connect_out     = proxy.connect_out,
+            .disconnect_in   = proxy.disconnect_in,
+            .request_in      = proxy.client_request_in,
+            .cancel_in       = proxy.client_cancel_in,
+            .response_out    = proxy.client_response_out,
+        };
+    }
     if (sh2_context_create(&h2cfg, &h2) != sh2_ok) {
         fprintf(stderr, "Worker %d: sh2_context_create failed: errno=%d (%s)\n",
                 wcfg->worker_id, errno, strerror(errno));
@@ -539,10 +922,36 @@ void *sjs_worker_fn(void *arg) {
         }
     }
 
+    /* ---- Connect to code server (if proxy enabled) ---- */
+    if (proxy_enabled) {
+        proxy.backend_addr = (struct sockaddr_in){
+            .sin_family = AF_INET,
+            .sin_port   = htons(wcfg->code_server_port),
+        };
+        inet_pton(AF_INET, wcfg->code_server_host, &proxy.backend_addr.sin_addr);
+
+        shift_entity_t ce;
+        shift_entity_create_one_begin(sh, proxy.connect_in, &ce);
+        sh2_connect_target_t *tgt = NULL;
+        shift_entity_get_component(sh, ce, comp.connect_target, (void **)&tgt);
+        tgt->addr         = proxy.backend_addr;
+        tgt->hostname     = proxy.backend_host;
+        tgt->hostname_len = (uint32_t)strlen(proxy.backend_host);
+        shift_entity_create_one_end(sh, ce);
+        proxy.backend_connecting = true;
+
+        printf("shift-js worker %d: connecting to code server %s:%d\n",
+               wcfg->worker_id, proxy.backend_host, proxy.backend_port);
+    }
+
     /* ---- Event loop ---- */
     while (*wcfg->running) {
         if (sh2_poll(h2, 0) != sh2_ok)
             break;
+
+        /* ---- Proxy: consume connect results ---- */
+        if (proxy_enabled) system_proxy_connect(&proxy);
+        shift_flush(sh);
 
         /* ---- Process incoming requests ---- */
         {
@@ -687,7 +1096,29 @@ void *sjs_worker_fn(void *arg) {
                         .kv_prefix  = prefix,
                     };
                     admin_response_t aresp;
-                    admin_dispatch(kv, &areq, &aresp);
+                    admin_services_t admin_svc = {
+                        .kv         = kv,
+                        .code_db    = sjs.code_db,
+                        .code_store = sjs.code_store,
+                    };
+                    int admin_rc = admin_dispatch(&admin_svc, &areq, &aresp);
+
+                    if (admin_rc == ADMIN_NEEDS_PROXY && proxy_enabled) {
+                        /* Park in proxy pending — system_proxy_flush_pending
+                         * will create the upstream request after flush. */
+                        shift_entity_move_one(sh, e, proxy.pending);
+                        free(method_str);
+                        free(path_str);
+                        continue;
+                    }
+
+                    if (admin_rc == ADMIN_NEEDS_PROXY) {
+                        /* No proxy available */
+                        aresp.status = 503;
+                        aresp.body = strdup("{\"error\":\"code server not connected\"}");
+                        aresp.body_len = aresp.body ? (uint32_t)strlen(aresp.body) : 0;
+                        aresp.content_type = "application/json; charset=utf-8";
+                    }
 
                     sh2_status_t *st = NULL;
                     shift_entity_get_component(sh, e, comp.status, (void **)&st);
@@ -877,6 +1308,7 @@ void *sjs_worker_fn(void *arg) {
                  * handle route, session, tape, bytecode on entity destroy. */
             }
         }
+        shift_flush(sh);
 
         /* ---- Release Raft-committed pending responses ---- */
         if (wcfg->raft && raft_pending != (shift_collection_id_t)-1) {
@@ -915,12 +1347,21 @@ void *sjs_worker_fn(void *arg) {
                 }
             }
         }
+        shift_flush(sh);
+
+        /* ---- Proxy: flush pending → inflight ---- */
+        if (proxy_enabled) system_proxy_flush_pending(&proxy);
+        shift_flush(sh);
+
+        /* ---- Proxy: map upstream responses back to downstream ---- */
+        if (proxy_enabled) system_proxy_map_responses(&proxy);
+        shift_flush(sh);
 
         /* ---- Drain completed responses & flush logs ---- */
         {
             shift_entity_t *entities = NULL;
             size_t          count    = 0;
-            shift_collection_get_entities(sh, response_result_out,
+            shift_collection_get_entities(sh, response_out,
                                           &entities, &count);
 
             if (log_db.db)
@@ -956,6 +1397,8 @@ void *sjs_worker_fn(void *arg) {
                 log_db_flush_commit(&log_db);
         }
 
+        /* ---- Proxy: reconnect if backend disconnected ---- */
+        if (proxy_enabled) system_proxy_reconnect(&proxy);
         shift_flush(sh);
     }
 
@@ -964,9 +1407,17 @@ void *sjs_worker_fn(void *arg) {
     shift_flush(sh);
 
     /* Drain remaining entities — flush logs and free response data before destroy */
-    shift_collection_id_t drain[] = { request_out, response_in, response_result_out,
-                                       raft_pending };
-    int drain_count = (raft_pending != (shift_collection_id_t)-1) ? 4 : 3;
+    shift_collection_id_t drain[8];
+    int drain_count = 0;
+    drain[drain_count++] = request_out;
+    drain[drain_count++] = response_in;
+    drain[drain_count++] = response_out;
+    if (raft_pending != (shift_collection_id_t)-1)
+        drain[drain_count++] = raft_pending;
+    if (proxy_enabled) {
+        drain[drain_count++] = proxy.pending;
+        drain[drain_count++] = proxy.inflight;
+    }
     if (log_db.db)
         log_db_flush_begin(&log_db);
     for (int c = 0; c < drain_count; c++) {

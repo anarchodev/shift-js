@@ -17,15 +17,20 @@ typedef struct {
     sh2_context_t       *ctx;
     sh2_component_ids_t  comp;
 
+    /* Server-side (required but unused in client-only mode) */
     shift_collection_id_t request_out;
     shift_collection_id_t response_in;
-    shift_collection_id_t response_result_out;
+    shift_collection_id_t response_out;
+    shift_collection_id_t conn_close_out;
 
+    /* Client-side */
+    shift_collection_id_t connect_in;
     shift_collection_id_t connect_out;
-    shift_collection_id_t connect_result_out;
+    shift_collection_id_t disconnect_in;
+    shift_collection_id_t cli_conn_close_out;
     shift_collection_id_t client_request_in;
+    shift_collection_id_t client_cancel_in;
     shift_collection_id_t client_response_out;
-    shift_collection_id_t client_result_out;
 
     shift_entity_t session_entity;
     bool           connected;
@@ -37,7 +42,7 @@ static int client_init(ctl_client_t *c) {
     shift_config_t sh_cfg = {
         .max_entities            = 4096,
         .max_components          = 32,
-        .max_collections         = 32,
+        .max_collections         = 64,
         .deferred_queue_capacity = 4096,
     };
     if (shift_context_create(&sh_cfg, &c->sh) != shift_ok)
@@ -63,24 +68,27 @@ static int client_init(ctl_client_t *c) {
     shift_collection_register(c->sh, &ci, &c->request_out);
     ci = (shift_collection_info_t){ .name = "response_in", .comp_ids = all, .comp_count = nall };
     shift_collection_register(c->sh, &ci, &c->response_in);
-    ci = (shift_collection_info_t){ .name = "response_result_out", .comp_ids = all, .comp_count = nall };
-    shift_collection_register(c->sh, &ci, &c->response_result_out);
-
+    ci = (shift_collection_info_t){ .name = "response_out", .comp_ids = all, .comp_count = nall };
+    shift_collection_register(c->sh, &ci, &c->response_out);
     /* Client-path collections */
     shift_component_id_t conn[] = {
         c->comp.connect_target, c->comp.session, c->comp.io_result,
     };
 
-    ci = (shift_collection_info_t){ .name = "connect_out", .comp_ids = conn, .comp_count = 3 };
+    ci = (shift_collection_info_t){ .name = "connect_in", .comp_ids = conn, .comp_count = 3 };
+    shift_collection_register(c->sh, &ci, &c->connect_in);
+    ci = (shift_collection_info_t){ .name = "connect_out", .comp_ids = all, .comp_count = nall };
     shift_collection_register(c->sh, &ci, &c->connect_out);
-    ci = (shift_collection_info_t){ .name = "connect_result_out", .comp_ids = all, .comp_count = nall };
-    shift_collection_register(c->sh, &ci, &c->connect_result_out);
+    ci = (shift_collection_info_t){ .name = "disconnect_in", .comp_ids = all, .comp_count = nall };
+    shift_collection_register(c->sh, &ci, &c->disconnect_in);
+    ci = (shift_collection_info_t){ .name = "cli_connection_close_out", .comp_ids = all, .comp_count = nall };
+    shift_collection_register(c->sh, &ci, &c->cli_conn_close_out);
     ci = (shift_collection_info_t){ .name = "client_request_in", .comp_ids = all, .comp_count = nall };
     shift_collection_register(c->sh, &ci, &c->client_request_in);
+    ci = (shift_collection_info_t){ .name = "client_cancel_in", .comp_ids = all, .comp_count = nall };
+    shift_collection_register(c->sh, &ci, &c->client_cancel_in);
     ci = (shift_collection_info_t){ .name = "client_response_out", .comp_ids = all, .comp_count = nall };
     shift_collection_register(c->sh, &ci, &c->client_response_out);
-    ci = (shift_collection_info_t){ .name = "client_result_out", .comp_ids = all, .comp_count = nall };
-    shift_collection_register(c->sh, &ci, &c->client_result_out);
 
     sh2_config_t cfg = {
         .shift               = c->sh,
@@ -91,18 +99,21 @@ static int client_init(ctl_client_t *c) {
         .buf_size            = 64 * 1024,
         .request_out         = c->request_out,
         .response_in         = c->response_in,
-        .response_result_out = c->response_result_out,
+        .response_out        = c->response_out,
         .enable_connect      = true,
         .client_colls = {
+            .connect_in          = c->connect_in,
             .connect_out         = c->connect_out,
-            .connect_result_out  = c->connect_result_out,
+            .disconnect_in       = c->disconnect_in,
+            .connection_close_out = c->cli_conn_close_out,
             .request_in          = c->client_request_in,
+            .cancel_in           = c->client_cancel_in,
             .response_out        = c->client_response_out,
-            .response_result_out = c->client_result_out,
         },
     };
 
     if (sh2_context_create(&cfg, &c->ctx) != sh2_ok) {
+        fprintf(stderr, "sjs ctl: sh2_context_create failed\n");
         shift_context_destroy(c->sh);
         return -1;
     }
@@ -118,7 +129,7 @@ static int client_connect(ctl_client_t *c, const char *host, uint16_t port) {
     inet_pton(AF_INET, host, &addr.sin_addr);
 
     shift_entity_t ce;
-    shift_entity_create_one_begin(c->sh, c->connect_out, &ce);
+    shift_entity_create_one_begin(c->sh, c->connect_in, &ce);
 
     sh2_connect_target_t *tgt = NULL;
     shift_entity_get_component(c->sh, ce, c->comp.connect_target, (void **)&tgt);
@@ -135,7 +146,7 @@ static int client_connect(ctl_client_t *c, const char *host, uint16_t port) {
 
         shift_entity_t *entities = NULL;
         size_t count = 0;
-        shift_collection_get_entities(c->sh, c->connect_result_out,
+        shift_collection_get_entities(c->sh, c->connect_out,
                                       &entities, &count);
         for (size_t i = 0; i < count; i++) {
             sh2_io_result_t *io = NULL;
@@ -240,12 +251,12 @@ static int client_request(ctl_client_t *c, const char *host,
     /* Poll until response complete */
     bool done = false;
     while (!done) {
-        if (sh2_poll(c->ctx, 0) != sh2_ok)
+        if (sh2_poll(c->ctx, 1) != sh2_ok)
             return -1;
 
         shift_entity_t *entities = NULL;
         size_t count = 0;
-        shift_collection_get_entities(c->sh, c->client_result_out,
+        shift_collection_get_entities(c->sh, c->client_response_out,
                                       &entities, &count);
         for (size_t i = 0; i < count; i++) {
             sh2_status_t *st = NULL;
@@ -610,6 +621,119 @@ static int cmd_cert_put(ctl_client_t *c, const char *host, const char *token,
 }
 
 /* ======================================================================
+ * Code: upload files and deploy
+ * ====================================================================== */
+
+#include <sys/stat.h>
+#include <dirent.h>
+
+static int upload_file(ctl_client_t *c, const char *host, const char *token,
+                       const char *filepath, const char *code_path) {
+    size_t flen = 0;
+    char *fdata = read_file(filepath, &flen);
+    if (!fdata) {
+        fprintf(stderr, "error: cannot read %s\n", filepath);
+        return -1;
+    }
+
+    char param[1024];
+    url_encode_param("path", code_path, param, sizeof(param));
+    char path[2048];
+    snprintf(path, sizeof(path), "/upload?%s", param);
+
+    ctl_response_t resp;
+    int rc = client_request(c, host, "PUT", path, fdata, flen, token, &resp);
+    free(fdata);
+    if (rc != 0) return -1;
+    if (resp.status != 200) {
+        fprintf(stderr, "error uploading %s: %u %s\n", code_path,
+                resp.status, resp.body ? resp.body : "");
+        free(resp.body);
+        return -1;
+    }
+    free(resp.body);
+    return 0;
+}
+
+static int upload_dir_recursive(ctl_client_t *c, const char *host,
+                                const char *token, const char *dir_path,
+                                const char *prefix) {
+    DIR *d = opendir(dir_path);
+    if (!d) {
+        fprintf(stderr, "error: cannot open %s\n", dir_path);
+        return -1;
+    }
+
+    struct dirent *ent;
+    int count = 0;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+
+        char filepath[4096];
+        snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, ent->d_name);
+
+        struct stat st;
+        if (stat(filepath, &st) != 0) continue;
+
+        char code_path[4096];
+        if (prefix[0])
+            snprintf(code_path, sizeof(code_path), "%s/%s", prefix, ent->d_name);
+        else
+            snprintf(code_path, sizeof(code_path), "%s", ent->d_name);
+
+        if (S_ISDIR(st.st_mode)) {
+            int sub = upload_dir_recursive(c, host, token, filepath, code_path);
+            if (sub > 0) count += sub;
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+
+        if (upload_file(c, host, token, filepath, code_path) == 0) {
+            printf("  %s → %s\n", filepath, code_path);
+            count++;
+        }
+    }
+    closedir(d);
+    return count;
+}
+
+static int cmd_upload(ctl_client_t *c, const char *host, const char *token,
+                      int argc, char **argv) {
+    if (argc < 1) {
+        fprintf(stderr, "Usage: sjs ctl upload <dir> [prefix]\n");
+        return 1;
+    }
+    const char *dir = argv[0];
+    const char *prefix = argc > 1 ? argv[1] : "";
+
+    int count = upload_dir_recursive(c, host, token, dir, prefix);
+    if (count < 0) return 1;
+    printf("Uploaded %d files\n", count);
+    return 0;
+}
+
+static int cmd_deploy(ctl_client_t *c, const char *host, const char *token,
+                      int argc, char **argv) {
+    (void)argc; (void)argv;
+
+    ctl_response_t resp;
+    if (client_request(c, host, "POST", "/deploy",
+                       NULL, 0, token, &resp) != 0)
+        return 1;
+
+    if (resp.status == 200) {
+        printf("Deploy successful\n");
+    } else {
+        fprintf(stderr, "Deploy failed: %u %s\n", resp.status,
+                resp.body ? resp.body : "");
+        free(resp.body);
+        return 1;
+    }
+    free(resp.body);
+    return 0;
+}
+
+/* ======================================================================
  * Entry point
  * ====================================================================== */
 
@@ -623,6 +747,8 @@ static void ctl_usage(void) {
         "  delete <key>                    Delete key\n"
         "  range <start> <end> [limit]     List keys in range\n"
         "  list [prefix]                   List all keys with prefix\n"
+        "  upload <dir> [prefix]           Upload directory to code database\n"
+        "  deploy                          Compile and deploy code\n"
         "  domain-map <host> <tenant_id>   Map hostname to tenant\n"
         "  domain-unmap <host>             Remove hostname mapping\n"
         "  cert-put <name> <cert> <key>    Store TLS cert/key pair\n"
@@ -694,6 +820,10 @@ int cmd_ctl(int argc, char **argv) {
         rc = cmd_domain_map(&client, host, token, cmd_argc, cmd_argv);
     else if (strcmp(cmd, "domain-unmap") == 0)
         rc = cmd_domain_unmap(&client, host, token, cmd_argc, cmd_argv);
+    else if (strcmp(cmd, "upload") == 0)
+        rc = cmd_upload(&client, host, token, cmd_argc, cmd_argv);
+    else if (strcmp(cmd, "deploy") == 0)
+        rc = cmd_deploy(&client, host, token, cmd_argc, cmd_argv);
     else if (strcmp(cmd, "cert-put") == 0)
         rc = cmd_cert_put(&client, host, token, cmd_argc, cmd_argv);
     else {

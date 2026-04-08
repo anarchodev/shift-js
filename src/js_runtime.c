@@ -1,11 +1,15 @@
 #define _GNU_SOURCE
 #include "js_runtime.h"
 #include "js_globals.h"
+#include "code_store.h"
 #include "crypto.h"
 #include "kvstore.h"
 #include "preprocessor.h"
 #include "replay_capture.h"
 #include "typescript.h"
+
+/* Note: preprocessor.h and typescript.h are still needed for
+ * sjs_runtime_init (TypeScript/Sucrase initialization). */
 
 #include <quickjs.h>
 #include <openssl/rand.h>
@@ -20,203 +24,53 @@ void arena_reset(sjs_runtime_t *sjs) {
 }
 
 /* ======================================================================
- * Module loader (compile context only)
- * ====================================================================== */
-
-typedef struct {
-    kvstore_t  *kv;
-    const char *prefix;
-} kv_fetch_ctx_t;
-
-static int kv_fetch(const char *key, void **out, size_t *out_len, void *ctx) {
-    kv_fetch_ctx_t *fc = ctx;
-    char raw_key[256];
-    int n = snprintf(raw_key, sizeof(raw_key), "__code/%s", key);
-    if (n < 0 || (size_t)n >= sizeof(raw_key)) return -1;
-    char buf[512];
-    const char *k = kv_prefixed_key(fc->prefix, raw_key, buf, sizeof(buf));
-    if (!k) return -1;
-    return kv_get(fc->kv, k, out, out_len);
-}
-
-static JSModuleDef *sjs_module_loader(JSContext *ctx, const char *module_name,
-                                      void *opaque) {
-    sjs_runtime_t *sjs = JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
-    kvstore_t *kv = sjs ? sjs->kv : NULL;
-    if (!kv) return NULL;
-
-    void  *source = NULL;
-    size_t source_len = 0;
-    const char *resolved_name = module_name;
-    char *resolved_alloc = NULL;
-
-    const char *ext = sjs_path_extension(module_name);
-
-    if (ext) {
-        char raw_key[256];
-        snprintf(raw_key, sizeof(raw_key), "__code/%s", module_name);
-
-        char key_buf[512];
-        const char *key = sjs_prefixed_key(sjs->current_prefix, raw_key,
-                                            key_buf, sizeof(key_buf));
-        if (!key) return NULL;
-
-        if (kv_get(kv, key, &source, &source_len) != 0) return NULL;
-    } else {
-        kv_fetch_ctx_t fc = { .kv = kv, .prefix = sjs->current_prefix };
-        resolved_alloc = sjs_resolve_with_extensions(
-            sjs->preprocessors, kv_fetch, &fc,
-            module_name, &source, &source_len);
-        if (!resolved_alloc) return NULL;
-        resolved_name = resolved_alloc;
-        ext = sjs_path_extension(resolved_name);
-    }
-
-    char  *compile_source = source;
-    size_t compile_len    = source_len;
-
-    const sjs_preprocessor_entry_t *pp = ext
-        ? sjs_preprocessor_find(sjs->preprocessors, ext)
-        : NULL;
-
-    if (pp) {
-        if (pp->transform == sjs_typescript_transform) {
-            sjs_ts_binding_t *binding = pp->user_data;
-            if (binding && binding->ts_ctx)
-                binding->ts_ctx->current_module_path = resolved_name;
-        }
-        size_t js_len;
-        char *js = pp->transform(source, source_len, &js_len, pp->user_data);
-        free(source);
-        if (!js) { free(resolved_alloc); return NULL; }
-        compile_source = js;
-        compile_len    = js_len;
-
-        /* Store transpiled JS for browser replay/debugging */
-        {
-            char js_key[512];
-            snprintf(js_key, sizeof(js_key), "__code_js/%s", resolved_name);
-            char jk[512];
-            const char *jkey = kv_prefixed_key(sjs->current_prefix, js_key,
-                                                jk, sizeof(jk));
-            if (jkey)
-                kv_put(kv, jkey, js, js_len);
-        }
-
-        /* Store source map if TypeScript preprocessor produced one */
-        if (pp->transform == sjs_typescript_transform) {
-            sjs_ts_binding_t *binding = pp->user_data;
-            if (binding && binding->last_source_map) {
-                char sm_key[512];
-                snprintf(sm_key, sizeof(sm_key),
-                         "__code_sourcemap/%s", resolved_name);
-                char pk[512];
-                const char *key = kv_prefixed_key(sjs->current_prefix, sm_key,
-                                                   pk, sizeof(pk));
-                if (key)
-                    kv_put(kv, key, binding->last_source_map,
-                           binding->last_source_map_len);
-                free(binding->last_source_map);
-                binding->last_source_map = NULL;
-                binding->last_source_map_len = 0;
-            }
-        }
-    }
-
-    JSValue func = JS_Eval(ctx, compile_source, compile_len, resolved_name,
-                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    free(compile_source);
-
-    if (JS_IsException(func)) { free(resolved_alloc); return NULL; }
-
-    size_t bc_len;
-    uint8_t *bc = JS_WriteObject(ctx, &bc_len, func,
-                                 JS_WRITE_OBJ_BYTECODE);
-    if (bc) {
-        char raw_cache[256];
-        snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", resolved_name);
-        char cache_buf[512];
-        const char *ck = sjs_prefixed_key(sjs->current_prefix, raw_cache,
-                                          cache_buf, sizeof(cache_buf));
-        if (ck)
-            kv_put(sjs->kv, ck, bc, bc_len);
-        js_free(ctx, bc);
-    }
-
-    free(resolved_alloc);
-
-    JSModuleDef *mod = JS_VALUE_GET_PTR(func);
-    JS_FreeValue(ctx, func);
-    return mod;
-}
-
-/* ======================================================================
- * Request-time module loader
+ * Request-time module loader (loads pre-compiled bytecode from code_store)
  * ====================================================================== */
 
 JSModuleDef *sjs_request_module_loader(JSContext *ctx,
                                        const char *module_name,
                                        void *opaque) {
     sjs_runtime_t *sjs = JS_GetRuntimeOpaque(JS_GetRuntime(ctx));
-    if (!sjs || !sjs->kv) return NULL;
-
-    sjs_request_ctx_t *req = JS_GetContextOpaque(ctx);
-    const char *prefix = req ? req->kv_prefix : NULL;
+    if (!sjs || !sjs->code_store) return NULL;
 
     void  *bc = NULL;
     size_t bc_len = 0;
     char resolved_name[256];
+    char replay_hash[65] = {0};
 
     const char *ext = sjs_path_extension(module_name);
     if (ext) {
-        char raw_cache[256];
-        snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s", module_name);
-        char cache_buf[512];
-        const char *ck = sjs_prefixed_key(prefix, raw_cache,
-                                          cache_buf, sizeof(cache_buf));
-        if (ck)
-            kv_get(sjs->kv, ck, &bc, &bc_len);
-        snprintf(resolved_name, sizeof(resolved_name), "%s", module_name);
+        code_entry_t entry;
+        if (code_store_get(sjs->code_store, module_name, &entry) == 0) {
+            bc = malloc(entry.bytecode_len);
+            memcpy(bc, entry.bytecode, entry.bytecode_len);
+            bc_len = entry.bytecode_len;
+            snprintf(resolved_name, sizeof(resolved_name), "%s", module_name);
+            memcpy(replay_hash, entry.source_hash, 41);
+        }
     } else {
         static const char *exts[] = { ".mjs", ".ejs", ".ts", ".tsx" };
         for (int ei = 0; ei < 4; ei++) {
-            char raw_cache[256];
-            snprintf(raw_cache, sizeof(raw_cache), "__compiled/%s%s",
-                     module_name, exts[ei]);
-            char cache_buf[512];
-            const char *ck = sjs_prefixed_key(prefix, raw_cache,
-                                              cache_buf, sizeof(cache_buf));
-            if (!ck) continue;
-            if (kv_get(sjs->kv, ck, &bc, &bc_len) == 0 && bc) {
-                snprintf(resolved_name, sizeof(resolved_name), "%s%s",
-                         module_name, exts[ei]);
+            char name[256];
+            snprintf(name, sizeof(name), "%s%s", module_name, exts[ei]);
+            code_entry_t entry;
+            if (code_store_get(sjs->code_store, name, &entry) == 0) {
+                bc = malloc(entry.bytecode_len);
+                memcpy(bc, entry.bytecode, entry.bytecode_len);
+                bc_len = entry.bytecode_len;
+                snprintf(resolved_name, sizeof(resolved_name), "%s", name);
+                memcpy(replay_hash, entry.source_hash, 41);
                 break;
             }
         }
     }
+
     if (!bc) return NULL;
 
     /* Record imported module in replay capture */
-    if (sjs->current_replay_capture) {
-        char mod_name[256];
-        snprintf(mod_name, sizeof(mod_name), "%s", resolved_name);
-        char meta_raw[256];
-        snprintf(meta_raw, sizeof(meta_raw), "__code_meta/%s", mod_name);
-        char meta_buf[512];
-        const char *meta_key = sjs_prefixed_key(prefix, meta_raw,
-                                                 meta_buf, sizeof(meta_buf));
-        if (meta_key) {
-            void *hash_val = NULL;
-            size_t hash_len = 0;
-            if (kv_get(sjs->kv, meta_key, &hash_val, &hash_len) == 0 && hash_val) {
-                char hash_str[65] = {0};
-                if (hash_len >= 64) memcpy(hash_str, hash_val, 64);
-                replay_capture_module(sjs->current_replay_capture,
-                                      mod_name, hash_str);
-                free(hash_val);
-            }
-        }
-    }
+    if (sjs->current_replay_capture && replay_hash[0])
+        replay_capture_module(sjs->current_replay_capture,
+                              resolved_name, replay_hash);
 
     JSValue module_val = JS_ReadObject(ctx, bc, bc_len, JS_READ_OBJ_BYTECODE);
     free(bc);
@@ -485,7 +339,6 @@ int sjs_runtime_init(sjs_runtime_t *sjs, kvstore_t *kv,
     if (!sjs->compile_rt) return -1;
 
     JS_SetRuntimeOpaque(sjs->compile_rt, sjs);
-    JS_SetModuleLoaderFunc(sjs->compile_rt, NULL, sjs_module_loader, NULL);
 
     sjs->compile_ctx = JS_NewContext(sjs->compile_rt);
     if (!sjs->compile_ctx) {

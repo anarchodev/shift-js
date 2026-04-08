@@ -44,6 +44,13 @@ typedef struct {
      * Empty string = no deployed tree (use legacy __compiled/ path). */
     char    current_tree_hash[41];
     int64_t tree_hash_ts;    /* monotonic ns of last check, 0 = never checked */
+
+    /* Code database (content-addressed storage).  May be NULL. */
+    struct code_db *code_db;
+
+    /* In-memory bytecode store.  When non-NULL, bytecode is served from
+     * here instead of KV.  Shared across all workers (read-only). */
+    struct code_store *code_store;
 } sjs_runtime_t;
 
 /* ======================================================================

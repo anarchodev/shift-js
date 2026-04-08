@@ -161,6 +161,13 @@ target_include_directories(sjs_raft PUBLIC src)
 target_link_libraries(sjs_raft PUBLIC kvstore raft sqlite3 OpenSSL::Crypto uring pthread)
 
 # ----------------------------------------------------------------------
+# code_store: in-memory bytecode hash map
+# ----------------------------------------------------------------------
+add_library(code_store STATIC src/code_store.c)
+target_include_directories(code_store PUBLIC src)
+target_link_libraries(code_store PUBLIC pthread)
+
+# ----------------------------------------------------------------------
 # sjs: single executable with subcommands
 # ----------------------------------------------------------------------
 add_executable(sjs
@@ -168,6 +175,8 @@ add_executable(sjs
     src/worker.c
     src/admin.c
     src/ctl.c
+    src/code_server.c
+    src/code_client.c
     src/js_runtime.c
     src/js_globals.c
     src/js_dispatch.c
@@ -181,6 +190,7 @@ target_link_libraries(sjs PRIVATE
     qjs_snap
     kvstore
     code_db
+    code_store
     preprocessors
     log_db
     replay_capture
